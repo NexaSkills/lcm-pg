@@ -25,3 +25,16 @@ SQLite path stays as upstream default so rollout/rollback is a config flip.
 - Local PG 18.6, db "lcm", schemas lcm_default|lcm_mike|lcm_brandbuddy|lcm_buttercup|lcm_debbie (owned by role mybuddy).
 - Auth: unix-socket peer (systemd socket-activation ready) + TCP/SCRAM via LCM_PG_DSN in profile .env files.
 - psycopg 3.6 + pgvector installed into the gateway site-packages (9527c3f3.../site-packages).
+
+## Deterministic profile provisioning (no hardcoded profile lists)
+- schema_name(profile) = "lcm_" + profile_id (profile_id = basename of HERMES_HOME;
+  default profile -> ".hermes" -> maps to "default" -> lcm_default).
+- Engine startup with LCM_BACKEND=postgres runs
+  `CREATE SCHEMA IF NOT EXISTS <schema> AUTHORIZATION mybuddy` (idempotent),
+  then `SET search_path`, then versioned CREATE TABLE IF NOT EXISTS migrations.
+  => a brand-new agent profile needs ZERO manual provisioning steps.
+- Backfill for pre-existing profiles: scripts/ensure_schemas.py scans
+  ~/.hermes/profiles/*/ and creates any missing lcm_<profile> schemas (idempotent).
+- Host provisioning itself is equally deterministic (recorded in FORK.md infra section):
+  data dir /home/postgres/data (ext4, /dev/sdb), systemd drop-in PGROOT + ProtectHome=false,
+  socket /var/run/postgresql (peer) + TCP/SCRAM via LCM_PG_DSN.
