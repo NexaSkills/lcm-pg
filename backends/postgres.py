@@ -340,6 +340,14 @@ def _rewrite_sqlite_master(sql: str):
 
 def _translate_sqlite_trigger(sql: str):
     """Return PG trigger DDL (multi-statement) or None for unsupported shapes."""
+    # sqlite "CREATE [VIRTUAL TABLE|TRIGGER] IF NOT EXISTS" — PG has no IF NOT
+    # EXISTS on either, so pre-normalize: virtual tables become no-ops (the
+    # tsvector shim needs no shadow table), triggers keep the name.
+    if re.search(r"(?is)\bIF\s+NOT\s+EXISTS\b", sql):
+        if re.match(r"(?is)\s*CREATE\s+VIRTUAL\s+TABLE\b", sql):
+            return ["SELECT 1"]
+        sql = re.sub(r"(?is)\bCREATE\s+TRIGGER\s+IF\s+NOT\s+EXISTS\s+",
+                     "CREATE TRIGGER ", sql, count=1)
     m = re.match(
         r"(?is)\s*CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?"
         r"(\w+)\s+(AFTER|BEFORE)\s+(INSERT|UPDATE|DELETE)(?:\s+OF\s+([\w,\s]+))?"
@@ -412,7 +420,9 @@ def _drop_trigger_pg(m: re.Match) -> str:
     name collision drop the wrong object). Built by concatenation so the
     statement never carries a literal % (psycopg placeholder).
     """
-    if_exists, name, table = m.groups()
+    if_exists, name, name_q, table, table_q = m.groups()
+    name = name_q or name
+    table = table_q or table
     if table:
         return "DROP TRIGGER %s %s ON %s CASCADE" % (
             "IF EXISTS" if if_exists else "", name, table)
@@ -425,7 +435,7 @@ def _drop_trigger_pg(m: re.Match) -> str:
         " EXCEPTION WHEN OTHERS THEN"
         " IF (SELECT count(*) FROM pg_trigger WHERE " + cond + ") = 0 THEN"
         " NULL; ELSE RAISE; END IF;"
-        " END $$")
+        " END $$;")
 
 
 def _rewrite_text(sql: str) -> str:
@@ -531,7 +541,8 @@ def _rewrite_text(sql: str) -> str:
     # placeholders).
     if re.search(r"(?i)\bDROP\s+TRIGGER\b", s):
         s = re.sub(
-            r"(?i)\bDROP\s+TRIGGER\s+(?:(IF\s+EXISTS)\s+)?(\w+)(?:\s+ON\s+(\w+))?",
+            r"(?i)\bDROP\s+TRIGGER\s+(?:(IF\s+EXISTS)\s+)?"
+            r"(?:\"([^\"]+)\"|([\w$]+))(?:\s+ON\s+(?:\"([^\"]+)\"|([\w$]+)))?",
             _drop_trigger_pg,
             s)
 
@@ -620,6 +631,11 @@ class _Cursor:
     def execute(self, sql: str, parameters: Sequence | dict | None = None):
         if sql.strip().lower().startswith("begin"):
             self._adapter.begin()
+        if re.match(r"(?i)\s*CREATE\s+VIRTUAL\s+TABLE\b", sql):
+            # external-content FTS5 shadow tables are not needed: backends/fts_pg
+            # provides trigger-maintained tsvectors on the content table.
+            self._rowcount = 0
+            return self
         if re.match(r"(?i)\s*CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\b", sql):
             tr = _translate_sqlite_trigger(sql)
             if tr is not None:
@@ -664,6 +680,8 @@ class _Cursor:
             stmt = stmt.strip()
             if not stmt:
                 continue
+            if re.match(r"(?i)\s*CREATE\s+VIRTUAL\s+TABLE\b", stmt):
+                continue  # FTS5 shadow tables unused under the tsvector shim
             if re.match(r"(?i)\s*CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\b", stmt):
                 tr = _translate_sqlite_trigger(stmt)
                 if tr is not None:
@@ -673,14 +691,20 @@ class _Cursor:
         return self
 
     # sqlite3 parity: .row_factory assignment is handled at connection level
-    def _raw_exec(self, sql: str):
+    def _raw_exec(self, sql):
         """Execute DDL/text-rewritten SQL with NO binds.
 
         psycopg only unescapes '%%' when it treats the string as a query
         (params not None). Passing () keeps placeholder scanning on while
         binding nothing, so '%%' -> '%' reaches the server. Without this,
         LIKE '%x%%' patterns baked into translated DDL break silently.
+        A list/tuple is executed statement-by-statement.
         """
+        if isinstance(sql, (list, tuple)):
+            last = None
+            for s in sql:
+                last = self._raw.execute(s, ())
+            return last
         return self._raw.execute(sql, ())
 
     @staticmethod
