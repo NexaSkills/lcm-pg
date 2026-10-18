@@ -184,6 +184,8 @@ class _Cursor:
 
     # sqlite3 parity surface
     def execute(self, sql: str, parameters: Sequence | dict | None = None):
+        if sql.strip().lower().startswith("begin"):
+            self._adapter.begin()
         sql, params = self._adapter._translate(sql, parameters)
         self._raw.execute(sql, params)
         self._rowcount = self._raw.rowcount
@@ -274,6 +276,8 @@ class PgConnection:
         self._ctx = pool.connection()
         self._conn = self._ctx.__enter__()
         self._query_only = False
+        self._tx = None
+        self._tx_open = False
         self.row_factory = None  # accepted & ignored (dict rows always)
         with self._conn.cursor() as cur:
             cur.execute(_set_stmts(schema, 15000))
@@ -284,9 +288,11 @@ class PgConnection:
         if stripped.lower().startswith("pragma "):
             return self._pragma(stripped)
         if re.match(r"^(SET|BEGIN|COMMIT|ROLLBACK|CHECKPOINT|VACUUM)\b", stripped, flags=re.I):
-            # only COMMIT/ROLLBACK are ours (pool manages tx); swallow the rest
-            if re.match(r"^(BEGIN|COMMIT)\b", stripped, flags=re.I):
-                return ("SELECT 1", ())
+            # BEGIN IMMEDIATE is upstream's cross-process lock primitive; on PG
+            # run it as a real transaction (COMMIT/ROLLBACK are handled by the
+            # PgTransaction context manager, never by raw passthrough).
+            if re.match(r"^BEGIN\b", stripped, flags=re.I):
+                return ("BEGIN TRANSACTION", ())
             return ("SELECT 1", ())
         out = _rewrite_text(stripped)
         if isinstance(params, dict):
@@ -325,9 +331,28 @@ class PgConnection:
             raise RuntimeError("readonly")  # parity with sqlite READONLY error
         return _Cursor(self, self._conn.cursor(row_factory=dict_row))
 
+    # -- sqlite3 parity surface ----------------------------------------------
+    # BEGIN IMMEDIATE tracking: psycopg runs the pooled connection in autocommit,
+    # where a bare "BEGIN" is a no-op. We mirror upstream's BEGIN IMMEDIATE /
+    # COMMIT lock primitive with a real PG transaction: begin() opens a tx on the
+    # underlying psycopg connection (so all subsequent statements are in it and
+    # COMMIT/ROLLBACK via the adapter actually commit/roll back it).
+    def begin(self):
+        if not self._tx_open:
+            try:
+                self._conn.execute("BEGIN TRANSACTION")
+            except Exception:
+                pass
+            self._tx_open = True
+
+    def end_tx(self):
+        self._tx_open = False
+
     def execute(self, sql: str, parameters=()):
         c = self.cursor()
         return c.execute(sql, parameters)
+
+
 
     def executemany(self, sql, seq):
         c = self.cursor()
@@ -338,12 +363,22 @@ class PgConnection:
         return c.executescript(script)
 
     def commit(self):
-        # psycopg commits on context exit; explicit commits mid-tx are legal no-ops
-        # until we need real tx boundaries for the write-path migration (Phase 2).
-        pass
+        # No-op outside an explicit BEGIN IMMEDIATE transaction (autocommit pool);
+        # inside one, it ends the real PG transaction opened by begin().
+        if self._tx_open:
+            try:
+                self._conn.commit()
+            except Exception:
+                pass
+            self.end_tx()
 
     def rollback(self):
-        pass
+        if self._tx_open:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+            self.end_tx()
 
     def close(self):
         try:

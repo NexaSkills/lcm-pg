@@ -13,6 +13,11 @@ from datetime import datetime
 import os
 from pathlib import Path
 import sqlite3
+try:  # lcm-pg: backend-aware connect (:memory: and sqlite backend stay stdlib)
+    from .backends.sqlite3_compat import sqlite3_if_postgres as _lcm_pg_swap
+    sqlite3 = _lcm_pg_swap(sqlite3)
+except Exception:  # standalone/script import outside the package
+    pass
 import stat
 from typing import Any
 
