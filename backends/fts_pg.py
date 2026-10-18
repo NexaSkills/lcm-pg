@@ -64,6 +64,9 @@ def normalize_expr_sql(inner: str) -> str:
 
 def ensure_helper(conn) -> None:
     """Create the normalize function + tsvector triggers idempotently."""
+    # PG 18 resolves an unresolved prepared param to smallint; make that
+    # (and integer) explicit so lcm_normalize_fts($n) never falls through
+    # the anyelement/anynonarray pair into an ambiguous/none match.
     conn.execute(
         """
         CREATE OR REPLACE FUNCTION lcm_normalize_fts(q text) RETURNS text
@@ -73,7 +76,7 @@ def ensure_helper(conn) -> None:
             s := coalesce(q, '');
             s := regexp_replace(s, '^"(.*[^"])"$', '\\1', 'g');
             s := regexp_replace(s, '\\*', ' ', 'g');
-            s := regexp_replace(s, '(?i)\\bNEAR\\s*/\\s*[0-9]+\\b', ' or ', 'g');
+            s := regexp_replace(s, '(?i)\\bNEAR\\s*/\\s*[0-9]+\\b', ' | ', 'g');
             s := regexp_replace(s, '[^0-9A-Za-z_]+', ' ', 'g');
             s := regexp_replace(s, '\\s+', ' ', 'g');
             s := btrim(s);
@@ -82,24 +85,54 @@ def ensure_helper(conn) -> None:
             s := lower(s);
             -- insert explicit or between adjacent lexemes; the lookahead
             -- skips pairs already joined by an explicit or
-            s := regexp_replace(s, '([0-9A-Za-z_]+) +([0-9A-Za-z_]+)(?![^ ]*\\bor\\b)',
-                                '\\1 or \\2', 'g');
-            -- collapse doubled connectors ("a or or b" is invalid tsquery)
-            s := regexp_replace(s, '\\m(or(\\s+or)+)\\M', 'or', 'g');
-            s := regexp_replace(s, '^(or\\s+|\\s+or$)', '', 'g');
+            -- join lexeme runs into an | chain: repeat the adjacent-pair
+            -- substitution until stable, so 3+ word queries chain fully
+            -- (one global pass only joins alternating pairs).
+            WHILE s ~ '[0-9A-Za-z_]+ +[0-9A-Za-z_]' LOOP
+                s := regexp_replace(s, '([0-9A-Za-z_]+) +([0-9A-Za-z_]+)',
+                                    '\\1 | \\2', 'g');
+                -- collapse any doubled connectors introduced
+                s := regexp_replace(s, '\\|(\\s*\\|)+', '|', 'g');
+                -- never touch an existing | connector pair again: guard by
+                -- the loop condition (only bare-space adjacencies match)
+            END LOOP;
+            -- collapse doubled connectors ("a | | b" is invalid tsquery)
+            s := regexp_replace(s, '\\|(\\s*\\|)+', '|', 'g');
+            s := regexp_replace(s, '^(\\|\\s*|\\s*\\|$)', '', 'g');
             RETURN btrim(s);
         END $fn$;
         """
     )
 
 
+
 def ts_colname(indexed_column: str) -> str:
     return indexed_column + _TS_SUFFIX
+    conn.execute(
+        "CREATE OR REPLACE FUNCTION lcm_tsq(q text) RETURNS text "
+        "LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$ "
+        "SELECT q $$"
+    )
+
+
+
+def ensure_query_fn(conn) -> None:
+    """Create lcm_tsq(q text) -> text (idempotent). The FTS rewriter bakes
+    ts_rank/ts_headline/ORDER BY copies of the WHERE tsquery expression as
+    `lcm_tsq('<literal>')`: a text passthrough that guarantees the copy's
+    argument is text-typed (a bare literal would work too, but the wrapper
+    keeps a single normalization choke point for future tuning)."""
+    conn.execute(
+        "CREATE OR REPLACE FUNCTION lcm_tsq(q text) RETURNS text "
+        "LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$ "
+        "SELECT q $$"
+    )
 
 
 def ensure_fts(conn, table: str, indexed_column: str) -> None:
     """Idempotent tsvector column + triggers for one (table, column) pair."""
     ensure_helper(conn)
+    ensure_query_fn(conn)
     tcol = ts_colname(indexed_column)
     conn.execute(
         f'ALTER TABLE "{table}" ADD COLUMN IF NOT EXISTS "{tcol}" tsvector'

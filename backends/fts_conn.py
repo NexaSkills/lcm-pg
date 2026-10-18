@@ -51,6 +51,30 @@ def set_spec(conn: "FtsConnection", specs: tuple[tuple[str, str, str], ...]) -> 
     conn._specs = tuple(specs)
 
 
+def add_spec(conn: "FtsConnection", spec: tuple[str, str, str]) -> None:
+    """Append one spec post-connect (store's own ensure_external_content_fts
+    path discovered a new FTS surface after factory.connect decided specs)."""
+    cur = getattr(conn, "_specs", ())
+    if spec not in cur:
+        set_spec(conn, (*cur, spec))
+
+
+def _protect_percents(sql: str) -> str:
+    """Literal `%s` OUTSIDE string literals -> sentinel (defensive; SQLite-
+    shaped SQL should not contain %s). Inside quotes, leave untouched — a
+    strftime('%s',...) pattern is a format spec, not a psycopg bind."""
+    out, i, in_str = [], 0, False
+    while i < len(sql):
+        c = sql[i]
+        if c == "'":
+            in_str = not in_str
+            out.append(c); i += 1; continue
+        if not in_str and sql.startswith("%s", i):
+            out.append(_SENTINEL); i += 2; continue
+        out.append(c); i += 1
+    return "".join(out)
+
+
 def _protect_params(sql: str) -> str:
     """Uniform sentinel for positional `?` outside string literals."""
     out, i, in_str = [], 0, False
@@ -67,6 +91,10 @@ def _protect_params(sql: str) -> str:
 
 
 def _unprotect_params(sql: str) -> str:
+    """Convert sentinel placeholders to psycopg %s. Used by paths WITHOUT
+    positional re-binding (executemany). The FTS SELECT path binds
+    sentinels positionally via _bind_sentinels instead, so late copies
+    become lcm_q($1) references rather than new placeholders."""
     return sql.replace(_SENTINEL, "%s")
 
 
@@ -86,6 +114,217 @@ def _sentinels_outside_literals(sql: str) -> int:
         i += 1
     return n
 
+
+def _where_start(sql: str) -> int:
+    """Index of the first WHERE keyword outside string literals (else -1)."""
+    i, in_str, n = 0, False, len(sql)
+    while i < n:
+        c = sql[i]
+        if c == "'":
+            in_str = not in_str
+            i += 1; continue
+        if not in_str and (i == 0 or not (sql[i-1].isalnum() or sql[i-1] == "_")) \
+                and sql.startswith("WHERE", i):
+            j = i + 5
+            if j >= n or not (sql[j].isalnum() or sql[j] == "_"):
+                return i
+        i += 1
+    return -1
+
+
+_TSQ = "lcm_normalize_fts("
+
+
+def _bind_sentinels_by_input(sentinel_sql: str, params, orig_qs: int):
+    """Bind sentinels: genuine placeholders -> %s (positional, params
+    untouched), rewriter COPIES -> baked literal via lcm_tsq('...').
+
+    Rules (verified against store.search's FTS SQL shape):
+
+    1. The tsvector MATCH predicate is `col @@ to_tsquery('lang',
+       lcm_normalize_fts(SENT))` (from _rewrite_ts step 1). The sentinel
+       INSIDE that @@ RHS span is the genuine MATCH bind -> %s. Its
+       positional slot = count of operand-position sentinels before it,
+       which for store shapes is 0 (params[0] = the query).
+
+    2. Every OTHER sentinel is a COPY (SELECT-list ts_rank / ts_headline /
+       ORDER BY ts_rank re-spellings of that same expression) -> literal
+       bake of the MATCH param's value: `lcm_tsq('<params[pred_slot]>')`.
+       Copies add zero placeholders.
+
+    3. Sentinels outside any to_tsquery span keep the operand classifier
+       (right of =, <, >, !=, <>, <=, >=, LIKE, ILIKE, IS, IN(, LIMIT,
+       OFFSET, arithmetic = genuine %s; otherwise argument position —
+       a copy of some function's arg = also bake with its positional
+       value if identifiable, else params[0]).
+
+    4. If the classifier finds no to_tsquery spans (non-search SQL), this
+       degrades to pure positional binding: sentinel -> %s everywhere —
+       identical to the legacy shim."""
+    n_params = 0 if isinstance(params, dict) else len(params)
+    if n_params == 0:
+        return sentinel_sql.replace(_SENTINEL, "%s"), params
+
+    # -- span of the FIRST @@ predicate's tsquery function-arg parens ----
+    pred_span = None
+    jj = 0
+    n = len(sentinel_sql)
+    while True:
+        jj = sentinel_sql.find("@@", jj)
+        if jj == -1:
+            break
+        # quote-parity at jj decides whether @@ is real (outside literals)
+        if sentinel_sql.count("'", 0, jj) % 2 == 0:
+            k = jj + 2
+            depth = 0
+            in2 = False
+            end = None
+            while k < n:
+                ch = sentinel_sql[k]
+                if ch == "'":
+                    in2 = not in2
+                elif not in2:
+                    if ch == "(":
+                        depth += 1
+                    elif ch == ")":
+                        depth -= 1
+                        if depth == 0:
+                            end = k + 1
+                            break
+                    elif depth == 0 and re.match(
+                            r"(?i)\b(AND|ORDER|GROUP|LIMIT|OFFSET|WHERE)\b",
+                            sentinel_sql[k:]):
+                        end = k
+                        break
+                k += 1
+            if end is not None:
+                pred_span = (jj, end)
+                break
+        jj += 2
+
+    def _in_pred(pos):
+        return pred_span is not None and pred_span[0] < pos < pred_span[1]
+
+    # -- scan occurrences: classify operand vs argument ------------------
+    occs = []
+    j, in_str = 0, False
+    while j < n:
+        c = sentinel_sql[j]
+        if c == "'":
+            in_str = not in_str
+            j += 1; continue
+        if in_str:
+            j += 1; continue
+        if sentinel_sql.startswith(_SENTINEL, j):
+            p = j - 1
+            while p >= 0 and sentinel_sql[p] in " \t\r\n":
+                p -= 1
+            operand = False
+            if p < 0:
+                operand = True
+            else:
+                ch = sentinel_sql[p]
+                if ch in "=<>+-*/%@!":
+                    operand = True
+                elif ch == "(":
+                    w = p
+                    while w >= 0 and (sentinel_sql[w].isalnum() or sentinel_sql[w] == "_"):
+                        w -= 1
+                    operand = sentinel_sql[w + 1:p + 1].upper() == "IN"
+                elif ch.isalnum() or ch == "_":
+                    w = p
+                    while w >= 0 and (sentinel_sql[w].isalnum() or sentinel_sql[w] == "_"):
+                        w -= 1
+                    operand = sentinel_sql[w + 1:p + 1].upper() in (
+                        "LIMIT", "OFFSET", "LIKE", "ILIKE", "IN", "IS",
+                        "AND", "OR", "NOT", "BETWEEN")
+            if _in_pred(j):
+                operand = True  # predicate bind is genuine regardless
+            occs.append((j, operand))
+            j += len(_SENTINEL); continue
+        j += 1
+    if not occs:
+        return sentinel_sql, params
+    if not pred_span and len(occs) <= orig_qs:
+        # plain positional SQL (non-fts or fts without copies)
+        return sentinel_sql.replace(_SENTINEL, "%s"), params
+
+    # -- positional mapping: the k-th operand occurrence takes params
+    #    assigned by psycopg to %s order = original `?` order. The original
+    #    slot of occurrence j (1-based SQL order) is j-1 ONLY for genuine
+    #    placeholders; copies consumed no placeholder. Genuine occurrences
+    #    in SQL order are exactly the input's `?` order, so the m-th
+    #    genuine (operand) occurrence takes params[m-1].
+    # -- BUT copies appear interleaved; psycopg %s order = order we emit
+    #    %s = genuine order = params order. So the bind tuple is params
+    #    AS-IS iff the number of %s emitted == n_params. When copies stole
+    #    slots (genuine count < n_params) — e.g. LIMIT ? misclassified —
+    #    we must NOT bake genuine ones. The predicate rule guarantees the
+    #    MATCH bind is never baked, so mismatch can only mean the
+    #    classifier missed an operand; detect: operand_count < orig_qs ->
+    #    the surplus params belong to those missed operands. Positional
+    #    binding can't express "skip the missed slot", so reorder params:
+    #    %s k takes params[slot_k] where slot_k = occurrence-index based.
+    g_list = [pos for pos, o in occs if o]
+    c_list = [pos for pos, o in occs if not o]
+    if len(g_list) == n_params:
+        # clean split: positional params as-is
+        out_s, last = [], 0
+        for pos, operand in occs:
+            out_s.append(sentinel_sql[last:pos])
+            if operand:
+                out_s.append("%s")
+            else:
+                out_s.append("%s")  # placeholder below replaced by literal
+            last = pos + len(_SENTINEL)
+        out_s.append(sentinel_sql[last:])
+        sql = "".join(out_s)
+        # bake copies: they stand for the predicate slot = the operand
+        # inside pred_span, whose slot = count operands before it.
+        pslot = 0
+        for m, (pos, operand) in enumerate(occs):
+            if _in_pred(pos):
+                pslot = sum(1 for q, o in occs[:m] if o)
+                break
+        v = params[pslot] if pslot < n_params else ""
+        lv = str(v).replace("'", "''") if v is not None else ""
+        # rebuild copies with literal
+        out_s, last = [], 0
+        for pos, operand in occs:
+            out_s.append(sentinel_sql[last:pos])
+            if operand:
+                out_s.append("%s")
+            else:
+                out_s.append(f"lcm_tsq('{lv}')")
+            last = pos + len(_SENTINEL)
+        out_s.append(sentinel_sql[last:])
+        return "".join(out_s), params
+    # mismatch: map by occurrence index (occurrence j -> params[j-1]);
+    # copies bake their own occurrence param (== the value their source
+    # would have carried in naive positional order — for tsquery copies
+    # the source is always the predicate param; for others the naive slot
+    # is correct by construction of naive %s numbering).
+    out_s, last = [], 0
+    kept = []
+    for m, (pos, operand) in enumerate(occs):
+        out_s.append(sentinel_sql[last:pos])
+        if operand:
+            if m < n_params:
+                out_s.append("%s")
+                kept.append(m)
+            else:
+                out_s.append("%s")
+                kept.append(None)
+        else:
+            src_i = m if m < n_params else 0
+            v = params[src_i]
+            lv = str(v).replace("'", "''") if v is not None else ""
+            out_s.append(f"lcm_tsq('{lv}')")
+        last = pos + len(_SENTINEL)
+    out_s.append(sentinel_sql[last:])
+    new_params = tuple((params[k] if k is not None and k < n_params else None)
+                       for k in kept)
+    return "".join(out_s), new_params
 
 def _placeholders_outside_literals(sql: str, tok: str) -> int:
     """Count `tok` ('?' or '%s') occurrences outside string literals."""
@@ -112,6 +351,66 @@ def _pg_post(sql: str) -> str:
     return _unprotect_params(_pg_rewrite(sql))
 
 
+
+
+def _position_cast(sql: str, params):
+    """CAST every positional %s by context: bigint after LIMIT/OFFSET, text
+    everywhere else. PG 18 then never falls back to the smallint default.
+    LIMIT/OFFSET binds get Int32 (exact assignment to bigint); text slots
+    pass through unchanged (psycopg sends str with oid=text; bools become
+    '1'/'0'). Param COUNT is preserved so pad math is untouched."""
+    try:
+        from psycopg.types.numeric import Int32
+    except ImportError:  # pragma: no cover
+        Int32 = None
+    out, i, n = [], 0, len(sql)
+    in_str = False
+    bigint_pos: list[int] = []  # occurrence index -> needs int32
+    occ = 0
+    while i < n:
+        c = sql[i]
+        if c == "'":
+            in_str = not in_str
+            out.append(c); i += 1; continue
+        if not in_str and sql.startswith("%s", i):
+            # numeric context: LIMIT/OFFSET directly before the placeholder
+            # (skip parens/whitespace). Keyword is a whole token, so LIKE
+            # patterns/aliases containing "limit" cannot trigger this.
+            k = i
+            depth = 0
+            while k > 0:
+                k -= 1
+                if sql[k] in " \t\r\n":
+                    continue
+                if sql[k] == "(":
+                    depth += 1
+                    continue
+                break
+            kw = sql[:k + 1].rstrip().upper()
+            if kw.endswith("LIMIT") or kw.endswith("OFFSET"):
+                out.append("CAST(%s AS bigint)")
+                bigint_pos.append(occ)
+            else:
+                out.append("CAST(%s AS text)")
+            occ += 1
+            i += 2; continue
+        out.append(c); i += 1
+    if not bigint_pos and occ == 0:
+        return sql, params
+    newp = list(params)
+    for o in bigint_pos:
+        if o < len(newp):
+            v = newp[o]
+            if isinstance(v, int) and not isinstance(v, bool):
+                newp[o] = Int32(int(v)) if Int32 is not None else v
+    for o in range(occ):
+        if o < len(newp) and o not in bigint_pos:
+            v = newp[o]
+            if isinstance(v, bool):
+                newp[o] = "1" if v else "0"
+    return "".join(out), tuple(newp)
+
+
 class FtsConnection:
     """Wraps a backend connection; rewrites FTS5 virtual-table SQL to PG."""
 
@@ -124,7 +423,7 @@ class FtsConnection:
         return getattr(self._base, name)
 
     def cursor(self):
-        return _FtsCursor(self._base.cursor(), self._specs)
+        return _FtsCursor(self._base.cursor(), lambda: self._specs)
 
     def execute(self, sql, parameters=()):
         c = self.cursor()
@@ -136,6 +435,21 @@ class FtsConnection:
     def executescript(self, script):
         return self._base.executescript(script)
 
+    # -- sqlite3.Connection context-manager parity --------------------------
+    # Upstream uses `with self._conn:` (implicit transaction). Nested use is
+    # safe: psycopg.Transaction is re-entrant via savepoints.
+    def __enter__(self):
+        base_enter = getattr(self._base, "__enter__", None)
+        if base_enter is not None:
+            base_enter()
+        return self
+
+    def __exit__(self, *exc):
+        base_exit = getattr(self._base, "__exit__", None)
+        if base_exit is not None:
+            return base_exit(*exc)
+        return False
+
     def close(self):
         _SPEC_REGISTRY.pop(id(self), None)
         return self._base.close()
@@ -143,19 +457,33 @@ class FtsConnection:
 
 class _FtsCursor:
     def __init__(self, cur, specs):
+        # specs may arrive as an empty tuple at connect time (tables not yet
+        # created); re-read the connection's current specs at use time so
+        # ensure_external_content_fts running later still gets the rewrite.
+        self._parent_specs_ref = specs
         self._cur = cur
         self._specs = specs
         self._extra_params = 0
 
+    def _live_specs(self):
+        specs = self.__dict__.get("_parent_specs_ref", self.__dict__.get("_specs", ()))
+        if callable(specs):
+            try:
+                specs = specs()
+            except Exception:
+                specs = ()
+        return specs
+
     def _rewrite_ts(self, sql: str) -> str:
         self._extra_params = 0
-        if not self._specs:
+        specs_all = self._live_specs()
+        if not specs_all:
             return sql
         if "match" not in sql.lower() and not re.search(r"\b\w+_fts\b", sql, flags=re.I):
             return sql
         out = _pre_pg(sql)
         specs = []
-        for fts_table, content_table, indexed_col in self._specs:
+        for fts_table, content_table, indexed_col in specs_all:
             if not re.search(rf"\b{fts_table}\b", out, flags=re.I):
                 continue
             m = re.search(rf"\b{fts_table}\s+(?:AS\s+)?(?!{_KW}\b)(\w+)", out, flags=re.I)
@@ -274,10 +602,12 @@ class _FtsCursor:
                     continue
                 out = re.sub(rf"(?<![\w.\"]){_other}(?=\s*\.)", _vis, out, flags=re.I)
 
-            # 4. snippet() -> ts_headline over the source column
+            # 4. snippet() -> ts_headline over the source column. tsquery
+            # comes from the WHERE's normalized expression (set below via
+            # {TSQ} placeholder resolved in step 5); options use the
+            # StartSel/StopSel form FTS5 callers expect visually.
             out = re.sub(rf"snippet\s*\(\s*(?:{alias}|{fts_table})\s*,[^)]*\)",
-                         "ts_headline('english', coalesce(\"" + src + "\"::text, ''), "
-                         "'StartSel=>>>, StopSel=<<<, MaxFragments=1, MaxWords=40')",
+                         "SNIP" + src,
                          out, flags=re.I)
 
             # 5. rank -> ts_rank over the SAME tsquery expression from WHERE.
@@ -302,7 +632,17 @@ class _FtsCursor:
                         break
                     k += 1
                 tsexpr = out[j:k].strip()
+            # The captured expression may already carry %s from an earlier
+            # per-spec pass; restore to sentinel tokens so _bind_sentinels
+            # treats copies as COPIES (lcm_q($1)), not fresh placeholders.
+            tsexpr = tsexpr.replace("%s", _SENTINEL)
             ref = 'ts_rank("' + tcol + '", ' + tsexpr + ')'
+            # Resolve deferred snippet() markers (step 4) with the real
+            # tsquery expression discovered from WHERE.
+            def _snip_sub(m):
+                return ("ts_headline('english', coalesce(\"" + m.group(1) + "\"::text, ''), "
+                        + tsexpr + ", 'StartSel=>>>, StopSel=<<<, MaxFragments=1, MaxWords=40')")
+            out = re.sub(r"SNIP(\w+)", _snip_sub, out)
             out = re.sub(rf"\b{alias}\.rank\b", ref, out, flags=re.I)
             # `rank AS x` / `rank x` in a SELECT list is an ALIAS DEFINITION —
             # FTS5's hidden `rank` column does not exist on PG, so substitute
@@ -318,45 +658,43 @@ class _FtsCursor:
             _BOUND = r"\s*(?:\bASC\b|\bDESC\b|\bWHERE\b|\bGROUP\b|\bORDER\b|\bLIMIT\b|\bOFFSET\b|\bFETCH\b|\bUNION\b|EXCEPT|INTERSECT|\bWINDOW\b|$)"
             out = re.sub(r"(?<![\w.\"])rank\b(?=" + _BOUND + ")", ref, out,
                          flags=re.I)
-            # Placeholder accounting: every occurrence of the WHERE clause's
-            # bound query literal (sentinel) OUTSIDE string literals needs one
-            # bind. ORDER BY ts_rank(...) re-spells the WHERE's expression, so
-            # those occurrences add to the original WHERE bind.
-            _i, _c, _in_str = 0, 0, False
-            while _i < len(out):
-                if out[_i] == "'":
-                    _in_str = not _in_str
-                elif not _in_str and out.startswith(_SENTINEL, _i):
-                    _c += 1
-                    _i += len(_SENTINEL)
-                    continue
-                _i += 1
-            self._extra_params = max(self._extra_params, _c - 1)
         return out
 
     def execute(self, sql, parameters=()):
         sql_in = sql
+        # Protect FIRST: every literal `?` outside strings becomes the
+        # internal sentinel token so the rewriter can track which
+        # expressions are bound, then _bind_sentinels assigns real slots
+        # (WHERE binds -> %s, copies -> lcm_q($1)).
+        sql = _protect_params(_protect_percents(sql))
         sql = self._rewrite_ts(sql)
-        final = _unprotect_params(sql)
-        # Padding: the rewriter duplicates the WHERE's bound MATCH expression
-        # into ORDER BY's ts_rank(...). Every placeholder outside string
-        # literals is served by the SAME value as the original WHERE bind.
-        # Count total placeholders in `final` and the original `?` binds
-        # (outside string literals) in the input; the difference is how many
-        # extra copies of params[0] to append.
-        total = _placeholders_outside_literals(final, "%s")
-        supplied_n = len(parameters) if (parameters and not isinstance(parameters, dict)) else 0
-        orig_qs = _placeholders_outside_literals(sql_in, "?")
-        # original ? outside literals == binds the query had (orig_qs count);
-        # params may carry MORE binds (session_id, limit...) than the ts part
-        # — never pad below what the original SQL's ? count.
-        extra = max(total - orig_qs, 0)
-        if supplied_n and extra > 0 and supplied_n >= 1:
-            params = tuple(parameters) + (list(parameters)[0],) * extra
-        elif not parameters:
-            params = ()
+        # Param binding.
+        #
+        # Two kinds of sentinel survive rewriting:
+        #   GENUINE binds  — the original SQL's own `?` placeholders. The
+        #     rewriter NEVER adds these; they exist in the INPUT (sql_in).
+        #     They bind positionally: psycopg assigns %s left-to-right, and
+        #     the rewriter preserves the relative order of genuine
+        #     placeholders, so the k-th genuine sentinel takes slot $k.
+        #   COPIES — rewriter re-spellings of the tsquery expression
+        #     (ts_rank/ts_headline). They must add NO placeholder: they
+        #     become `lcm_q($k)` where $k is the genuine MATCH param's slot.
+        # Classification: a sentinel is genuine iff its byte offset appears
+        # in the sentinel-protected input; a copy is any sentinel not at an
+        # input offset (offsets are stable because all rewrites preserve
+        # non-placeholder text 1:1 at the sentinel level).
+        if isinstance(parameters, dict):
+            params = parameters
+            final = _unprotect_params(sql)
         else:
-            params = tuple(parameters) if not isinstance(parameters, dict) else parameters
+            params = tuple(parameters)
+            # literals are baked from the params themselves: each copy
+            # becomes lcm_tsq(lit) with the MATCH value inlined (single-
+            # quoted, doubled-quote escaped), so no placeholder and no
+            # parameter-reference trickery is involved.
+            final, params = _bind_sentinels_by_input(
+                sql, params,
+                orig_qs=_placeholders_outside_literals(sql_in, "?"))
         up = final.upper()
         # sqlite3 exposes lastrowid for plain INSERTs; the pg shim recovers the
         # generated key via RETURNING, but ONLY for simple single-row INSERTs
@@ -368,7 +706,10 @@ class _FtsCursor:
                 and re.search(r"\bVALUES\b", up)
                 and not re.search(r"DO\s+(NOTHING|UPDATE|SELECT)\b", up)):
             t = re.match(r"^\s*INSERT\s+INTO\s*\W?(\w+)", final, flags=re.I).group(1)
-            aug = " RETURNING *" if t in _INSERT_ROWID_TABLES else ""
+            # RETURNING * would type the INSERT's literal binds through the
+            # target columns; RETURNING store_id keeps them independent and
+            # still serves lastrowid for the content-less-PK tables.
+            aug = " RETURNING store_id" if t in _INSERT_ROWID_TABLES else ""
         try:
             self._cur.execute(final + aug, params)
         except Exception as exc:
@@ -382,7 +723,35 @@ class _FtsCursor:
         self._cur.executemany(_pg_post(_protect_params(sql)), rows)
         return self
 
+    def fetchone(self):
+        from .postgres import _HybridRow
+        r = self._cur.fetchone()
+        return _HybridRow(r) if isinstance(r, dict) else r
+
+    def fetchall(self):
+        from .postgres import _HybridRow
+        return [_HybridRow(r) if isinstance(r, dict) else r
+                for r in self._cur.fetchall()]
+
+    def fetchmany(self, n=None):
+        from .postgres import _HybridRow
+        rows = self._cur.fetchmany(n) if n else self._cur.fetchmany()
+        return [_HybridRow(r) if isinstance(r, dict) else r for r in rows]
+
+    def __iter__(self):
+        from .postgres import _HybridRow
+        def _gen():
+            while True:
+                r = self.fetchone()
+                if r is None:
+                    return
+                yield r
+        return _gen()
+
     def __getattr__(self, name):
+        if name.startswith("__") or name in ("_cur", "_specs", "_extra_params",
+                                            "_parent_specs_ref"):
+            raise AttributeError(name)
         return getattr(self._cur, name)
 
 

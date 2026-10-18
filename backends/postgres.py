@@ -88,6 +88,144 @@ _PRAGMA_EMULATIONS = {
 }
 
 
+def _ensure_catalog_shims(cur, schema: str) -> None:
+    """sqlite_master view + sqlite_sequence table per schema (idempotent).
+
+    Upstream introspects via `SELECT ... FROM sqlite_master WHERE type=...`
+    (~50 sites). The view maps PG catalog rows into the sqlite shape:
+      type    'table' (incl. views; 'virtual' for FTS-facade names below),
+              'index' (incl. the GIN tsvector stand-ins), 'trigger'
+      name    object name (facade/index aliases resolved to the content table)
+      tbl_name owning table
+      sql     best-effort DDL text from pg_get_* (structural checks only
+              substring-test it; callers degrade on residue)
+    """
+    if not _SCHEMA_RE.match(schema):
+        raise ValueError(schema)
+    cur.execute(f'''
+        CREATE TABLE IF NOT EXISTS "{schema}".sqlite_sequence (name text, seq bigint)
+    ''')
+    cur.execute(f'''
+        CREATE OR REPLACE FUNCTION "{schema}"._lcm_tabledef(cls oid) RETURNS text
+        LANGUAGE sql STABLE AS $td$
+            SELECT 'CREATE TABLE ' || quote_ident(c.relname) || ' ('
+                || (SELECT string_agg(
+                        quote_ident(a.attname) || ' ' || format_type(a.atttypid, a.atttypmod)
+                        || CASE WHEN a.atthasdef THEN ' DEFAULT '
+                                   || pg_get_expr(d.adbin, d.adrelid) ELSE '' END,
+                        ', ' ORDER BY a.attnum)
+                    FROM pg_attribute a
+                    LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+                    WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped)
+                || ')'
+            FROM pg_class c
+            WHERE c.oid = cls;
+        $td$;
+    ''')
+    cur.execute(f'''
+        CREATE OR REPLACE VIEW "{schema}".sqlite_master AS
+        WITH objs AS (
+            SELECT CASE
+                       WHEN c.relkind IN ('r','p') THEN 'table'
+                       WHEN c.relkind = 'v' AND c.relname = 'sqlite_master' THEN NULL
+                       WHEN c.relkind = 'v' THEN 'table'
+                   END AS type,
+                   c.relname AS name,
+                   c.relname AS tbl_name,
+                   "{schema}"._lcm_tabledef(c.oid::regclass) AS sql
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = '{schema}' AND c.relkind IN ('r','p','v')
+            UNION ALL
+            SELECT 'index', ic.relname, tc.relname,
+                   pg_get_indexdef(i.indexrelid)
+              FROM pg_index i
+              JOIN pg_class ic ON ic.oid = i.indexrelid
+              JOIN pg_class tc ON tc.oid = i.indrelid
+              JOIN pg_namespace n ON n.oid = tc.relnamespace
+             WHERE n.nspname = '{schema}'
+            UNION ALL
+            SELECT 'trigger', t.tgname, tc.relname,
+                   pg_get_triggerdef(t.oid)
+              FROM pg_trigger t
+              JOIN pg_class tc ON tc.oid = t.tgrelid
+              JOIN pg_namespace n ON n.oid = tc.relnamespace
+             WHERE n.nspname = '{schema}' AND NOT t.tgisinternal
+        ),
+        facades AS (
+            SELECT c.relname || '_fts' AS name, c.relname AS content
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = '{schema}' AND c.relkind = 'r'
+               AND EXISTS (SELECT 1 FROM pg_attribute a
+                            WHERE a.attrelid = c.oid AND a.attname LIKE '%_tsv'
+                              AND a.attnum > 0 AND NOT a.attisdropped)
+        )
+        SELECT 'virtual' AS type, f.name AS name, f.name AS tbl_name,
+               'CREATE VIRTUAL TABLE "' || f.name || '" USING fts5('
+                 || 'content, content_rowid=store_id)' AS sql
+          FROM facades f
+        UNION ALL
+        SELECT 'table', f.name || '_docsize', f.name || '_docsize',
+               'CREATE TABLE "' || f.name || '_docsize"(docid INTEGER PRIMARY KEY, size)'
+          FROM facades f
+        UNION ALL
+        SELECT type, name, tbl_name, sql FROM objs WHERE type IS NOT NULL
+    ''')
+
+
+def _pragma_table_content_exists(cur, name: str):
+    """Fast path for the dominant `SELECT 1 FROM sqlite_master WHERE
+    type='table' AND name=?` shape — a real EXISTS on pg_class, no view."""
+    cur.execute(
+        "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "WHERE n.nspname = current_schema() AND c.relname = %s "
+        "AND c.relkind IN ('r','p','v') LIMIT 1",
+        (name,),
+    )
+    return cur
+
+
+
+def _table_info_sql(value: str):
+    """sqlite PRAGMA table_info row shape as a real query (dict rows serve
+    both row[1] callers — via the cid column — and row['name'] callers)."""
+    return (
+        "SELECT (row_number() OVER ())::int - 1 AS cid,"
+        " column_name AS name, data_type AS type,"
+        " CASE WHEN is_nullable = 'NO' THEN 1 ELSE 0 END AS \"notnull\","
+        " column_default AS dflt_value,"
+        " CASE WHEN ordinal_position ="
+        "     (SELECT min(ordinal_position) FROM information_schema.columns k"
+        "       WHERE k.table_schema = c.table_schema"
+        "         AND k.table_name = c.table_name"
+        "         AND k.column_default LIKE '%%nextval%%')"
+        " THEN 1 ELSE 0 END AS pk"
+        " FROM information_schema.columns c"
+        " WHERE table_schema = current_schema() AND table_name = %s"
+        " ORDER BY ordinal_position",
+        (value,),
+    )
+
+
+def _rewrite_sqlite_master(sql: str):
+    """Rewrite the dominant sqlite_master EXISTS probes into catalog EXISTS
+    queries (bind-param name only). Returns (sql, rewrote: bool)."""
+    m = re.match(
+        r"(?is)^\s*SELECT\s+1\s+FROM\s+sqlite_master\s+WHERE\s+"
+        r"(?:type\s*=\s*'(?:table|view)'\s+AND\s+)?name\s*=\s*\?\s*$",
+        sql.strip(),
+    )
+    if not m:
+        return sql, False
+    return (
+        "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "WHERE n.nspname = current_schema() AND c.relname = %s "
+        "AND c.relkind IN ('r','p','v') LIMIT 1",
+        True,
+    )
+
+
 def _rewrite_text(sql: str) -> str:
     s = sql
 
@@ -173,6 +311,72 @@ def _rewrite_text(sql: str) -> str:
     return s
 
 
+def _adapt_params(params):
+    """SQLite binds dict/list as JSON TEXT; mirror that (targets are TEXT
+    columns, so Jsonb wrappers would fail type checks)."""
+    if params is None:
+        return params
+    import json as _json
+    def _one(p):
+        if isinstance(p, (dict, list)):
+            return _json.dumps(p, ensure_ascii=False, default=str)
+        return p
+    if isinstance(params, dict):
+        return {k: _one(v) for k, v in params.items()}
+    return tuple(_one(p) for p in params)
+
+
+def _annotate_param_types(sql: str, _shape=None) -> str:
+    """Cast every positional %s to text EXCEPT after LIMIT/OFFSET (which
+    PG needs numeric). String-literal %s are left alone."""
+    out, i, in_str = [], 0, False
+    n = len(sql)
+    while i < n:
+        c = sql[i]
+        if c == "'":
+            in_str = not in_str
+            out.append(c); i += 1; continue
+        if not in_str and sql.startswith("%s", i):
+            # look back: LIMIT/OFFSET keyword right before -> numeric cast
+            j = i - 1
+            while j >= 0 and sql[j] in " \t\n\r":
+                j -= 1
+            tail = sql[max(0, j-7):j+1].upper()
+            if tail.endswith("LIMIT") or tail.endswith("OFFSET"):
+                out.append("CAST(%s AS bigint)")
+            else:
+                out.append("CAST(%s AS text)")
+            i += 2; continue
+        out.append(c); i += 1
+    return "".join(out)
+
+
+class _HybridRow(dict):
+    """Row with BOTH dict and tuple semantics.
+
+    dict(row)/isinstance(row, dict) -> True (dict base), while row[0],
+    row[1], tuple(row), len(row) work via __getitem__ overload (int index ->
+    positional value in SELECT order; str/slice -> dict access). psycopg
+    dict_row keeps key insertion order == SELECT order, which makes the
+    positional branch faithful.
+    """
+
+    __slots__ = ()
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return list(self.values())[key]
+        if isinstance(key, slice):
+            return list(self.values())[key]
+        return dict.__getitem__(self, key)
+
+    def __iter__(self):
+        return iter(list(self.values()))  # sqlite3.Row iterates values
+
+    def keys(self):
+        return dict.keys(self)
+
+
 class _Cursor:
     """sqlite3.Cursor-shaped wrapper over a psycopg cursor."""
 
@@ -187,6 +391,10 @@ class _Cursor:
         if sql.strip().lower().startswith("begin"):
             self._adapter.begin()
         sql, params = self._adapter._translate(sql, parameters)
+        params = _adapt_params(params)
+        if isinstance(params, dict):
+            # sqlite-style :named params -> psycopg %(name)s dictConfig keys
+            sql = re.sub(r":([A-Za-z_]\w*)", lambda m: "%%(%s)s" % m.group(1), sql)
         self._raw.execute(sql, params)
         self._rowcount = self._raw.rowcount
         if "INSERT" in sql.upper() and "RETURNING" in sql.upper():
@@ -217,14 +425,24 @@ class _Cursor:
         return self
 
     # sqlite3 parity: .row_factory assignment is handled at connection level
+    @staticmethod
+    def _as_row(r):
+        # Hybrid rows: dict AND tuple semantics (upstream indexes store rows
+        # positionally (row[0]/tuple(row)) AND by key (row["content"])).
+        # Lists keep dict(row)/isinstance(row, dict) working everywhere.
+        if isinstance(r, dict):
+            return _HybridRow(r)
+        return r
+
     def fetchone(self):
-        return self._raw.fetchone()
+        return self._as_row(self._raw.fetchone())
 
     def fetchall(self):
-        return self._raw.fetchall()
+        return [self._as_row(r) for r in self._raw.fetchall()]
 
     def fetchmany(self, n=None):
-        return self._raw.fetchmany(n) if n else self._raw.fetchmany()
+        return [self._as_row(r) for r in
+                (self._raw.fetchmany(n) if n else self._raw.fetchmany())]
 
     def close(self):
         self._raw.close()
@@ -294,21 +512,28 @@ class PgConnection:
             if re.match(r"^BEGIN\b", stripped, flags=re.I):
                 return ("BEGIN TRANSACTION", ())
             return ("SELECT 1", ())
+        if isinstance(params, dict):
+            return _rewrite_text(stripped), params
         out = _rewrite_text(stripped)
+        if params and len(params) == 1 and "sqlite_master" in stripped:
+            probe, hit = _rewrite_sqlite_master(out)
+            if hit:
+                return probe, params
         if isinstance(params, dict):
             return out, params
         return out, tuple(params or ())
 
     def _pragma(self, stmt: str):
-        m = re.match(r"PRAGMA\s+(\w+)(?:\s*=\s*(\S+))?\s*;?\s*$", stmt, flags=re.I)
+        m = re.match(r"PRAGMA\s+(?:\w+\.)?(\w+)\s*(?:[=(]\s*(\S+?)\s*[)=]|\s*=\s*(\S+))?\s*;?\s*$", stmt, flags=re.I)
         if not m:
             raise UnsupportedSQL(f"unparseable pragma: {stmt!r}")
-        name, value = m.group(1).lower(), (m.group(2) or "").strip("'\"")
+        name = m.group(1).lower()
+        value = (m.group(2) or m.group(3) or "").strip("'\"")
         if name == "query_only":
             self._query_only = value not in ("", "0", "OFF", "off", "false")
             return ("SELECT 1", ())
-        if name == "table_info":
-            return ("SELECT * FROM information_schema.columns WHERE table_name = %s ORDER BY ordinal_position", (value,))
+        if name in ("table_info", "table_xinfo"):
+            return _table_info_sql(value)
         if name == "user_version":
             return ("SELECT 1", ())
         if name in ("schema_version", "data_version"):
@@ -320,6 +545,16 @@ class PgConnection:
                 (),
             )
         if name in ("wal_checkpoint", "foreign_key_check", "index_list", "index_info", "index_xinfo"):
+            return ("SELECT 1", ())
+        if name == "database_list":
+            return (
+                "SELECT 0 AS seq, 'lcm' AS name,"
+                " current_setting('data_directory', true) || '/base/'"
+                " || (SELECT datname FROM pg_database"
+                "     WHERE datname = current_database()) AS file",
+                (),
+            )
+        if name in ("settings", "mmap_size", "journal_size_limit", "page_size"):
             return ("SELECT 1", ())
         if name in _PRAGMA_EMULATIONS and _PRAGMA_EMULATIONS[name] is None:
             return ("SELECT 1", ())
@@ -347,6 +582,39 @@ class PgConnection:
 
     def end_tx(self):
         self._tx_open = False
+
+    # sqlite3 `with conn:` == transaction scope. The psycopg connection ctx
+    # manager IS transaction scope (BEGIN..COMMIT/ROLLBACK around the block).
+    # It must wrap the PHYSICAL psycopg connection, not re-issue BEGIN.
+    def __enter__(self):
+        inner = getattr(self, "_tx_ctx", None)
+        if inner is None:
+            from psycopg import Transaction
+            inner = self._conn.transaction()
+            self._tx_ctx = inner
+        try:
+            inner.__enter__()
+        except Exception:
+            # already inside a transaction psycopg manages; degrade to no-op
+            self._tx_ctx = None
+        return self
+
+    def __exit__(self, *exc):
+        inner = getattr(self, "_tx_ctx", None)
+        if inner is not None:
+            self._tx_ctx = None
+            try:
+                return inner.__exit__(*exc)
+            except Exception:
+                if exc[0] is not None:
+                    try:
+                        self._conn.rollback()
+                    except Exception:
+                        pass
+                return False
+        if exc[0] is not None:
+            self.rollback()
+        return False
 
     def execute(self, sql: str, parameters=()):
         c = self.cursor()
@@ -430,6 +698,7 @@ def connect(dsn: str, schema: str, *, min_size: int = 1, max_size: int = 8,
                 raise ValueError(schema)
             cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
             cur.execute(_set_stmts(schema, lock_timeout_ms))
+            _ensure_catalog_shims(cur, schema)
     finally:
         pool.putconn(probe)
     # wrap: configure callback pins schema/lock_timeout on every checkout

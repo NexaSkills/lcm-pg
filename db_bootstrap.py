@@ -2999,6 +2999,17 @@ def _fts_repair_ownership(conn: sqlite3.Connection):
         conn.execute(f"PRAGMA busy_timeout={previous_timeout_ms}")
 
 
+def _pg_fts_native(conn) -> bool:
+    """True on a Postgres-backend connection: FTS there is trigger-maintained
+    tsvector (backends/fts_pg), so SQLite's shadow-table repair machinery is
+    inapplicable and every check below reports 'complete'."""
+    try:
+        from .backends.fts_conn import FtsConnection  # type: ignore
+    except Exception:
+        return False
+    return isinstance(conn, FtsConnection)
+
+
 def repair_external_content_fts(
     conn: sqlite3.Connection,
     spec: ExternalContentFtsSpec,
@@ -3006,6 +3017,15 @@ def repair_external_content_fts(
     now: float | None = None,
     throttle: bool = False,
 ) -> dict[str, bool]:
+    if _pg_fts_native(conn):
+        try:
+            from .backends import fts_pg  # type: ignore
+            from .backends.fts_conn import add_spec  # type: ignore
+            fts_pg.ensure_fts(conn, spec.content_table, spec.indexed_column)
+            add_spec(conn, (spec.table_name, spec.content_table, spec.indexed_column))
+        except Exception:
+            logger.debug("pg fts ensure failed (degrading to LIKE)", exc_info=True)
+        return {"rebuilt": False, "degraded": False, "triggers_recreated": False}
     rebuilt = False
     degraded = False
     fts_structure_needs_rebuild = _fts_needs_rebuild_structural(conn, spec)
