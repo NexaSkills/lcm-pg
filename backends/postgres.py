@@ -105,73 +105,8 @@ def _ensure_catalog_shims(cur, schema: str) -> None:
     cur.execute(f'''
         CREATE TABLE IF NOT EXISTS "{schema}".sqlite_sequence (name text, seq bigint)
     ''')
-    cur.execute(f'''
-        CREATE OR REPLACE FUNCTION "{schema}"._lcm_tabledef(cls oid) RETURNS text
-        LANGUAGE sql STABLE AS $td$
-            SELECT 'CREATE TABLE ' || quote_ident(c.relname) || ' ('
-                || (SELECT string_agg(
-                        quote_ident(a.attname) || ' ' || format_type(a.atttypid, a.atttypmod)
-                        || CASE WHEN a.atthasdef THEN ' DEFAULT '
-                                   || pg_get_expr(d.adbin, d.adrelid) ELSE '' END,
-                        ', ' ORDER BY a.attnum)
-                    FROM pg_attribute a
-                    LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
-                    WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped)
-                || ')'
-            FROM pg_class c
-            WHERE c.oid = cls;
-        $td$;
-    ''')
-    cur.execute(f'''
-        CREATE OR REPLACE VIEW "{schema}".sqlite_master AS
-        WITH objs AS (
-            SELECT CASE
-                       WHEN c.relkind IN ('r','p') THEN 'table'
-                       WHEN c.relkind = 'v' AND c.relname = 'sqlite_master' THEN NULL
-                       WHEN c.relkind = 'v' THEN 'table'
-                   END AS type,
-                   c.relname AS name,
-                   c.relname AS tbl_name,
-                   "{schema}"._lcm_tabledef(c.oid::regclass) AS sql
-              FROM pg_class c
-              JOIN pg_namespace n ON n.oid = c.relnamespace
-             WHERE n.nspname = '{schema}' AND c.relkind IN ('r','p','v')
-            UNION ALL
-            SELECT 'index', ic.relname, tc.relname,
-                   pg_get_indexdef(i.indexrelid)
-              FROM pg_index i
-              JOIN pg_class ic ON ic.oid = i.indexrelid
-              JOIN pg_class tc ON tc.oid = i.indrelid
-              JOIN pg_namespace n ON n.oid = tc.relnamespace
-             WHERE n.nspname = '{schema}'
-            UNION ALL
-            SELECT 'trigger', t.tgname, tc.relname,
-                   pg_get_triggerdef(t.oid)
-              FROM pg_trigger t
-              JOIN pg_class tc ON tc.oid = t.tgrelid
-              JOIN pg_namespace n ON n.oid = tc.relnamespace
-             WHERE n.nspname = '{schema}' AND NOT t.tgisinternal
-        ),
-        facades AS (
-            SELECT c.relname || '_fts' AS name, c.relname AS content
-              FROM pg_class c
-              JOIN pg_namespace n ON n.oid = c.relnamespace
-             WHERE n.nspname = '{schema}' AND c.relkind = 'r'
-               AND EXISTS (SELECT 1 FROM pg_attribute a
-                            WHERE a.attrelid = c.oid AND a.attname LIKE '%_tsv'
-                              AND a.attnum > 0 AND NOT a.attisdropped)
-        )
-        SELECT 'virtual' AS type, f.name AS name, f.name AS tbl_name,
-               'CREATE VIRTUAL TABLE "' || f.name || '" USING fts5('
-                 || 'content, content_rowid=store_id)' AS sql
-          FROM facades f
-        UNION ALL
-        SELECT 'table', f.name || '_docsize', f.name || '_docsize',
-               'CREATE TABLE "' || f.name || '_docsize"(docid INTEGER PRIMARY KEY, size)'
-          FROM facades f
-        UNION ALL
-        SELECT type, name, tbl_name, sql FROM objs WHERE type IS NOT NULL
-    ''')
+    from . import shim_ddl
+    shim_ddl.install(cur, schema)
 
 
 def _pragma_table_content_exists(cur, name: str):
@@ -187,25 +122,194 @@ def _pragma_table_content_exists(cur, name: str):
 
 
 
-def _table_info_sql(value: str):
-    """sqlite PRAGMA table_info row shape as a real query (dict rows serve
-    both row[1] callers — via the cid column — and row['name'] callers)."""
+def _stdlib_sqlite3_path():
+    import sysconfig, pathlib
+    return str(pathlib.Path(sysconfig.get_paths()["stdlib"]) / "sqlite3" / "__init__.py")
+
+
+def _table_info_sql(value: str, conn=None):
+    """PRAGMA table_info emulation with sqlite-exact row shapes.
+
+    Reconstructs the original sqlite DDL for `value` from the PG catalog and
+    parses it with stdlib sqlite (in-memory) so sqlite's own pragma engine
+    answers. LCM's schema verifiers compare sqlite shapes (storage classes,
+    AUTOINCREMENT pk=1 / notnull=0 / NULL default, strftime('%s','now')
+    default text) that a catalog-derived query cannot express: PG stores
+    those as nextval(...), EXTRACT(epoch FROM now()), 'x'::text. Returns a
+    ('__rows__', rows) direct-result marker consumed by _Cursor.execute
+    before translation; falls back to a catalog-only query (right names and
+    types, approximate defaults) when reconstruction fails.
+    """
+    try:
+        base = value.split(".")[-1]  # schema.table form: pragma takes bare name
+        ddl = _sqlite_ddl_for(base, conn)
+        if ddl:
+            import importlib.util as _ilu, sys as _sys
+            _s3 = _sys.modules.get("_lcm_stdlib_sqlite3")
+            if _s3 is None:
+                # Import BY PATH: inside the fork package a bare
+                # `import sqlite3` hits the compat shim and recurses. The
+                # stdlib package dir shadows the stdlib extension (its
+                # sqlite3/ subdirectory), so give it a non-shadowing name.
+                _spec = _ilu.spec_from_file_location(
+                    "_lcm_stdlib_sqlite3", _stdlib_sqlite3_path(),
+                    submodule_search_locations=[])
+                _s3 = _ilu.module_from_spec(_spec)
+                _sys.modules["_lcm_stdlib_sqlite3"] = _s3  # pkg init imports .sqlite3 → resolves via path
+                try:
+                    _spec.loader.exec_module(_s3)
+                except Exception:
+                    _sys.modules.pop("_lcm_stdlib_sqlite3", None)
+                    raise
+            mem = _s3.connect(":memory:")
+            try:
+                mem.execute(ddl)
+                rows = mem.execute(
+                    "SELECT cid, name, type, \"notnull\", dflt_value, pk"
+                    " FROM pragma_table_info(?)", (base,)).fetchall()
+                if rows:
+                    import os as _os
+                    if _os.environ.get("LCM_PG_DEBUG_PRAGMA"):
+                        import sys as _s
+                        print("[pragma] DDL:", ddl[:120], file=_s.stderr)
+                    return ("__rows__", [tuple(r) for r in rows])
+            finally:
+                mem.close()
+    except Exception as _e:
+        import os as _os
+        if _os.environ.get("LCM_PG_DEBUG_PRAGMA"):
+            import sys as _s, traceback as _tb
+            print("[pragma] fallback:", repr(_e), file=_s.stderr)
+            _tb.print_exc(file=_s.stderr)
+    # fallback: catalog-only shapes
     return (
-        "SELECT (row_number() OVER ())::int - 1 AS cid,"
-        " column_name AS name, data_type AS type,"
-        " CASE WHEN is_nullable = 'NO' THEN 1 ELSE 0 END AS \"notnull\","
-        " column_default AS dflt_value,"
-        " CASE WHEN ordinal_position ="
-        "     (SELECT min(ordinal_position) FROM information_schema.columns k"
-        "       WHERE k.table_schema = c.table_schema"
-        "         AND k.table_name = c.table_name"
-        "         AND k.column_default LIKE '%%nextval%%')"
-        " THEN 1 ELSE 0 END AS pk"
-        " FROM information_schema.columns c"
-        " WHERE table_schema = current_schema() AND table_name = %s"
-        " ORDER BY ordinal_position",
+        "SELECT (a.attnum - 1)::int AS cid, a.attname AS name,"
+        " CASE"
+        "   WHEN a.atttypid IN ('integer'::regtype,'bigint'::regtype,"
+        "     'smallint'::regtype) THEN 'INTEGER'"
+        "   WHEN a.atttypid IN ('real'::regtype,'double precision'::regtype,"
+        "     'numeric'::regtype) THEN 'REAL'"
+        "   WHEN a.atttypid = 'bytea'::regtype THEN 'BLOB'"
+        "   ELSE 'TEXT' END AS type,"
+        " a.attnotnull::int AS \"notnull\","
+        " CASE WHEN d.adbin IS NULL THEN NULL"
+        "   WHEN pg_get_expr(d.adbin, d.adrelid) LIKE 'nextval%%' THEN NULL"
+        "   WHEN position('::' in pg_get_expr(d.adbin, d.adrelid)) > 0 THEN"
+        "     left(pg_get_expr(d.adbin, d.adrelid),"
+        "          position('::' in pg_get_expr(d.adbin, d.adrelid)) - 1)"
+        "   ELSE pg_get_expr(d.adbin, d.adrelid) END AS dflt_value,"
+        " coalesce((SELECT u.ord::int FROM pg_index i,"
+        "     LATERAL unnest(i.indkey::int[]) WITH ORDINALITY AS u(k, ord)"
+        "     WHERE i.indrelid = a.attrelid AND i.indisprimary"
+        "       AND u.k = a.attnum LIMIT 1), 0) AS pk"
+        " FROM pg_attribute a"
+        " LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum"
+        " WHERE a.attrelid = (SELECT oid FROM pg_class WHERE relname = %s"
+        "   AND relnamespace = current_schema()::regnamespace)"
+        "   AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
         (value,),
     )
+
+
+def _pg_default_to_sqlite(d: str) -> str:
+    """Map a PG default expression back to sqlite-parseable text."""
+    s = d.strip()
+    m = re.match(r"(?is)^CAST\s*\((.*)\)\s*(AS\s+\w+)?$", s)
+    if m:
+        s = m.group(1).strip()
+    s = re.sub(r"(?i)\bEXTRACT\s*\(\s*epoch\s+FROM\s+now\s*\(\s*\)\s*\)",
+               "strftime('%s','now')", s)
+    s = re.sub(r"(?i)^now\s*\(\s*\)\s*$", "strftime('%s','now')", s)
+    # sqlite requires parenthesized expression defaults (and the original
+    # sqlite DDL had them); only wrap function-call expressions.
+    if re.match(r"^[A-Za-z_][A-Za-z_0-9]*\s*\(", s):
+        s = "(" + s + ")"
+    return s
+
+
+def _sqlite_ddl_for(table: str, conn=None):
+    """Reconstruct sqlite CREATE TABLE text from PG catalog rows.
+
+    Column order = attnum; types mapped to sqlite storage classes; a
+    nextval-defaulted first PK column becomes PRIMARY KEY AUTOINCREMENT
+    (sqlite's rowid alias: notnull 0, NULL default, pk 1); NOT NULL applies
+    to the rest; default expressions have PG ::type casts stripped and
+    EXTRACT(epoch FROM now()) mapped back to strftime('%s','now').
+    """
+    if conn is None:
+        return None
+    raw = conn._pool.getconn() if hasattr(conn, "_pool") else conn._conn
+    try:
+        # RAW psycopg cursor: bypass _Cursor/_translate (percent protection
+        # would turn the %s placeholder into a literal and return 0 rows).
+        cur = raw.cursor()
+        try:
+            cur.execute(
+                "SELECT a.attnum, a.attname,"
+                " CASE"
+                "   WHEN a.atttypid IN ('integer'::regtype,'bigint'::regtype,"
+                "     'smallint'::regtype) THEN 'INTEGER'"
+                "   WHEN a.atttypid IN ('real'::regtype,'double precision'::regtype,"
+                "     'numeric'::regtype) THEN 'REAL'"
+                "   WHEN a.atttypid = 'bytea'::regtype THEN 'BLOB'"
+                "   ELSE 'TEXT' END,"
+                " a.attnotnull,"
+                " (d.adbin IS NOT NULL AND pg_get_expr(d.adbin, d.adrelid)"
+                "     LIKE 'nextval%%'),"
+                " CASE WHEN d.adbin IS NULL THEN NULL"
+                "   WHEN pg_get_expr(d.adbin, d.adrelid)"
+                "     LIKE 'nextval%%' THEN NULL"
+                "   WHEN position('::' in pg_get_expr(d.adbin, d.adrelid)) > 0 THEN"
+                "     left(pg_get_expr(d.adbin, d.adrelid),"
+                "          position('::' in pg_get_expr(d.adbin, d.adrelid)) - 1)"
+                "   ELSE pg_get_expr(d.adbin, d.adrelid) END,"
+                " (SELECT u.ord::int FROM pg_index i,"
+                "     LATERAL unnest(i.indkey::int[])"
+                "       WITH ORDINALITY AS u(k, ord)"
+                "     WHERE i.indrelid = a.attrelid AND i.indisprimary"
+                "       AND u.k = a.attnum LIMIT 1)"
+                " FROM pg_attribute a"
+                " LEFT JOIN pg_attrdef d"
+                "   ON d.adrelid = a.attrelid AND d.adnum = a.attnum"
+                " WHERE a.attrelid = (SELECT oid FROM pg_class"
+                "   WHERE relname = %s"
+                "     AND relnamespace = current_schema()::regnamespace)"
+                "   AND a.attnum > 0 AND NOT a.attisdropped"
+                " ORDER BY a.attnum",
+                (table,))
+            rows = cur.fetchall()
+        finally:
+            cur.close()
+    finally:
+        if hasattr(conn, "_pool"):
+            conn._pool.putconn(raw)
+    if not rows:
+        return None
+    cols = []
+    pk_cols = sorted((p for p in rows if p[6]), key=lambda p: p[6])
+    autoincrement_pk = (len(pk_cols) == 1 and pk_cols and pk_cols[0][6] == 1
+                        and pk_cols[0][4] and pk_cols[0][2] == "INTEGER")
+    for (attnum, name, stype, notnull, is_seq, dflt, pkord) in rows:
+        bits = ['"' + str(name).replace('"', '""') + '"', stype]
+        if autoincrement_pk and pkord == 1:
+            bits.append("PRIMARY KEY AUTOINCREMENT")
+        else:
+            # sqlite reports a sequence-defaulted INTEGER PK as a rowid
+            # alias: notnull 0 (INTEGER PKs are NULL-tolerant aliases).
+            if notnull and not (is_seq and pkord):
+                bits.append("NOT NULL")
+            if dflt is not None:
+                d = str(dflt)
+                d = _pg_default_to_sqlite(d)
+                bits.append("DEFAULT " + d)
+        cols.append(" ".join(bits))
+    if pk_cols and not autoincrement_pk:
+        # table-level PRIMARY KEY (composite or non-integer): sqlite orders
+        # pk columns 1..n by index position; columns keep NOT NULL already.
+        cols.append("PRIMARY KEY (%s)" % ", ".join(
+            '"' + str(p[1]).replace('"', '""') + '"' for p in pk_cols))
+    return "CREATE TABLE %s (%s)" % ('"' + table.replace('"', '""') + '"',
+                                      ", ".join(cols))
 
 
 def _rewrite_sqlite_master(sql: str):
@@ -224,6 +328,104 @@ def _rewrite_sqlite_master(sql: str):
         "AND c.relkind IN ('r','p','v') LIMIT 1",
         True,
     )
+
+
+# ---------------------------------------------------------------------------
+# SQLite CREATE TRIGGER -> PG trigger translation
+# ---------------------------------------------------------------------------
+# Covers LCM's two shapes: outbox INSERT triggers and SELECT RAISE(ABORT,...)
+# guard triggers, with UPDATE OF col lists mapped to WHEN guards. The body
+# compiles into a row-level plpgsql function named _trg_<trigger>.
+
+
+def _translate_sqlite_trigger(sql: str):
+    """Return PG trigger DDL (multi-statement) or None for unsupported shapes."""
+    m = re.match(
+        r"(?is)\s*CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+        r"(\w+)\s+(AFTER|BEFORE)\s+(INSERT|UPDATE|DELETE)(?:\s+OF\s+([\w,\s]+))?"
+        r"\s+ON\s+(\w+)\s+BEGIN\s+(.*?)\s*END\s*;?\s*$",
+        sql)
+    if not m:
+        return None
+    name, when, event, of_cols, table, body = m.groups()
+    stmts = [s.strip() for s in re.split(r";\s*(?=\S)", body) if s.strip()]
+    translated = []
+    for st in stmts:
+        mr = re.match(r"(?is)^\s*SELECT\s+RAISE\s*\(\s*(ABORT|FAIL|IGNORE|ROLLBACK)"
+                      r"\s*,\s*'((?:[^']|'')*)'\s*\)(?:\s+WHERE\s+(.+?))?\s*$", st)
+        if mr:
+            _kind, msg, cond = mr.groups()
+            cond = (cond or "TRUE").replace("new.", "NEW.").replace("old.", "OLD.")
+            if cond != "TRUE":
+                cond = _rewrite_text(cond).rstrip(";").strip()
+            translated.append(
+                "IF %s THEN RAISE EXCEPTION '%s'; END IF"
+                % (cond, msg.replace("'", "''")))
+            continue
+        if not re.match(r"(?is)^\s*(INSERT\s+INTO|DELETE\s+FROM|UPDATE\s)", st):
+            return None  # unsupported body op -> caller passes SQL through
+        st = re.sub(r"(?i)\bnew\.", "NEW.", st)
+        st = re.sub(r"(?i)\bold\.", "OLD.", st)
+        translated.append(st.rstrip(";").strip())
+    fn = "_trg_" + name
+    # translate body statements ONE BY ONE (_rewrite_text is single-statement
+    # scoped; its regexes cannot span ';').
+    body_sql = ";\n            ".join(
+        "; ".join(_rewrite_text(part).rstrip(";").strip()
+                  for part in _split_statements(s))
+        for s in translated)
+    # sentinel: authoritative event kind for the sqlite_master shim's trigger
+    # reverse-translation (tgtype bits are unreliable across WHEN guards).
+    body_sql = "/*lcm-event: " + event + "*/ " + body_sql
+    guard = ""
+    if of_cols and event == "UPDATE":
+        cols = [c.strip() for c in of_cols.split(",") if c.strip()]
+        conds = " OR ".join(f"OLD.{c} IS DISTINCT FROM NEW.{c}" for c in cols)
+        guard = "\n            WHEN (" + conds + ")"
+    op = {"INSERT": "INSERT", "DELETE": "DELETE", "UPDATE": "UPDATE"}[event]
+    ret = "OLD" if (when == "BEFORE" and event == "DELETE") else "NEW"
+    return f"""
+        DROP TRIGGER IF EXISTS "{name}" ON "{table}" CASCADE;
+        DROP FUNCTION IF EXISTS "{fn}"() CASCADE;
+        CREATE FUNCTION "{fn}"() RETURNS trigger
+        LANGUAGE plpgsql AS $trg$
+        BEGIN
+            {body_sql};
+            RETURN {ret};
+        END
+        $trg$;
+        CREATE TRIGGER "{name}" {when} {op} ON "{table}"
+        FOR EACH ROW{guard}
+        EXECUTE FUNCTION "{fn}"();
+    """
+
+
+
+def _drop_trigger_pg(m: re.Match) -> str:
+    """Render a PG DROP TRIGGER for a SQLite DROP (see _rewrite_text).
+
+    PG requires the owning table; CASCADE also removes the shadow
+    _trg_<name>() function the translator created. SQLite trigger names are
+    global, so ON-less drops reverse-resolve via pg_trigger inside a DO
+    block — and only fire when the name is genuinely a trigger (the
+    sqlite_master view lists functions too, so a bare name check would let a
+    name collision drop the wrong object). Built by concatenation so the
+    statement never carries a literal % (psycopg placeholder).
+    """
+    if_exists, name, table = m.groups()
+    if table:
+        return "DROP TRIGGER %s %s ON %s CASCADE" % (
+            "IF EXISTS" if if_exists else "", name, table)
+    head = "DROP TRIGGER " + ("IF EXISTS " if if_exists else "")
+    cond = "NOT tgisinternal AND tgname = " + repr(name)
+    return (
+        "DO $$ BEGIN EXECUTE '" + head + "' || ("
+        "SELECT quote_ident(tgname) || ' ON ' || tgrelid::regclass::text"
+        " || ' CASCADE' FROM pg_trigger WHERE " + cond + " LIMIT 1);"
+        " EXCEPTION WHEN OTHERS THEN"
+        " IF (SELECT count(*) FROM pg_trigger WHERE " + cond + ") = 0 THEN"
+        " NULL; ELSE RAISE; END IF;"
+        " END $$")
 
 
 def _rewrite_text(sql: str) -> str:
@@ -286,6 +488,20 @@ def _rewrite_text(sql: str) -> str:
     # x'hex' blob literals -> decode(hex)
     s = re.sub(r"\bx'([0-9a-fA-F]+)'", r"decode(hex('\1'))", s)
 
+    # SQLite 2-arg scalar min()/max() -> PG least()/greatest() (aggregate
+    # min(double, double) does not exist in PG).
+    s = re.sub(r"\bmin\s*\(\s*([^,(()]*(?:\([^()]*\))?[^,(()]*)\s*,\s*([^,(()]*(?:\([^()]*\))?[^,(()]*)\s*\)",
+               r"least(\1, \2)", s, flags=re.I)
+    s = re.sub(r"\bmax\s*\(\s*([^,(()]*(?:\([^()]*\))?[^,(()]*)\s*,\s*([^,(()]*(?:\([^()]*\))?[^,(()]*)\s*\)",
+               r"greatest(\1, \2)", s, flags=re.I)
+
+    # SQLite 2-arg scalar min()/max() -> PG least()/greatest() (aggregate
+    # min(double, double) does not exist in PG). Statement-scoped input.
+    s = re.sub(r"\bmin\s*\(\s*([^,(()]*(?:\([^()]*\))?[^,(()]*)\s*,\s*([^,(()]*(?:\([^()]*\))?[^,(()]*)\s*\)",
+               r"least(\1, \2)", s, flags=re.I)
+    s = re.sub(r"\bmax\s*\(\s*([^,(()]*(?:\([^()]*\))?[^,(()]*)\s*,\s*([^,(()]*(?:\([^()]*\))?[^,(()]*)\s*\)",
+               r"greatest(\1, \2)", s, flags=re.I)
+
     # random() -> random() works on PG; json_extract(col,'$.key') -> (col)::jsonb ->> 'key'
     s = re.sub(
         r"\bjson_extract\s*\(\s*([A-Za-z_][\w.]*)\s*,\s*'\$\.([\w]+)'\s*\)",
@@ -306,6 +522,18 @@ def _rewrite_text(sql: str) -> str:
             out.append(c)
         i += 1
     s = "".join(out)
+
+    # DROP TRIGGER [IF EXISTS] name [ON table] -> PG form. PG requires the
+    # owning table; CASCADE also removes the shadow _trg_<name>() function the
+    # translator created. ON-less drops (SQLite trigger names are global) are
+    # reverse-resolved via pg_trigger inside a DO block. The concatenation
+    # avoids literal % tokens in the statement (psycopg treats them as
+    # placeholders).
+    if re.search(r"(?i)\bDROP\s+TRIGGER\b", s):
+        s = re.sub(
+            r"(?i)\bDROP\s+TRIGGER\s+(?:(IF\s+EXISTS)\s+)?(\w+)(?:\s+ON\s+(\w+))?",
+            _drop_trigger_pg,
+            s)
 
     # SQLite FTS MATCH quoting: "col" MATCH '"phrase"' -> to_tsvector/plainto
     return s
@@ -385,12 +613,26 @@ class _Cursor:
         self._raw = raw
         self._lastrowid: Optional[int] = None
         self._rowcount = -1
+        self._rows: Optional[list] = None  # direct-result channel (pragmas)
+        self._pos = 0
 
     # sqlite3 parity surface
     def execute(self, sql: str, parameters: Sequence | dict | None = None):
         if sql.strip().lower().startswith("begin"):
             self._adapter.begin()
+        if re.match(r"(?i)\s*CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\b", sql):
+            tr = _translate_sqlite_trigger(sql)
+            if tr is not None:
+                self._raw_exec(tr)
+                self._rowcount = 0
+                return self
+        self._rows, self._pos = None, 0
         sql, params = self._adapter._translate(sql, parameters)
+        if sql == "__rows__":
+            self._rows = [dict(zip(("cid", "name", "type", "notnull",
+                                     "dflt_value", "pk"), r)) for r in params]
+            self._rowcount = len(self._rows)
+            return self
         params = _adapt_params(params)
         if isinstance(params, dict):
             # sqlite-style :named params -> psycopg %(name)s dictConfig keys
@@ -420,11 +662,27 @@ class _Cursor:
     def executescript(self, script: str):
         for stmt in _split_statements(script):
             stmt = stmt.strip()
-            if stmt:
-                self._raw.execute(_rewrite_text(stmt))
+            if not stmt:
+                continue
+            if re.match(r"(?i)\s*CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\b", stmt):
+                tr = _translate_sqlite_trigger(stmt)
+                if tr is not None:
+                    self._raw_exec(tr)
+                    continue
+            self._raw_exec(_rewrite_text(stmt))
         return self
 
     # sqlite3 parity: .row_factory assignment is handled at connection level
+    def _raw_exec(self, sql: str):
+        """Execute DDL/text-rewritten SQL with NO binds.
+
+        psycopg only unescapes '%%' when it treats the string as a query
+        (params not None). Passing () keeps placeholder scanning on while
+        binding nothing, so '%%' -> '%' reaches the server. Without this,
+        LIKE '%x%%' patterns baked into translated DDL break silently.
+        """
+        return self._raw.execute(sql, ())
+
     @staticmethod
     def _as_row(r):
         # Hybrid rows: dict AND tuple semantics (upstream indexes store rows
@@ -435,12 +693,27 @@ class _Cursor:
         return r
 
     def fetchone(self):
+        if self._rows is not None:
+            if self._pos >= len(self._rows):
+                return None
+            r = self._rows[self._pos]
+            self._pos += 1
+            return self._as_row(r)
         return self._as_row(self._raw.fetchone())
 
     def fetchall(self):
+        if self._rows is not None:
+            out = self._rows[self._pos:]
+            self._pos = len(self._rows)
+            return [self._as_row(r) for r in out]
         return [self._as_row(r) for r in self._raw.fetchall()]
 
     def fetchmany(self, n=None):
+        if self._rows is not None:
+            take = len(self._rows) - self._pos if n is None else n
+            out = self._rows[self._pos:self._pos + take]
+            self._pos += len(out)
+            return [self._as_row(r) for r in out]
         return [self._as_row(r) for r in
                 (self._raw.fetchmany(n) if n else self._raw.fetchmany())]
 
@@ -457,9 +730,14 @@ class _Cursor:
 
     @property
     def description(self):
+        if self._rows is not None:
+            return tuple((c, None, None, None, None, None, None) for c in
+                         ("cid", "name", "type", "notnull", "dflt_value", "pk"))
         return self._raw.description
 
     def __iter__(self):
+        if self._rows is not None:
+            return iter([self._as_row(r) for r in self._rows[self._pos:]])
         return iter(self._raw)
 
     def __enter__(self):
@@ -533,7 +811,7 @@ class PgConnection:
             self._query_only = value not in ("", "0", "OFF", "off", "false")
             return ("SELECT 1", ())
         if name in ("table_info", "table_xinfo"):
-            return _table_info_sql(value)
+            return _table_info_sql(value, self)
         if name == "user_version":
             return ("SELECT 1", ())
         if name in ("schema_version", "data_version"):
@@ -544,8 +822,54 @@ class PgConnection:
                 "WHERE n.nspname = current_schema() AND c.relkind IN ('r','i') LIMIT 1",
                 (),
             )
-        if name in ("wal_checkpoint", "foreign_key_check", "index_list", "index_info", "index_xinfo"):
+        if name in ("wal_checkpoint", "foreign_key_check"):
             return ("SELECT 1", ())
+        if name == "index_list":
+            # sqlite shape: seq, name, unique, origin, partial
+            return (
+                "SELECT (ROW_NUMBER() OVER (ORDER BY c.relname) - 1)::int AS seq,"
+                " c.relname AS name,"
+                " CASE WHEN i.indisunique THEN 1 ELSE 0 END AS unique,"
+                " CASE WHEN i.indisprimary THEN 'p' ELSE 'c' END AS origin,"
+                " CASE WHEN i.indpred IS NOT NULL THEN 1 ELSE 0 END AS partial"
+                " FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid"
+                " JOIN pg_class t ON t.oid = i.indrelid"
+                " JOIN pg_namespace n ON n.oid = t.relnamespace"
+                " WHERE t.relname = %s AND n.nspname = current_schema()",
+                (value,),
+            )
+        if name == "index_xinfo":
+            # sqlite shape: seqno, cid, name, desc, coll, key, partial
+            return (
+                "SELECT (x.ord - 1)::int AS seqno,"
+                " CASE WHEN x.k = 0 THEN -1 ELSE x.k::int END AS cid,"
+                " CASE WHEN x.k = 0 THEN NULL ELSE a.attname END AS name,"
+                ' CASE WHEN (i.indoption[x.ord - 1] & 3) IN (1,3) THEN 1 ELSE 0 END AS "desc",'
+                " 0 AS coll, 1 AS key,"
+                " CASE WHEN i.indpred IS NOT NULL THEN 1 ELSE 0 END AS partial"
+                " FROM pg_index i"
+                " JOIN pg_class c ON c.oid = i.indexrelid"
+                " JOIN pg_class t ON t.oid = i.indrelid"
+                " JOIN pg_namespace n ON n.oid = t.relnamespace"
+                " JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS x(k, ord) ON TRUE"
+                " LEFT JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = x.k"
+                " WHERE c.relname = %s AND n.nspname = current_schema()"
+                " ORDER BY x.ord",
+                (value,),
+            )
+        if name == "index_info":
+            # sqlite shape: seqno, cid, name
+            return (
+                "SELECT (ik.ord - 1)::int AS seqno, ik.k AS cid, a.attname AS name"
+                " FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid"
+                " JOIN pg_class t ON t.oid = i.indrelid"
+                " JOIN pg_namespace n ON n.oid = t.relnamespace"
+                " JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS ik(k, ord) ON TRUE"
+                " JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ik.k"
+                " WHERE c.relname = %s AND n.nspname = current_schema()"
+                " ORDER BY ik.ord",
+                (value,),
+            )
         if name == "database_list":
             return (
                 "SELECT 0 AS seq, 'lcm' AS name,"
