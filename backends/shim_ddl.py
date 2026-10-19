@@ -103,7 +103,7 @@ DDL_STATEMENTS = (
                FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary
                LIMIT 1), '')
            || coalesce((SELECT ', CHECK(' || string_agg(
-                 -- fold parens, strip casts/arrays, rewrite between+eq, fold again
+                 -- fold parens, strip casts/arrays, rewrite between + eq + any
                  replace(replace(replace(replace(
                      regexp_replace(
                        regexp_replace(
@@ -111,7 +111,8 @@ DDL_STATEMENTS = (
                            substring(pg_get_constraintdef(p.oid) from 7),
                            '\(([a-z_0-9]+) >= ([0-9]+)\) AND \(([a-z_0-9]+) <= ([0-9]+)\)',
                            '\\1 between \\2 and \\4', 'g'),
-                         '\(([a-z_0-9]+) = (''[^'']*'')\)', '\\1 IN (\\2)', 'g'),
+                         '\\(([a-z_0-9]+) = (' || chr(39) || '[^' || chr(39) || ']*' || chr(39) || ')\\)',
+                         '\\1 IN (\\2)', 'g'),
                        ' = ANY [(]ARRAY[[]', ' IN (', 'g'),
                      '::text', ''),
                      ']', ''),
