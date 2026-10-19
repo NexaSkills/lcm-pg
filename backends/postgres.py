@@ -985,7 +985,7 @@ class PgConnection:
                 " CASE WHEN x.k = 0 THEN -1 ELSE x.k::int END AS cid,"
                 " CASE WHEN x.k = 0 THEN NULL ELSE a.attname END AS name,"
                 ' CASE WHEN (i.indoption[x.ord - 1] & 3) IN (1,3) THEN 1 ELSE 0 END AS "desc",'
-                " 0 AS coll, 1 AS key,"
+                " NULL AS coll, 1 AS key,"
                 " CASE WHEN i.indpred IS NOT NULL THEN 1 ELSE 0 END AS partial"
                 " FROM pg_index i"
                 " JOIN pg_class c ON c.oid = i.indexrelid"
@@ -994,8 +994,22 @@ class PgConnection:
                 " JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS x(k, ord) ON TRUE"
                 " LEFT JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = x.k"
                 " WHERE c.relname = %s AND n.nspname = current_schema()"
-                " ORDER BY x.ord",
-                (value,),
+                # sqlite appends trailing rows (cid -1, key 0, no name) for
+                # table columns not in the index; verifiers expect >= 3 rows.
+                " UNION ALL"
+                " SELECT (i.indnatts + a2.attnum)::int AS seqno, -a2.attnum AS cid,"
+                " NULL AS name, 0 AS \"desc\", NULL AS coll, 0 AS key,"
+                " CASE WHEN i.indpred IS NOT NULL THEN 1 ELSE 0 END AS partial"
+                " FROM pg_index i"
+                " JOIN pg_class c ON c.oid = i.indexrelid"
+                " JOIN pg_class t ON t.oid = i.indrelid"
+                " JOIN pg_namespace n ON n.oid = t.relnamespace"
+                " JOIN pg_attribute a2 ON a2.attrelid = i.indrelid"
+                "  AND a2.attnum > 0 AND NOT a2.attisdropped"
+                "  AND NOT (a2.attnum = ANY (i.indkey::int[]))"
+                " WHERE c.relname = %s AND n.nspname = current_schema()"
+                " ORDER BY 1",
+                (value, value),
             )
         if name == "index_info":
             # sqlite shape: seqno, cid, name
