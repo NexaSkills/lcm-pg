@@ -38,7 +38,7 @@ shared databases, own binaries, own venv, own embedding model cache.
 ```
 
 DSN (every profile, every daemon):
-`LCM_PG_DSN=postgresql:///lcm?host=/home/mybuddy/lcm-pg/run&user=lcm01`
+`LCM_PG_DSN=postgresql:///lcm?host=/home/mybuddy/lcm-pg/run&port=54329&user=lcm01`
 plus `LCM_BACKEND=postgres`. Schema per profile is derived automatically:
 `lcm_<profile-id>` (default profile -> `lcm_default`).
 
@@ -64,8 +64,10 @@ plus `LCM_BACKEND=postgres`. Schema per profile is derived automatically:
 
 - Start (idempotent): `~/lcm-pg/scripts/pg.sh start` (pg_ctl -w, safe to re-run).
 - Status: `~/lcm-pg/scripts/pg.sh status` / `logs`.
-- The cluster is LOCAL-SOCKET ONLY (`listen_addresses=''`, port 54329). It must
-  never be exposed on TCP. Peer auth: OS user mybuddy -> role lcm01.
+- The cluster is LOCAL-SOCKET ONLY (`listen_addresses=''`, port 54329, socket
+  dir 0700). It must never be exposed on TCP. Auth is `local all all trust`
+  (isolation comes from the 0700 socket dir, not peer mapping — peer maps
+  broke on multi-user targets; the installer enforces trust idempotently).
 - After a host reboot: daemons fail fast until the cluster is up. Either start
   it manually or enable the user unit (below).
 
