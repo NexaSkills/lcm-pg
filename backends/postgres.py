@@ -189,7 +189,10 @@ def _table_info_sql(value: str, conn=None):
         "     'smallint'::regtype) THEN 'INTEGER'"
         "   WHEN a.atttypid IN ('real'::regtype,'double precision'::regtype,"
         "     'numeric'::regtype) THEN 'REAL'"
-        "   WHEN a.atttypid = 'bytea'::regtype THEN 'BLOB'"
+        "   WHEN a.atttypid = 'bytea'::regtype OR"
+                "     a.atttypid::regtype::oid = (SELECT b.oid FROM pg_type b"
+                "       WHERE b.typname = 'blob' AND b.typtype = 'd')"
+                "     THEN 'BLOB'"
         "   ELSE 'TEXT' END AS type,"
         " a.attnotnull::int AS \"notnull\","
         " CASE WHEN d.adbin IS NULL THEN NULL"
@@ -251,7 +254,10 @@ def _sqlite_ddl_for(table: str, conn=None):
                 "     'smallint'::regtype) THEN 'INTEGER'"
                 "   WHEN a.atttypid IN ('real'::regtype,'double precision'::regtype,"
                 "     'numeric'::regtype) THEN 'REAL'"
-                "   WHEN a.atttypid = 'bytea'::regtype THEN 'BLOB'"
+                "   WHEN a.atttypid = 'bytea'::regtype OR"
+                "     a.atttypid::regtype::oid = (SELECT b.oid FROM pg_type b"
+                "       WHERE b.typname = 'blob' AND b.typtype = 'd')"
+                "     THEN 'BLOB'"
                 "   ELSE 'TEXT' END,"
                 " a.attnotnull,"
                 " (d.adbin IS NOT NULL AND pg_get_expr(d.adbin, d.adrelid)"
@@ -714,8 +720,10 @@ class _Cursor:
         self._rows, self._pos = None, 0
         sql, params = self._adapter._translate(sql, parameters)
         if sql == "__rows__":
-            self._rows = [dict(zip(("cid", "name", "type", "notnull",
-                                     "dflt_value", "pk"), r)) for r in params]
+            # Hybrid rows: pragma verifiers index positionally (row[1]) AND
+            # as dict; plain dicts break the positional path.
+            self._rows = [_Cursor._as_row(dict(zip(("cid", "name", "type", "notnull",
+                                     "dflt_value", "pk"), r))) for r in params]
             self._rowcount = len(self._rows)
             return self
         params = _adapt_params(params)
