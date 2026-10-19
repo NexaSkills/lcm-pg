@@ -653,6 +653,14 @@ class _Cursor:
         if isinstance(params, dict):
             # sqlite-style :named params -> psycopg %(name)s dictConfig keys
             sql = re.sub(r":([A-Za-z_]\w*)", lambda m: "%%(%s)s" % m.group(1), sql)
+        if not params and not isinstance(params, dict):
+            # psycopg treats ANY params value (even empty tuple) as "has
+            # placeholders" and scans literals for %s/%b/%t; a stray literal
+            # `%` inside a string (LIKE 'a%') then explodes. sqlite would
+            # ignore it, so hand psycopg a None (no-placeholder mode) when
+            # nothing is bound and nothing was substituted.
+            if "%s" not in sql and "%(" not in sql:
+                params = None
         self._raw.execute(sql, params)
         self._rowcount = self._raw.rowcount
         if "INSERT" in sql.upper() and "RETURNING" in sql.upper():
