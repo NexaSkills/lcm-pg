@@ -100,7 +100,7 @@ mig \$HOME/.hermes/lcm.db
 for p in \$HOME/.hermes/profiles/*/lcm.db; do mig "\$p"; done
 echo "== 6. legacy sqlite workaround units off (archived) =="
 LKB=\$HOME/.hermes/backups/lcm-pg-bundle-\$(date +%Y%m%d-%H%M%S); mkdir -p \$LKB
-for u in lcm-ghost-fd-check lcm-local-patch-watchdog hermes-lcm-integrity-check; do
+for u in lcm-ghost-fd-check lcm-local-patch-watchdog hermes-lcm-integrity-check mmap-patch-guard; do
   systemctl --user disable --now \$u.timer \$u.service 2>/dev/null
   mv ~/.config/systemd/user/\$u.service ~/.config/systemd/user/\$u.timer \$LKB/ 2>/dev/null
 done
