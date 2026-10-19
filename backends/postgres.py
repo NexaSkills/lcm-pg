@@ -746,6 +746,20 @@ class _Cursor:
 
     # sqlite3 parity surface
     def execute(self, sql: str, parameters: Sequence | dict | None = None):
+        # One retry for the whole dispatch: a dead physical conn (operator
+        # pg_terminate_backend / server restart) is rebound by _self_heal,
+        # then the statement is replayed (autocommit makes replay safe).
+        try:
+            return self._guarded(sql, parameters)
+        except Exception as e:
+            if self._retry_if_dead(e):
+                # replay on a FRESH physical cursor (the old raw cursor is
+                # bound to the corpse even after the conn rebounded)
+                self._raw = self._adapter._raw_cursor()
+                return self._guarded(sql, parameters)
+            raise
+
+    def _guarded(self, sql, parameters):
         if sql.strip().lower().startswith("begin"):
             self._adapter.begin()
         if re.match(r"(?i)\s*CREATE\s+VIRTUAL\s+TABLE\b", sql):
@@ -760,7 +774,14 @@ class _Cursor:
                 self._rowcount = 0
                 return self
         self._rows, self._pos = None, 0
-        sql, params = self._adapter._translate(sql, parameters)
+        try:
+            sql, params = self._adapter._translate(sql, parameters)
+        except Exception:
+            # A rejected statement can arrive while a pooled conn sits in an
+            # aborted transaction (poisoned by an earlier error); the error the
+            # caller sees would then mask the real, permanent conn state.
+            self._adapter._self_heal()
+            raise
         if sql == "__rows__":
             # Hybrid rows: pragma verifiers index positionally (row[1]) AND
             # as dict; plain dicts break the positional path.
@@ -780,7 +801,15 @@ class _Cursor:
             # nothing is bound and nothing was substituted.
             if "%s" not in sql and "%(" not in sql:
                 params = None
-        self._raw.execute(sql, params)
+        try:
+            self._raw.execute(sql, params)
+        except Exception:
+            # Outside an explicit BEGIN IMMEDIATE (autocommit pool), an errored
+            # statement leaves the conn in InFailedSqlTransaction unless psycopg
+            # rolled it back for us; heal it so the pool never returns a poisoned
+            # connection (one bad query used to break every later tool call).
+            self._adapter._self_heal()
+            raise
         self._rowcount = self._raw.rowcount
         if "INSERT" in sql.upper() and "RETURNING" in sql.upper():
             try:
@@ -794,8 +823,36 @@ class _Cursor:
             self._lastrowid = None
         return self
 
+    def _retry_if_dead(self, exc: Exception):
+        # True (caller retries) if the failure was a dead physical conn that
+        # we just rebound. False re-raises the original error.
+        try:
+            self._adapter._self_heal()
+        except Exception:
+            return False
+        if isinstance(exc, (psycopg.errors.InterfaceError, psycopg.errors.OperationalError,
+                            psycopg.errors.AdminShutdown)):
+            return True
+        # connection-loose variants (any error raised while the conn was
+        # silently dead) also deserve one replay after healing
+        return not self._conn_alive()
+
+    def _conn_alive(self):
+        try:
+            if self._adapter._conn is None or self._adapter._conn.closed:
+                return False
+            with self._adapter._conn.cursor() as cur:
+                cur.execute("SELECT 0")
+            return True
+        except Exception:
+            return False
+
     def executemany(self, sql: str, seq: Iterable[Sequence]):
-        sql, _ = self._adapter._translate(sql, ())
+        try:
+            sql, _ = self._adapter._translate(sql, ())
+        except Exception:
+            self._adapter._self_heal()
+            raise
         rows = [tuple(p) for p in seq]
         if rows:
             self._raw.executemany(sql, rows)
@@ -921,7 +978,14 @@ class PgConnection:
         self._pool = pool
         self._schema = schema
         self._ctx = pool.connection()
-        self._conn = self._ctx.__enter__()
+        try:
+            self._conn = self._ctx.__enter__()
+        except psycopg.errors.AdminShutdown:
+            # An operator ran pg_terminate_backend (e.g. clearing a poisoned
+            # idle-in-transaction conn). One failed checkout is not a dead
+            # pool — retry so the tool call survives the cleanup.
+            self._ctx = pool.connection()
+            self._conn = self._ctx.__enter__()
         self._query_only = False
         self._tx = None
         self._tx_open = False
@@ -1078,10 +1142,62 @@ class PgConnection:
         raise UnsupportedSQL(f"unsupported pragma: {name}")
 
     # -- sqlite3.Connection parity ------------------------------------------
+    def _raw_cursor(self):
+        return self._conn.cursor(row_factory=dict_row)
+
     def cursor(self):
         if self._query_only:
             raise RuntimeError("readonly")  # parity with sqlite READONLY error
-        return _Cursor(self, self._conn.cursor(row_factory=dict_row))
+        try:
+            raw = self._raw_cursor()
+        except (psycopg.errors.InterfaceError, psycopg.errors.AdminShutdown):
+            # Pool reused a physically closed conn (e.g. an operator ran
+            # pg_terminate_backend, or a server restart). psycopg only
+            # discards such conns at putconn, so the NEXT checkout can still
+            # hand one back. Heal by cycling the physical connection once.
+            self._rebind_physical_conn()
+            try:
+                raw = self._raw_cursor()
+            except psycopg.errors.AdminShutdown:
+                # terminate landed between the last use and this checkout:
+                # rebind again (second terminate in a row is not a real case)
+                self._rebind_physical_conn()
+                raw = self._raw_cursor()
+        return _Cursor(self, raw)
+
+    def _rebind_physical_conn(self):
+        # Swap the borrowed physical connection for a fresh one from the same
+        # pool (used after AdminShutdown / closed-physical detection). Explicit
+        # transactions cannot survive; drop the tracking (nothing to commit).
+        self._tx_open = False
+        self._tx_ctx = None
+        if getattr(self._conn, "closed", 0) != 2:
+            # psycopg only marks a terminated conn FAILED (closed=2) lazily,
+            # often at the next touch. Force it so the pool's putconn discards
+            # it instead of recycling the corpse to the next checkout.
+            try:
+                self._conn.info.transaction_status
+            except Exception:
+                pass
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+        old_ctx, self._ctx = self._ctx, None
+        if old_ctx is not None:
+            try:
+                old_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+        self._ctx = self._pool.connection()
+        try:
+            self._conn = self._ctx.__enter__()
+        except psycopg.errors.AdminShutdown:
+            # terminate raced this checkout too; one more cycle is enough
+            self._ctx = self._pool.connection()
+            self._conn = self._ctx.__enter__()
+        with self._conn.cursor() as cur:
+            cur.execute(_set_stmts(self._schema, 15000))
 
     # -- sqlite3 parity surface ----------------------------------------------
     # BEGIN IMMEDIATE tracking: psycopg runs the pooled connection in autocommit,
@@ -1096,6 +1212,36 @@ class PgConnection:
             except Exception:
                 pass
             self._tx_open = True
+
+    def _self_heal(self):
+        # Recover the borrowed physical connection after a failure, without
+        # ever losing tracked transaction state:
+        #  - aborted tx (poisoned pool conn) -> roll back (autocommit only;
+        #    inside an explicit BEGIN the caller's except-path rolls back)
+        #  - physically dead conn (terminate/restart) -> rebind a fresh one
+        #    (an open tx cannot survive the corpse anyway).
+        if getattr(self, "_conn", None) is None or self._conn.closed:
+            self._rebind_physical_conn()
+            return
+        try:
+            # .info.transaction_status is client-side and can lie about a
+            # silently-dead conn; a zero-cost SELECT 0 proves liveness AND
+            # reports aborted-tx state.
+            with self._conn.cursor() as cur:
+                cur.execute("SELECT 0")
+        except Exception:
+            if not getattr(self, "_tx_open", False):
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+            # aborted-tx AND dead-conn both land here; the next guarded
+            # statement retries (and rebinds) if the rollback proved failure.
+            try:
+                if self._conn.closed:
+                    self._rebind_physical_conn()
+            except Exception:
+                pass
 
     def end_tx(self):
         self._tx_open = False
