@@ -305,7 +305,10 @@ def _sqlite_ddl_for(table: str, conn=None):
         else:
             # sqlite reports a sequence-defaulted INTEGER PK as a rowid
             # alias: notnull 0 (INTEGER PKs are NULL-tolerant aliases).
-            if notnull and not (is_seq and pkord):
+            # PK columns overall also report notnull 0: sqlite tracks the PK
+            # constraint, not an inline NOT NULL (upstream embedding DDL has
+            # no per-column NOT NULL on PK members).
+            if notnull and not pkord and not (is_seq and pkord):
                 bits.append("NOT NULL")
             if dflt is not None:
                 d = str(dflt)
