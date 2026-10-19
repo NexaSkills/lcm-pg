@@ -53,7 +53,9 @@ echo "== 2. venv (py3.12; uv download may take minutes) =="
 [ -x $B/venv/bin/python ] || uv venv --python 3.12 $B/venv -q
 VIRTUAL_ENV=$B/venv VIRTUAL_ENV_DISABLE_WARNING=1 uv pip install -q --python $B/venv/bin/python \
   "psycopg[binary]==3.3.6" "psycopg_pool==3.3.3" "pgvector==0.5.1" "fastembed==0.8.1"
-\$B/venv/bin/python -c "import psycopg, psycopg_pool, pgvector, fastembed; print('VENV_OK', psycopg.__version__)"
+# NOTE: psycopg_pool is NOT pulled in by psycopg[binary] — it must be explicit
+# (fork postgres.py imports it at module level; absence => PoolTimeout-at-init).
+$B/venv/bin/python -c "import psycopg, psycopg_pool, pgvector, fastembed; print('VENV_OK', psycopg.__version__)"
 echo "== 3. installer (cluster + plugin symlink + .env DSNs; idempotent) =="
 python3 $B/install_lcm_pg.py 2>&1 | tail -8
 echo "== 4. environment.d + systemd layers =="

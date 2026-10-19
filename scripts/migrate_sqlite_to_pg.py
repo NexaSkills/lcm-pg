@@ -40,8 +40,11 @@ def main() -> int:
     assert re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", schema), schema
 
     os.environ["LCM_BACKEND"] = "postgres"
+    # default = self-contained bundle cluster (never the shared system PG:
+    # an empty env used to point here and PoolTimeout on a foreign cluster)
     os.environ.setdefault("LCM_PG_DSN",
-                          "postgresql:///lcm?host=/run/postgresql&user=mybuddy")
+        f"postgresql:///lcm?host={os.path.expanduser('~')}/lcm-pg/run"
+        "&port=54329&user=lcm01")
     os.environ["LCM_PG_SCHEMA"] = schema
     sys.path.insert(0, os.path.dirname(FORK))  # so 'lcm_pg' pkg is importable
 
