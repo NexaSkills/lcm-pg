@@ -1147,6 +1147,31 @@ class PgConnection:
     def create_collation(self, *a, **k):
         pass
 
+    def set_progress_handler(self, handler, n_steps):
+        # SQLite's VM-step callback has no PG equivalent. The deadline wrapper
+        # in tools.py sets these handlers purely to abort long reads; PG
+        # honors equivalent deadlines via the lock/statement guards pinned
+        # per checkout (see _set_stmts), and the wrapper re-checks the
+        # deadline after the call, so accepting the call as a no-op keeps
+        # the FTS/recall arms alive without the AttributeError that killed
+        # the whole arm (lcm_recall degraded "full-text arm unavailable").
+        pass
+
+    def set_authorizer(self, *a, **k):
+        pass
+
+    def set_trace_callback(self, *a, **k):
+        pass
+
+    def set_commit_hook(self, *a, **k):
+        pass
+
+    def set_rollback_hook(self, *a, **k):
+        pass
+
+    def set_update_hook(self, *a, **k):
+        pass
+
     @property
     def in_transaction(self):
         return bool(self._conn.info.transaction_status)

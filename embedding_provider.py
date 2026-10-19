@@ -1745,8 +1745,14 @@ def resolve_provider(
             spend_guard=spend_guard,
         )
     if provider in {"fastembed", "fast-embed"}:
+        # Self-contained installs keep the model cache inside the bundle
+        # (LCM_FASTEMBED_CACHE_DIR wins); default stays ~/.cache/fastembed.
+        _cache_override = os.environ.get("LCM_FASTEMBED_CACHE_DIR", "").strip()
         return FastembedProvider(
-            model, timeout=timeout, spend_guard=spend_guard
+            model,
+            cache_dir=_cache_override or None,
+            timeout=timeout,
+            spend_guard=spend_guard,
         )
     raise ProviderUnavailable(
         f"Unsupported embedding provider {provider!r}; use voyage, ollama, or fastembed"
