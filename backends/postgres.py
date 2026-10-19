@@ -537,7 +537,11 @@ def _rewrite_text(sql: str) -> str:
         if k == -1:
             return m.group(0)
         return "btrim(" + inner[:k] + "," + inner[k + 1:] + ")"
-    s = re.sub(r"""\bTRIM\s*\(((?:[^()'"]|'[^']*'|\([^()]*\))*)\)""", _btrim, s, flags=re.I)
+    s = re.sub(r"""\bTRIM\s*\(((?:[^()"]|'[^']*'|\([^()]*\))*)\)""", _btrim, s, flags=re.I)
+    # SQLite index hints have no PG equivalent and are PG syntax errors:
+    # "INDEXED BY name" / "NOT INDEXED" after a table reference -> drop.
+    s = re.sub(r"\bINDEXED\s+BY\s+[A-Za-z_][\w$]*", "", s, flags=re.I)
+    s = re.sub(r"\bNOT\s+INDEXED\b", "", s, flags=re.I)
     # datetime(x) on an epoch/REAL column -> to_timestamp(x) (unix epoch, UTC)
     s = re.sub(r"\bdatetime\s*\(\s*(\?|%s)\s*((?:\s*,\s*'[^']*')*)\)", _dt_bound, s)
     # datetime(col) over a numeric epoch column -> to_timestamp(col)
