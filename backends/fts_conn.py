@@ -660,7 +660,47 @@ class _FtsCursor:
                          flags=re.I)
         return out
 
+    # FTS5 maintenance commands arrive as special INSERTs
+    # (`INSERT INTO x(x, rank) VALUES('integrity-check', 1)`). With trigger-
+    # maintained tsvectors there is no separate index to check: verify the
+    # docsize parity invariant for integrity-check, and no-op the rest
+    # (rebuild/optimize/merge).
+    _MAINT = re.compile(
+        r"""INSERT\s+INTO\s+"?(\w*fts)"?\s*\(\s*"?(\w+)"?\s*,\s*rank\s*\)\s+VALUES""",
+        re.I)
+    _MAINT_VALS = re.compile(r"""VALUES\s*\(\s*'([A-Za-z -]+)'""", re.I)
+
+    def _intercept_maintenance(self, sql):
+        m = self._MAINT.search(sql)
+        if not m:
+            return False
+        table = m.group(1)
+        content = m.group(2)
+        if content == table:
+            content = table[:-4] if table.endswith("_fts") else table
+        mv = self._MAINT_VALS.search(sql)
+        cmd = (mv.group(1).strip().lower() if mv else "")
+        if cmd == "integrity-check":
+            # db_bootstrap runs its structural check BEFORE calling this; the
+            # remaining invariant is docsize-vs-content row parity.
+            row = self._cur.execute(
+                'SELECT (SELECT count(*) FROM "%s") - (SELECT count(*) FROM "%s_docsize")'
+                % (content, table)).fetchone()
+            diff = next(iter(row.values())) if isinstance(row, dict) else row[0]
+            if diff != 0:
+                import sqlite3 as _sqlite3
+                raise _sqlite3.DatabaseError(
+                    "fts integrity-check: %s docsize differs from content by %d"
+                    % (table, diff))
+            return True
+        # rebuild / optimize / merge / * : triggers keep the tsvector column,
+        # there is nothing FTS5-specific to do.
+        return True
+
     def execute(self, sql, parameters=()):
+        if self._intercept_maintenance(sql):
+            self._rowcount = 0
+            return self
         sql_in = sql
         # Protect FIRST: every literal `?` outside strings becomes the
         # internal sentinel token so the rewriter can track which
