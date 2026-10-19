@@ -303,12 +303,17 @@ def _sqlite_ddl_for(table: str, conn=None):
         if autoincrement_pk and pkord == 1:
             bits.append("PRIMARY KEY AUTOINCREMENT")
         else:
-            # sqlite reports a sequence-defaulted INTEGER PK as a rowid
-            # alias: notnull 0 (INTEGER PKs are NULL-tolerant aliases).
-            # PK columns overall also report notnull 0: sqlite tracks the PK
-            # constraint, not an inline NOT NULL (upstream embedding DDL has
-            # no per-column NOT NULL on PK members).
-            if notnull and not pkord and not (is_seq and pkord):
+            # Emit NOT NULL exactly where PG records it (attnotnull), EXCEPT
+            # the single sequence-backed INTEGER PK: sqlite renders that as a
+            # rowid alias (PRIMARY KEY AUTOINCREMENT) with notnull 0, so the
+            # alias column's implicit NOT NULL must be dropped. Composite-PK
+            # INTEGER columns are NOT a rowid alias, so PG's explicit
+            # attnotnull is preserved (matches sqlite, which reports the
+            # explicit NOT NULL the original DDL declared). The old blanket
+            # `not pkord` suppression wrongly zeroed NOT NULL on composite-PK
+            # columns, breaking verify_temporal_rollup_schema's column-shape
+            # check (lcm_rollup_state/sources) and failing plugin load.
+            if notnull and not (autoincrement_pk and pkord == 1):
                 bits.append("NOT NULL")
             if dflt is not None:
                 d = str(dflt)

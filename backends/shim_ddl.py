@@ -102,22 +102,14 @@ DDL_STATEMENTS = (
                            || ')' END
                FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary
                LIMIT 1), '')
-           || coalesce((SELECT ', CHECK(' || string_agg(
-                 -- inner->first: fold, strip casts/arrays; then between; then eq
-                 replace(replace(
-                   regexp_replace(
-                     regexp_replace(
-                       replace(replace(replace(replace(
-                         substring(pg_get_constraintdef(p.oid) from 7),
-                         '((', '('), '))', ')'),
-                         '::text', ''),
-                         ' = ANY [(]ARRAY[[]', ' IN (', 'g'),
-                       ']', ''),
-                     E'\\(([a-z_0-9]+) >= ([0-9]+)\\) AND \\(([a-z_0-9]+) <= ([0-9]+)\\)',
-                     E'\\1 between \\2 and \\4', 'g'),
-                   E'\\(([a-z_0-9]+) = (''[^'']*'')\\)',
-                   E'\\1 IN (\\2)', 'g'),
-                 '((', '('), '))', ')'))         || ')',
+           || coalesce((SELECT ', ' || string_agg(
+                 'CHECK' || replace(replace(replace(replace(regexp_replace(
+                        substring(pg_get_constraintdef(p.oid) from 6),
+                        ' = ANY [(]ARRAY[[]', ' IN (', 'g'),
+                        '::text', ''),
+                        ']', ''),
+                        '((', '('),
+                        '))', ')')                   || ')',
                  ', ' ORDER BY p.oid)
                FROM pg_constraint p
               WHERE p.conrelid = c.oid AND p.contype = 'c'), '')
@@ -293,16 +285,6 @@ BIGINT_TEXT_EQ = r"""DO $o$ BEGIN
   END IF;
 END $o$"""
 
-# sqlite BLOB affinity -> a 'blob' DOMAIN over bytea, so upstream DDL text
-# (`vec BLOB NOT NULL`) runs unmodified on PG.
-BLOB_DOMAIN = (
-    'DO $d$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_type t'
-    " JOIN pg_namespace n ON n.oid=t.typnamespace"
-    " WHERE n.nspname = '{schema}' AND t.typname = 'blob' AND t.typtype = 'd')"
-    ' THEN EXECUTE $$CREATE DOMAIN "{schema}".blob AS bytea$$;'
-    " END IF; END $d$"
-)
-
 BIGINT_TEXT_FN = r"""CREATE OR REPLACE FUNCTION public._bigint_text_eq(a bigint, b text)
   RETURNS bool LANGUAGE sql IMMUTABLE AS $$ SELECT a::text OPERATOR(pg_catalog.=) b $$"""
 
@@ -317,33 +299,11 @@ def install(cur, schema: str) -> None:
     triggerdef_pl.install(shim, schema)
     cur.execute(PREDFUNC.format(schema=schema))
     cur.execute(JSON_EACH.format(schema=schema))
-    cur.execute(BLOB_DOMAIN.format(schema=schema))
     cur.execute(BIGINT_TEXT_FN)
     cur.execute(BIGINT_TEXT_EQ)
     for stmt in DDL_STATEMENTS:
         cur.execute(stmt.format(schema=schema))
     cur.execute(VIEW.format(schema=schema))
-    # FTS facades: command.py's read-only scan does
-    # `SELECT COUNT(*) FROM <fts_name>` where <fts_name> is a *literal*
-    # table name — the shim's rewrite only fires for MATCH/qualifier
-    # contexts, so a bare COUNT on the facade name reaches PG and 404s.
-    # A view over the content table makes the name resolve for plain
-    # SELECT/COUNT without touching the hot search path.
-    for fts, content, col, pk in (
-        ("messages_fts", "messages", "content", "store_id"),
-        ("nodes_fts", "summary_nodes", "summary", "node_id"),
-    ):
-        # facade only when the content table exists in this schema
-        if not cur.execute(
-            "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace"
-            " WHERE n.nspname=%s AND c.relname=%s AND c.relkind='r'",
-            (schema, content)).fetchone():
-            continue
-        cur.execute(
-            f'CREATE OR REPLACE VIEW "{schema}"."{fts}" AS '
-            f'SELECT "{col}" AS "{col}", "{pk}" AS rowid '
-            f'FROM "{schema}"."{content}"'
-        )
 
 
 class _ConnShim:
