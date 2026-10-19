@@ -102,20 +102,23 @@ DDL_STATEMENTS = (
                            || ')' END
                FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary
                LIMIT 1), '')
-           || coalesce((SELECT ', ' || string_agg(
-                 'CHECK(' || replace(replace(replace(replace(
-                    regexp_replace(
+           || coalesce((SELECT ', CHECK(' || string_agg(
+                 replace(replace(replace(replace(replace(replace(
+                    replace(
+                      regexp_replace(
                         regexp_replace(
-                          regexp_replace(
+                          replace(replace(
                             substring(pg_get_constraintdef(p.oid) from 8),
-                            '\\(([a-z_0-9]+) >= ([0-9]+)\\) AND \\(([a-z_0-9]+) <= ([0-9]+)\\)',
-                            '\\1 between \\2 and \\4', 'g'),
-                          '\(([a-z_0-9]+) = (''[^'']*'')\)', '\\1 IN \\2', 'g'),
-                        ' = ANY [(]ARRAY[[]', ' IN (', 'g'),
-                        '::text', ''),
-                        ']', ''),
-                        '((', '('),
-                        '))', ')')                   || ')',
+                            '((', '('),
+                            '))', ')'),
+                          '\(([a-z_0-9]+) >= ([0-9]+)\) AND \(([a-z_0-9]+) <= ([0-9]+)\)',
+                          '\\1 between \\2 and \\4', 'g'),
+                        '\(([a-z_0-9]+) = (''[^'']*'')\)', '\\1 IN \\2', 'g'),
+                      '::text', ''),
+                    ' = ANY [(]ARRAY[[]', ' IN (', 'g'),
+                    ']', ''),
+                    '((', '('),
+                    '))', ')')                   || ')',
                  ', ' ORDER BY p.oid)
                FROM pg_constraint p
               WHERE p.conrelid = c.oid AND p.contype = 'c'), '')
