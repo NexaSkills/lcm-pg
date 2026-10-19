@@ -87,6 +87,33 @@ def main() -> int:
     pg = psycopg.connect(os.environ["LCM_PG_DSN"], autocommit=True, options=f"-c search_path={schema}")
     cur = pg.cursor()
 
+    def align_sequences():
+        """setval every owned serial to max(col) (nextval -> max+1)."""
+        seqrows = cur.execute("""
+            SELECT s.relname, t.relname, a.attname
+            FROM pg_class s
+            JOIN pg_depend d ON d.objid=s.oid AND d.deptype='a'
+            JOIN pg_class t ON t.oid=d.refobjid
+            JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=d.refobjsubid
+            JOIN pg_namespace n ON n.oid=t.relnamespace
+            WHERE n.nspname=%s AND s.relkind='S'""", (schema,)).fetchall()
+        errs = {}
+        for row in seqrows:
+            seq, tbl, col = row[0], row[1], row[2]
+            try:
+                mx = cur.execute(f'SELECT coalesce(max("{col}"),0) FROM "{schema}"."{tbl}"').fetchone()[0]
+                cur.execute("SELECT setval(%s::regclass, %s)", (f'"{schema}"."{seq}"', max(int(mx), 1)))
+            except Exception as e:
+                errs[f"seq:{seq}"] = f"ERR {str(e)[:50]}"
+        return errs
+
+    # MUST run before any COPY: inserting summary_nodes fires
+    # _trg_lcm_rollup_node_insert, which takes a fresh event_id from
+    # lcm_rollup_invalidations' sequence — if that sequence lags the rows
+    # already migrated by a previous run, the trigger hits a pkey collision
+    # mid-COPY and aborts the whole table (observed on buttercup delta, 2026-10-20).
+    report = align_sequences()
+
     # sqlite source: prefer live-with-WAL read via backup into memory-safe temp copy
     tmp = os.path.join(FORK, "_migrate_src.tmp")
     s0 = sqlite3.connect(src_path)
@@ -167,23 +194,10 @@ def main() -> int:
                     n += 1
         report[table] = f"copied {n} (source {len(srows)})"
 
-    # 3. sequences: align each owned serial to max(col)+1
+    # 3. sequences: final re-align after the COPY (also aligns sequences of
+    # tables that only grew during this run)
     if not dry:
-        seqrows = cur.execute("""
-            SELECT s.relname, t.relname, a.attname
-            FROM pg_class s
-            JOIN pg_depend d ON d.objid=s.oid AND d.deptype='a'
-            JOIN pg_class t ON t.oid=d.refobjid
-            JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=d.refobjsubid
-            JOIN pg_namespace n ON n.oid=t.relnamespace
-            WHERE n.nspname=%s AND s.relkind='S'""", (schema,)).fetchall()
-        for row in seqrows:
-            seq, tbl, col = row[0], row[1], row[2]
-            try:
-                mx = cur.execute(f'SELECT coalesce(max("{col}"),0) FROM "{schema}"."{tbl}"').fetchone()[0]
-                cur.execute("SELECT setval(%s::regclass, %s)", (f'"{schema}"."{seq}"', max(int(mx), 1)))
-            except Exception as e:
-                report[f"seq:{seq}"] = f"ERR {str(e)[:50]}"
+        report.update(align_sequences())
 
     sconn.close()
     os.unlink(tmp)
