@@ -130,17 +130,15 @@ def ensure_query_fn(conn) -> None:
 
 
 def _pk_column(conn, table: str) -> str:
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT a.attname FROM pg_index i"
-            " JOIN pg_class t ON t.oid = i.indrelid"
-            " JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(i.indkey)"
-            " JOIN pg_namespace n ON n.oid = t.relnamespace"
-            " WHERE n.nspname = current_schema() AND t.relname = %s AND i.indisprimary"
-            " LIMIT 1",
-            (table,),
-        )
-        row = cur.fetchone()
+    row = conn.execute(
+        "SELECT a.attname FROM pg_index i"
+        " JOIN pg_class t ON t.oid = i.indrelid"
+        " JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(i.indkey)"
+        " JOIN pg_namespace n ON n.oid = t.relnamespace"
+        " WHERE n.nspname = current_schema() AND t.relname = %s AND i.indisprimary"
+        " LIMIT 1",
+        (table,),
+    ).fetchone()
     if row is None:
         raise RuntimeError(f"no primary key for {table}")
     return row[0] if not isinstance(row, dict) else next(iter(row.values()))
