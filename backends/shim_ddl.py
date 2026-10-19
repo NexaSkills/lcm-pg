@@ -304,6 +304,21 @@ def install(cur, schema: str) -> None:
     for stmt in DDL_STATEMENTS:
         cur.execute(stmt.format(schema=schema))
     cur.execute(VIEW.format(schema=schema))
+    # FTS facades: command.py's read-only scan does
+    # `SELECT COUNT(*) FROM <fts_name>` where <fts_name> is a *literal*
+    # table name — the shim's rewrite only fires for MATCH/qualifier
+    # contexts, so a bare COUNT on the facade name reaches PG and 404s.
+    # A view over the content table makes the name resolve for plain
+    # SELECT/COUNT without touching the hot search path.
+    for fts, content, col, pk in (
+        ("messages_fts", "messages", "content", "store_id"),
+        ("nodes_fts", "summary_nodes", "summary", "node_id"),
+    ):
+        cur.execute(
+            f'CREATE OR REPLACE VIEW "{schema}"."{fts}" AS '
+            f'SELECT "{col}" AS "{col}", "{pk}" AS rowid '
+            f'FROM "{schema}"."{content}"'
+        )
 
 
 class _ConnShim:
