@@ -118,7 +118,7 @@ DDL_STATEMENTS = (
                     ' = ANY [(]ARRAY[[]', ' IN (', 'g'),
                     ']', ''),
                     '((', '('),
-                    '))', ')')                   || ')',
+                    '))', ')')))                  || ')',
                  ', ' ORDER BY p.oid)
                FROM pg_constraint p
               WHERE p.conrelid = c.oid AND p.contype = 'c'), '')
