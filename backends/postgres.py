@@ -233,6 +233,8 @@ def _pg_default_to_sqlite(d: str) -> str:
     return s
 
 
+
+
 def _sqlite_ddl_for(table: str, conn=None):
     """Reconstruct sqlite CREATE TABLE text from PG catalog rows.
 
@@ -276,7 +278,11 @@ def _sqlite_ddl_for(table: str, conn=None):
                 "     LATERAL unnest(i.indkey::int[])"
                 "       WITH ORDINALITY AS u(k, ord)"
                 "     WHERE i.indrelid = a.attrelid AND i.indisprimary"
-                "       AND u.k = a.attnum LIMIT 1)"
+                "       AND u.k = a.attnum LIMIT 1),"
+                " (SELECT string_agg("
+                "     'CHECK(' || _lcm_checkfold(p.oid) || ')', ', ' ORDER BY p.oid)"
+                "   FROM pg_constraint p"
+                "   WHERE p.conrelid = a.attrelid AND p.contype = 'c')"
                 " FROM pg_attribute a"
                 " LEFT JOIN pg_attrdef d"
                 "   ON d.adrelid = a.attrelid AND d.adnum = a.attnum"
@@ -298,7 +304,7 @@ def _sqlite_ddl_for(table: str, conn=None):
     pk_cols = sorted((p for p in rows if p[6]), key=lambda p: p[6])
     autoincrement_pk = (len(pk_cols) == 1 and pk_cols and pk_cols[0][6] == 1
                         and pk_cols[0][4] and pk_cols[0][2] == "INTEGER")
-    for (attnum, name, stype, notnull, is_seq, dflt, pkord) in rows:
+    for (attnum, name, stype, notnull, is_seq, dflt, pkord, checks) in rows:
         bits = ['"' + str(name).replace('"', '""') + '"', stype]
         if autoincrement_pk and pkord == 1:
             bits.append("PRIMARY KEY AUTOINCREMENT")
@@ -325,6 +331,27 @@ def _sqlite_ddl_for(table: str, conn=None):
         # pk columns 1..n by index position; columns keep NOT NULL already.
         cols.append("PRIMARY KEY (%s)" % ", ".join(
             '"' + str(p[1]).replace('"', '""') + '"' for p in pk_cols))
+    # table-level CHECK clauses (canonicalized to sqlite text by the fold;
+    # every row carries the same aggregated string, take the first non-null).
+    # The aggregate is ', '-joined — split on ', ' ONLY at depth 0 so the
+    # commas inside IN (...) lists are never cut.
+    checks = next((r[7] for r in rows if len(r) > 7 and r[7]), None)
+    if checks:
+        depth = 0; buf = []; parts = []
+        for ch in str(checks):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            if depth == 0 and ch == "," and buf and buf[-1] == " ":
+                parts.append("".join(buf).strip()); buf = []
+                continue
+            buf.append(ch)
+        if "".join(buf).strip():
+            parts.append("".join(buf).strip())
+        # the _lcm_checkfold fold now emits fully-parenthesised CHECK clauses,
+        # so the legacy "add a closing paren" hack is unnecessary and is removed.
+        cols.extend(p for p in parts if p)
     return "CREATE TABLE %s (%s)" % ('"' + table.replace('"', '""') + '"',
                                       ", ".join(cols))
 
@@ -996,7 +1023,7 @@ class PgConnection:
                 " CASE WHEN x.k = 0 THEN -1 ELSE x.k::int END AS cid,"
                 " CASE WHEN x.k = 0 THEN NULL ELSE a.attname END AS name,"
                 ' CASE WHEN (i.indoption[x.ord - 1] & 3) IN (1,3) THEN 1 ELSE 0 END AS "desc",'
-                " NULL AS coll, 1 AS key,"
+                " 'BINARY' AS coll, 1 AS key,"
                 " CASE WHEN i.indpred IS NOT NULL THEN 1 ELSE 0 END AS partial"
                 " FROM pg_index i"
                 " JOIN pg_class c ON c.oid = i.indexrelid"

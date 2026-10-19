@@ -41,6 +41,178 @@ DDL_STATEMENTS = (
            ELSE regexp_replace(expr, '::[a-z_ ]+$', '', 'g')
          END
        $df$""",
+    # CHECK-fold: pure text surgery in plpgsql (position/substr, NO regex,
+    # NO backreferences, NO backslashes in the body). Replaces the old
+    # regexp_replace backref chain that corrupted the shim's CHECK text.
+    # _peel/_start are inlined here as nested functions so this stays a single
+    # DDL_STATEMENTS entry (install runs each entry as one execute()).
+    # CHECK-fold helpers (schema-local): pure text surgery (position/substr/left, NO regex, NO backreferences, NO backslashes in any body).
+    # _peel strips wrapping parens; _start finds the identifier start; _fold_any/_range/_eq canonicalize to IN/between.
+    """DROP FUNCTION IF EXISTS "{schema}"._lcm_checkfold(oid);
+DROP FUNCTION IF EXISTS "{schema}"._peel(text);
+DROP FUNCTION IF EXISTS "{schema}"._start(text,int);
+DROP FUNCTION IF EXISTS "{schema}"._fold_range(text);
+DROP FUNCTION IF EXISTS "{schema}"._fold_eq(text);
+DROP FUNCTION IF EXISTS "{schema}"._fold_any(text);
+DROP FUNCTION IF EXISTS "{schema}"._fold(text);
+
+-- CHECK-fold as PURE plpgsql: position()/substr()/left() only.
+-- ZERO regex, ZERO backreferences, ZERO backslashes in the body.
+-- Transport-proof (psql -f / DO / catalog rewrite / git) and kills the
+-- backref/SOH corruption class structurally.
+--
+-- CRITICAL plpgsql rule: any char-test loop must EXIT on k<=0 FIRST, and test
+-- characters NULL-safely (c >= '0' AND c <= '9', never NOT(...), since an
+-- out-of-range substr() yields NULL and NOT(NULL) is NULL, not TRUE, so an
+-- EXIT WHEN NOT(...) never fires -> index runs off the end, off-by-one bugs).
+
+-- strip balanced wrapper parens: while s='( ... )' with matching closer at the
+-- end, drop it. Extra closers stay (they become harmless trailing parens the
+-- shim wraps around CHECK(...)).
+CREATE OR REPLACE FUNCTION {schema}._peel(f text) RETURNS text
+LANGUAGE plpgsql IMMUTABLE AS $fn$
+DECLARE s text := btrim(f);
+BEGIN
+  -- match Python s.strip()[1:-1]: when the whole expr is wrapped '(...)',
+  -- drop ONE leading '(' and ONE trailing ')' (the outermost wrapper). Repeat
+  -- while the result is still fully wrapped. Inner parens stay.
+  WHILE length(s) >= 2 AND left(s,1) = '(' AND right(s,1) = ')' LOOP
+    s := btrim(substr(s, 2, length(s) - 2));
+  END LOOP;
+  -- leftover wrapper after 'CHECK (' strip on a doubly-wrapped expr
+  IF length(s) > 1 AND left(s, 2) = '((' THEN
+    s := btrim(substr(s, 2));
+  END IF;
+  RETURN s;
+END $fn$;
+
+-- start (1-based) of the identifier left of the char at i (scans back to a
+-- delimiter ' ' / ')' or string start). Returns that start position (>=1).
+CREATE OR REPLACE FUNCTION {schema}._start(s text, i int) RETURNS int
+LANGUAGE plpgsql IMMUTABLE AS $fn$
+DECLARE j int := i; c text;
+BEGIN
+  WHILE j > 0 LOOP
+    c := substr(s,j,1);
+    IF c = '(' OR c = ' ' OR c = ')' THEN EXIT; END IF;   -- delimiter stops scan
+    j := j - 1;
+  END LOOP;
+  RETURN j + 1;
+END $fn$;
+
+-- (A >= lo) AND (A <= hi)  ->  A between lo and hi
+CREATE OR REPLACE FUNCTION {schema}._fold_range(f text) RETURNS text
+LANGUAGE plpgsql IMMUTABLE AS $fn$
+DECLARE i int; j2 int; k0 int; k1 int; p1 int; k2 int; k3 int; p2 int;
+        a0 int; a text; b text; lo text; hi text; c text; guard int := 0;
+BEGIN
+  LOOP
+    i := position(' >= ' in f);
+    EXIT WHEN i = 0 OR guard >= 20;
+    guard := guard + 1;
+    a0 := {schema}._start(f, i - 1);
+    a := substr(f, a0, (i - 1) - a0 + 1);     -- 'col'
+    j2 := position(' <= ' in substr(f, i + 4));
+    EXIT WHEN j2 = 0;
+    j2 := i + 4 + j2 - 1;                       -- 1-based pos of the space before ' <= '
+    b := substr(f, {schema}._start(f, j2 - 1), (j2 - 1) - {schema}._start(f, j2 - 1) + 1);
+    EXIT WHEN b <> a;
+    k0 := i + 4;  WHILE k0 <= length(f) AND substr(f,k0,1) = ' ' LOOP k0 := k0 + 1; END LOOP;
+    k1 := k0;     WHILE k1 <= length(f) AND ((substr(f,k1,1) >= '0' AND substr(f,k1,1) <= '9') OR substr(f,k1,1) = '.') LOOP k1 := k1 + 1; END LOOP;
+    lo := substr(f, k0, k1 - k0);
+    -- extend past the block's trailing ')' so it is dropped, not left stray
+    p1 := k1;     WHILE p1 <= length(f) AND substr(f,p1,1) = ')' LOOP p1 := p1 + 1; END LOOP;
+    EXIT WHEN lo = '';
+    k2 := j2 + 4; WHILE k2 <= length(f) AND substr(f,k2,1) = ' ' LOOP k2 := k2 + 1; END LOOP;
+    k3 := k2;     WHILE k3 <= length(f) AND ((substr(f,k3,1) >= '0' AND substr(f,k3,1) <= '9') OR substr(f,k3,1) = '.') LOOP k3 := k3 + 1; END LOOP;
+    hi := substr(f, k2, k3 - k2);
+    -- extend past the block's trailing ')' so it is dropped, not left stray
+    p2 := k3;     WHILE p2 <= length(f) AND substr(f,p2,1) = ')' LOOP p2 := p2 + 1; END LOOP;
+    EXIT WHEN hi = '';
+    f := substr(f, 1, a0 - 1) || a || ' between ' || lo || ' and ' || hi || substr(f, p2);
+  END LOOP;
+  RETURN f;
+END $fn$;
+
+-- A = 'lit'  ->  A IN ('lit')   (single = ; 'ANY' handled by _fold_any)
+CREATE OR REPLACE FUNCTION {schema}._fold_eq(f text) RETURNS text
+LANGUAGE plpgsql IMMUTABLE AS $fn$
+DECLARE out text := ''; rest text := f; i int; a0 int; a text; k int; k2 int; lit text; c text; guard int := 0;
+BEGIN
+  LOOP
+    i := position(' = ' in rest);
+    IF i = 0 THEN out := out || rest; EXIT; END IF;
+    guard := guard + 1; EXIT WHEN guard >= 64;
+    a0 := {schema}._start(rest, i - 1);
+    a := substr(rest, a0, (i - 1) - a0 + 1);
+    lit := NULL;
+    k := i + 3;
+    c := substr(rest, k, 1);
+    IF c = '''' THEN
+      k2 := position('''' in substr(rest, k + 1));
+      IF k2 > 0 THEN k2 := k + k2; lit := substr(rest, k, k2 - k + 1); k := k2 + 1; END IF;
+    ELSIF c >= '0' AND c <= '9' THEN
+      WHILE k <= length(rest) AND ((substr(rest,k,1) >= '0' AND substr(rest,k,1) <= '9') OR substr(rest,k,1) = '.') LOOP k := k + 1; END LOOP;
+      lit := substr(rest, i + 3, k - (i + 3));
+    END IF;
+    IF a = '' OR lit IS NULL THEN
+      out := out || substr(rest, 1, i + 2);   -- keep through ' = '
+      rest := substr(rest, i + 3);
+      CONTINUE;
+    END IF;
+    WHILE k <= length(rest) AND (substr(rest,k,1) = ')' OR substr(rest,k,1) = ' ') LOOP k := k + 1; END LOOP;
+    out := out || substr(rest, 1, a0 - 1) || a || ' IN (' || lit || ')';
+    rest := substr(rest, k);
+  END LOOP;
+  RETURN out;
+END $fn$;
+
+-- A = ANY (ARRAY[..])  ->  A IN (..)
+CREATE OR REPLACE FUNCTION {schema}._fold_any(f text) RETURNS text
+LANGUAGE plpgsql IMMUTABLE AS $fn$
+DECLARE i int; j int; a0 int; a text; items text; mk text := ' = ANY (ARRAY['; guard int := 0;
+BEGIN
+  LOOP
+    i := position(mk in f);
+    EXIT WHEN i = 0 OR guard >= 20;
+    guard := guard + 1;
+    a0 := {schema}._start(f, i - 1);
+    a := substr(f, a0, (i - 1) - a0 + 1);
+    j := position(']' in substr(f, i));           -- first ']' from i
+    IF j = 0 THEN EXIT; END IF;
+    j := i + j - 1;
+    EXIT WHEN a = '';
+    items := substr(f, i + length(mk), j - (i + length(mk)));  -- between ARRAY[ and ]
+    -- tail: after '] )' (both consumed; ARRAY's closing paren dropped)
+    f := substr(f, 1, a0 - 1) || a || ' IN (' || items || ')' || substr(f, j + 3);
+  END LOOP;
+  RETURN f;
+END $fn$;
+
+-- top level: CHECK(...) -> folded
+CREATE OR REPLACE FUNCTION {schema}._fold(cd text) RETURNS text
+LANGUAGE plpgsql IMMUTABLE AS $fn$
+DECLARE f text := substr(cd, 8);     -- drop 'CHECK (' (7 chars), keep content
+BEGIN
+  f := {schema}._peel(f);
+  f := replace(f, '::text', '');
+  f := replace(f, '::integer', '');
+  f := replace(f, '::bigint', '');
+  f := replace(f, '::smallint', '');
+  f := {schema}._fold_any(f);
+  f := {schema}._fold_range(f);
+  f := {schema}._fold_eq(f);
+  RETURN {schema}._peel(f);
+END $fn$;""",
+    # _lcm_checkfold(oid): the CHECK-clause fold the shim calls (normalises pg CHECK(...) prefix, then folds).
+    """CREATE OR REPLACE FUNCTION "{schema}"._lcm_checkfold(p oid) RETURNS text
+LANGUAGE sql IMMUTABLE AS $cf$
+  SELECT "{schema}"._fold(
+    CASE WHEN left(pg_get_constraintdef(p), 6) = 'CHECK ' THEN
+      'CHECK (' || btrim(substr(pg_get_constraintdef(p), 7)) || ')'
+    ELSE pg_get_constraintdef(p) END)
+$cf$""",
+
     # table definition --------------------------------------------------------
     """CREATE OR REPLACE FUNCTION "{schema}"._lcm_tabledef(cls oid) RETURNS text
        LANGUAGE sql STABLE AS $td$
@@ -103,14 +275,7 @@ DDL_STATEMENTS = (
                FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary
                LIMIT 1), '')
            || coalesce((SELECT ', ' || string_agg(
-                 'CHECK' || replace(replace(replace(replace(regexp_replace(
-                        substring(pg_get_constraintdef(p.oid) from 6),
-                        ' = ANY [(]ARRAY[[]', ' IN (', 'g'),
-                        '::text', ''),
-                        ']', ''),
-                        '((', '('),
-                        '))', ')')                   || ')',
-                 ', ' ORDER BY p.oid)
+                 'CHECK(' || "{schema}"._lcm_checkfold(p.oid) || ')', ', ' ORDER BY p.oid)
                FROM pg_constraint p
               WHERE p.conrelid = c.oid AND p.contype = 'c'), '')
            || ')'
