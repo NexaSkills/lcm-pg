@@ -106,9 +106,11 @@ DDL_STATEMENTS = (
                  'CHECK(' || replace(replace(replace(replace(
                     regexp_replace(
                         regexp_replace(
-                          substring(pg_get_constraintdef(p.oid) from 7),
-                          '\\(([a-z_0-9]+) >= ([0-9]+)\\) AND \\(([a-z_0-9]+) <= ([0-9]+)\\)',
-                          '\\1 between \\2 and \\4', 'g'),
+                          regexp_replace(
+                            substring(pg_get_constraintdef(p.oid) from 7),
+                            '\\(([a-z_0-9]+) >= ([0-9]+)\\) AND \\(([a-z_0-9]+) <= ([0-9]+)\\)',
+                            '\1 between \2 and \4', 'g'),
+                          '\(([a-z_0-9]+) = (''[^'']*'')\)', '\1 IN \2', 'g'),
                         ' = ANY [(]ARRAY[[]', ' IN (', 'g'),
                         '::text', ''),
                         ']', ''),
@@ -329,6 +331,12 @@ def install(cur, schema: str) -> None:
         ("messages_fts", "messages", "content", "store_id"),
         ("nodes_fts", "summary_nodes", "summary", "node_id"),
     ):
+        # facade only when the content table exists in this schema
+        if not cur.execute(
+            "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace"
+            " WHERE n.nspname=%s AND c.relname=%s AND c.relkind='r'",
+            (schema, content)).fetchone():
+            continue
         cur.execute(
             f'CREATE OR REPLACE VIEW "{schema}"."{fts}" AS '
             f'SELECT "{col}" AS "{col}", "{pk}" AS rowid '
