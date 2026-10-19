@@ -103,8 +103,8 @@ DDL_STATEMENTS = (
                FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary
                LIMIT 1), '')
            || coalesce((SELECT ', ' || string_agg(
-                 'CHECK' || replace(replace(replace(replace(regexp_replace(
-                        substring(pg_get_constraintdef(p.oid) from 6),
+                 'CHECK (' || replace(replace(replace(replace(regexp_replace(
+                        substring(pg_get_constraintdef(p.oid) from 7),
                         ' = ANY [(]ARRAY[[]', ' IN (', 'g'),
                         '::text', ''),
                         ']', ''),
