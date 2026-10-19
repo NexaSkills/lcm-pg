@@ -287,7 +287,13 @@ END $o$"""
 
 # sqlite BLOB affinity -> a 'blob' DOMAIN over bytea, so upstream DDL text
 # (`vec BLOB NOT NULL`) runs unmodified on PG.
-BLOB_DOMAIN = 'CREATE DOMAIN IF NOT EXISTS "{schema}".blob AS bytea'
+BLOB_DOMAIN = (
+    'DO $d$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_type t'
+    " JOIN pg_namespace n ON n.oid=t.typnamespace"
+    " WHERE n.nspname = '{schema}' AND t.typname = 'blob' AND t.typtype = 'd')"
+    ' THEN EXECUTE $$CREATE DOMAIN "{schema}".blob AS bytea$$;'
+    " END IF; END $d$"
+)
 
 BIGINT_TEXT_FN = r"""CREATE OR REPLACE FUNCTION public._bigint_text_eq(a bigint, b text)
   RETURNS bool LANGUAGE sql IMMUTABLE AS $$ SELECT a::text OPERATOR(pg_catalog.=) b $$"""
