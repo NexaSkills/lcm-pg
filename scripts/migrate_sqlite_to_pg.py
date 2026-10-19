@@ -91,6 +91,14 @@ def main() -> int:
     tmp = os.path.join(FORK, "_migrate_src.tmp")
     s0 = sqlite3.connect(src_path)
     s1 = sqlite3.connect(tmp)
+    # Salvage class: legacy corrupt lcm.db files can hold invalid-UTF-8 TEXT
+    # (seen in tool_calls JSON on warren debbie). Strict decode aborts the
+    # whole table read; lossy decode keeps every row, U+FFFD where bytes died.
+    for _c in (s0, s1):
+        try:
+            _c.text_factory = lambda b: b.decode("utf-8", "replace")
+        except sqlite3.ProgrammingError:
+            pass
     s0.backup(s1)
     s0.close()
     sconn = s1
