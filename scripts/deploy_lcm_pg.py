@@ -55,12 +55,19 @@ def main():
     # 2. swap plugin dirs (root + every profile overlay)
     r = sh(f"bash -c 'ls -d {PLUGIN} {PROFILE_PLUGIN_GLOB} 2>/dev/null'")
     for d in r.stdout.split():
-        shutil.copytree(d, os.path.join(backup, os.path.basename(os.path.dirname(d)) + "--" + os.path.basename(d)),
-                        symlinks=True)
+        rel = d.removeprefix("/home/mybuddy/.hermes/").replace("/", "__")
+        dst = os.path.join(backup, "orig", rel)
+        if os.path.islink(d):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(os.readlink(d), dst)
+        else:
+            shutil.copytree(d, dst, symlinks=True)
         # remove FTS/cruft files not in fork, then copy fork content in
         for name in os.listdir(d):
             p = os.path.join(d, name)
-            if os.path.isdir(p) and not os.path.isdir(os.path.join(FORK, name)):
+            if os.path.islink(p):
+                os.remove(p)
+            elif os.path.isdir(p) and not os.path.isdir(os.path.join(FORK, name)):
                 shutil.rmtree(p)
             elif os.path.isfile(p) and not os.path.exists(os.path.join(FORK, name)):
                 os.remove(p)
@@ -94,6 +101,10 @@ def main():
         env.pop("LCM_PG_SCHEMA", None)
         print(f"== migrate {db}")
         subprocess.run([sys.executable, mig, db], env=env)
+
+    # 4b. align every schema's sequences above migrated ids
+    import subprocess as _sp
+    _sp.run([sys.executable, os.path.join(FORK, "scripts", "align_sequences.py")], env=env)
 
     # 5. start daemons
     for u in UNITS:
