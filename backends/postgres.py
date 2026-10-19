@@ -468,6 +468,8 @@ def _rewrite_text(sql: str) -> str:
     # the codebase is an epoch-seconds expression against REAL epoch columns)
     s = re.sub(r"\bstrftime\s*\(\s*'%s'\s*,\s*'now'\s*\)", "extract(epoch from now())", s, flags=re.I)
     # TRIM(x, chars) 2-arg form is Oracle/sqlite syntax; PG's 2-arg function
+    # char(n) is a TYPE keyword in PG, not a function; chr(n) is the function.
+    s = re.sub(r"\bchar\s*\(\s*(\d+)\s*\)", r"chr(\1)", s, flags=re.I)
     # is btrim(x, chars). (1-arg TRIM(x) parses natively on PG.) Split on the
     # top-level comma so inner parens/strings (char(9) || char(10) ...) ride
     # into arg2 untouched.
@@ -520,6 +522,45 @@ def _rewrite_text(sql: str) -> str:
     # sqlite's `temp.` / `tempx.` schema qualifier maps to PG's automatic
     # temporary-table namespace: bare names already resolve there.
     s = re.sub(r"\b(temp|tempx|main)\.([A-Za-z_]\w*)", r"\2", s)
+    # GLOB -> LIKE: operand order preserved; the quoted glob pattern (on
+    # either side) is translated * -> %, ? -> _; literal %/_ get backslash
+    # escapes and ESCAPE '\\' is appended. Non-literal RHS falls through to a
+    # plain LIKE swap (sqlite glob and LIKE agree on * ? only in this repo).
+    def _glob_to_like(s: str) -> str:
+        def _tr(pat: str) -> str:
+            out, i, in_br = [], 0, False
+            while i < len(pat):
+                ch = pat[i]
+                if ch == "[":
+                    in_br = True
+                    out.append("[")
+                elif ch == "]":
+                    in_br = False
+                    out.append("]")
+                elif in_br:
+                    out.append(ch)
+                elif ch == "*":
+                    out.append("%")
+                elif ch == "?":
+                    out.append("_")
+                elif ch in "%_":
+                    out.append("\\" + ch)
+                elif ch == "\\":
+                    out.append("\\\\")
+                else:
+                    out.append(ch)
+                i += 1
+            return "".join(out)
+        esc = lambda pat: " ESCAPE '\\\\'" if any(c in pat for c in "%_\\") else ""
+        # expr GLOB 'pat'   (pattern on RHS)
+        m = re.search(r"\bGLOB\s+'((?:[^']|'')*)'", s, flags=re.I)
+        if m:
+            pat = m.group(1).replace("''", "'")
+            return (s[:m.start()] + "LIKE" + esc(pat) + " '" + _tr(pat).replace("'", "''")
+                    + "'" + s[m.end():])
+        # 'pat' GLOB expr is not valid sqlite; not handled.
+        return re.sub(r"\bGLOB\b", "LIKE", s, flags=re.I)
+    s = _glob_to_like(s)
     # WITHOUT ROWID clause -> drop
     s = re.sub(r"\bWITHOUT\s+ROWID\b", "", s, flags=re.I)
 
