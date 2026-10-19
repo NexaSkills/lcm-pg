@@ -103,21 +103,21 @@ DDL_STATEMENTS = (
                FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary
                LIMIT 1), '')
            || coalesce((SELECT ', CHECK(' || string_agg(
-                 -- fold parens, strip casts/arrays, rewrite between + eq + any
-                 replace(replace(replace(replace(
+                 -- inner->first: fold, strip casts/arrays; then between; then eq
+                 replace(replace(
+                   regexp_replace(
                      regexp_replace(
-                       regexp_replace(
-                         regexp_replace(
-                           substring(pg_get_constraintdef(p.oid) from 7),
-                           '\(([a-z_0-9]+) >= ([0-9]+)\) AND \(([a-z_0-9]+) <= ([0-9]+)\)',
-                           '\\1 between \\2 and \\4', 'g'),
-                         '\\(([a-z_0-9]+) = (' || chr(39) || '[^' || chr(39) || ']*' || chr(39) || ')\\)',
-                         '\\1 IN (\\2)', 'g'),
-                       ' = ANY [(]ARRAY[[]', ' IN (', 'g'),
-                     '::text', ''),
-                     ']', ''),
-                     '((', '('),
-                     '))', ')')                   || ')',
+                       replace(replace(replace(replace(
+                         substring(pg_get_constraintdef(p.oid) from 7),
+                         '((', '('), '))', ')'),
+                         '::text', ''),
+                         ' = ANY [(]ARRAY[[]', ' IN (', 'g'),
+                       ']', ''),
+                     E'\\(([a-z_0-9]+) >= ([0-9]+)\\) AND \\(([a-z_0-9]+) <= ([0-9]+)\\)',
+                     E'\\1 between \\2 and \\4', 'g'),
+                   E'\\(([a-z_0-9]+) = (''[^'']*'')\\)',
+                   E'\\1 IN (\\2)', 'g'),
+                 '((', '('), '))', ')'))         || ')',
                  ', ' ORDER BY p.oid)
                FROM pg_constraint p
               WHERE p.conrelid = c.oid AND p.contype = 'c'), '')
