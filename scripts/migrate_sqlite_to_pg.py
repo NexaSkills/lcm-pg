@@ -131,9 +131,18 @@ def main() -> int:
         sidx = {c: scols.index(c) for c in common}
         rows = srows
         if pkrow and pkrow[0] in common:
+            # Drop source rows with NULL in the PK column: unreachable via the
+            # store's INSERT(key,value) path, so they are corruption residue
+            # (btrfs-damage survivors) that PG's NOT NULL/PK would reject and
+            # abort the whole COPY run on. Report them so they are not silent.
+            # Filter srows (the real COPY source), not just `rows`.
+            pi = scols.index(pkrow[0])
+            nulls = [r for r in srows if r[pi] is None]
+            if nulls:
+                report[table + "_skipped_null_pk"] = len(nulls)
+                srows = [r for r in srows if r[pi] is not None]
             have = {r[0] for r in cur.execute(
                 f'SELECT "{pkrow[0]}" FROM "{schema}"."{table}"')}
-            pi = scols.index(pkrow[0])
             rows = [r for r in srows if r[pi] not in have]
         if dry:
             report[table] = f"would copy {len(rows)} (source {len(srows)})"
