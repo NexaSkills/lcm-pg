@@ -129,6 +129,23 @@ def ensure_query_fn(conn) -> None:
     )
 
 
+def _pk_column(conn, table: str) -> str:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT a.attname FROM pg_index i"
+            " JOIN pg_class t ON t.oid = i.indrelid"
+            " JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(i.indkey)"
+            " JOIN pg_namespace n ON n.oid = t.relnamespace"
+            " WHERE n.nspname = current_schema() AND t.relname = %s AND i.indisprimary"
+            " LIMIT 1",
+            (table,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        raise RuntimeError(f"no primary key for {table}")
+    return row[0] if not isinstance(row, dict) else next(iter(row.values()))
+
+
 def ensure_fts(conn, table: str, indexed_column: str) -> None:
     """Idempotent tsvector column + triggers for one (table, column) pair."""
     ensure_helper(conn)
@@ -168,6 +185,50 @@ def ensure_fts(conn, table: str, indexed_column: str) -> None:
     conn.execute(
         f'UPDATE "{table}" SET "{tcol}" = to_tsvector(\'english\', coalesce("{indexed_column}"::text, \'lcm\')) '
         f'WHERE "{tcol}" IS NULL'
+    )
+
+    # docsize parity: db_bootstrap's FTS structural check counts
+    # f"{table}_fts_docsize" rows vs the content table. The shim already
+    # advertises that name through sqlite_master; back it with a real table
+    # (docid = content PK, size = char length) kept in sync by AFTER triggers.
+    pk = _pk_column(conn, table)
+    conn.execute(
+        f'CREATE TABLE IF NOT EXISTS "{table}_fts_docsize"(docid BIGINT PRIMARY KEY, size BIGINT)'
+    )
+    conn.execute(
+        f'''
+        CREATE OR REPLACE FUNCTION "{table}_docsize_sync"() RETURNS trigger AS $$
+        BEGIN
+            IF TG_OP = 'INSERT' THEN
+                INSERT INTO "{table}_fts_docsize"(docid, size)
+                    VALUES (NEW."{pk}", coalesce(length(NEW."{indexed_column}"::text), 0))
+                    ON CONFLICT (docid) DO UPDATE SET size = EXCLUDED.size;
+            ELSIF TG_OP = 'UPDATE' THEN
+                UPDATE "{table}_fts_docsize" SET size = coalesce(length(NEW."{indexed_column}"::text), 0)
+                    WHERE docid = NEW."{pk}";
+            ELSE
+                DELETE FROM "{table}_fts_docsize" WHERE docid = OLD."{pk}";
+            END IF;
+            RETURN NULL;
+        END $$ LANGUAGE plpgsql;
+        '''
+    )
+    conn.execute(
+        f'''
+        DROP TRIGGER IF EXISTS "{table}_docsize" ON "{table}";
+        CREATE TRIGGER "{table}_docsize"
+            AFTER INSERT OR UPDATE OR DELETE ON "{table}"
+            FOR EACH ROW EXECUTE FUNCTION "{table}_docsize_sync"();
+        '''
+    )
+    conn.execute(
+        f'''INSERT INTO "{table}_fts_docsize"(docid, size)
+            SELECT "{pk}", coalesce(length("{indexed_column}"::text), 0) FROM "{table}"
+            ON CONFLICT (docid) DO UPDATE SET size = EXCLUDED.size'''
+    )
+    conn.execute(
+        f'''DELETE FROM "{table}_fts_docsize" d
+            WHERE NOT EXISTS (SELECT 1 FROM "{table}" c WHERE c."{pk}" = d.docid)'''
     )
 
 

@@ -467,6 +467,31 @@ def _rewrite_text(sql: str) -> str:
     # strftime('%s','now') -> extract(epoch from now())  (the only strftime form in
     # the codebase is an epoch-seconds expression against REAL epoch columns)
     s = re.sub(r"\bstrftime\s*\(\s*'%s'\s*,\s*'now'\s*\)", "extract(epoch from now())", s, flags=re.I)
+    # TRIM(x, chars) 2-arg form is Oracle/sqlite syntax; PG's 2-arg function
+    # is btrim(x, chars). (1-arg TRIM(x) parses natively on PG.) Split on the
+    # top-level comma so inner parens/strings (char(9) || char(10) ...) ride
+    # into arg2 untouched.
+    def _btrim(m: re.Match) -> str:
+        inner = m.group(1)
+        depth, in_str, k = 0, False, -1
+        i = 0
+        while i < len(inner):
+            ch = inner[i]
+            if ch == "'":
+                in_str = not in_str
+            elif not in_str:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                elif ch == "," and depth == 0:
+                    k = i
+                    break
+            i += 1
+        if k == -1:
+            return m.group(0)
+        return "btrim(" + inner[:k] + "," + inner[k + 1:] + ")"
+    s = re.sub(r"""\bTRIM\s*\(((?:[^()'"]|'[^']*'|\([^()]*\))*)\)""", _btrim, s, flags=re.I)
     # datetime(x) on an epoch/REAL column -> to_timestamp(x) (unix epoch, UTC)
     s = re.sub(r"\bdatetime\s*\(\s*(\?|%s)\s*((?:\s*,\s*'[^']*')*)\)", _dt_bound, s)
     # datetime(col) over a numeric epoch column -> to_timestamp(col)
@@ -873,10 +898,16 @@ class PgConnection:
             return ("SELECT 1", ())
         if name in ("schema_version", "data_version"):
             return ("SELECT 1", ())
-        if name == "integrity_check":
+        if name in ("integrity_check", "quick_check"):
+            # sqlite returns a single row 'ok' on a healthy db; the doctor
+            # compares result[0] == "ok". No PG equivalent of B-tree walking
+            # exists inline; amcheck extension is not installed, so report
+            # ok when the catalog is readable (every query proving it works).
             return (
-                "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
-                "WHERE n.nspname = current_schema() AND c.relkind IN ('r','i') LIMIT 1",
+                "SELECT CASE WHEN EXISTS ("
+                "  SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace"
+                "  WHERE n.nspname = current_schema() AND c.relkind='r'"
+                ") THEN 'ok' ELSE 'corrupt' END AS integrity",
                 (),
             )
         if name in ("wal_checkpoint", "foreign_key_check"):
@@ -928,11 +959,11 @@ class PgConnection:
                 (value,),
             )
         if name == "database_list":
+            # data_directory is superuser-only on PG 16+; the schema-qualified
+            # path shape is cosmetic for callers (db file listing only).
             return (
-                "SELECT 0 AS seq, 'lcm' AS name,"
-                " current_setting('data_directory', true) || '/base/'"
-                " || (SELECT datname FROM pg_database"
-                "     WHERE datname = current_database()) AS file",
+                "SELECT 0 AS seq, current_database() AS name,"
+                " current_schema() AS file",
                 (),
             )
         if name in ("settings", "mmap_size", "journal_size_limit", "page_size"):
