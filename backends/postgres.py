@@ -194,7 +194,10 @@ def _table_info_sql(value: str, conn=None):
                 "       AND b.typname = 'blob' AND b.typtype = 'd')"
                 "     THEN 'BLOB'"
         "   ELSE 'TEXT' END AS type,"
-        " a.attnotnull::int AS \"notnull\","
+        " (CASE WHEN EXISTS (SELECT 1 FROM pg_index pi"
+        "   WHERE pi.indrelid = a.attrelid AND pi.indisprimary"
+        "     AND a.attnum = ANY(pi.indkey::int[]))"
+        '  THEN 0 ELSE a.attnotnull::int END) AS "notnull",'
         " CASE WHEN d.adbin IS NULL THEN NULL"
         "   WHEN pg_get_expr(d.adbin, d.adrelid) LIKE 'nextval%%' THEN NULL"
         "   WHEN position('::' in pg_get_expr(d.adbin, d.adrelid)) > 0 THEN"
@@ -994,19 +997,16 @@ class PgConnection:
                 " JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS x(k, ord) ON TRUE"
                 " LEFT JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = x.k"
                 " WHERE c.relname = %s AND n.nspname = current_schema()"
-                # sqlite appends trailing rows (cid -1, key 0, no name) for
-                # table columns not in the index; verifiers expect >= 3 rows.
+                # sqlite appends exactly one hidden row (cid -1, key 0,
+                # coll BINARY) after the index key rows.
                 " UNION ALL"
-                " SELECT (i.indnatts + a2.attnum)::int AS seqno, -a2.attnum AS cid,"
-                " NULL AS name, 0 AS \"desc\", NULL AS coll, 0 AS key,"
+                " SELECT i.indnatts::int AS seqno, -1 AS cid,"
+                " NULL AS name, 0 AS \"desc\", 'BINARY' AS coll, 0 AS key,"
                 " CASE WHEN i.indpred IS NOT NULL THEN 1 ELSE 0 END AS partial"
                 " FROM pg_index i"
                 " JOIN pg_class c ON c.oid = i.indexrelid"
                 " JOIN pg_class t ON t.oid = i.indrelid"
                 " JOIN pg_namespace n ON n.oid = t.relnamespace"
-                " JOIN pg_attribute a2 ON a2.attrelid = i.indrelid"
-                "  AND a2.attnum > 0 AND NOT a2.attisdropped"
-                "  AND NOT (a2.attnum = ANY (i.indkey::int[]))"
                 " WHERE c.relname = %s AND n.nspname = current_schema()"
                 " ORDER BY 1",
                 (value, value),

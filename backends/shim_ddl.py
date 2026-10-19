@@ -107,8 +107,8 @@ DDL_STATEMENTS = (
                     regexp_replace(
                         regexp_replace(
                           substring(pg_get_constraintdef(p.oid) from 7),
-                          '\\(([a-z_0-9]+)\\) >= \\(([0-9]+)\\) AND \\1 <= \\(([0-9]+)\\)',
-                          '\\1 between \\2 and \\3', 'g'),
+                          '\\(([a-z_0-9]+) >= ([0-9]+)\\) AND \\(([a-z_0-9]+) <= ([0-9]+)\\)',
+                          '\\1 between \\2 and \\4', 'g'),
                         ' = ANY [(]ARRAY[[]', ' IN (', 'g'),
                         '::text', ''),
                         ']', ''),
