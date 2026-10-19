@@ -798,6 +798,7 @@ class PgConnection:
         self._query_only = False
         self._tx = None
         self._tx_open = False
+        self._ensure_tx_probe = "SELECT 1"
         self.row_factory = None  # accepted & ignored (dict rows always)
         with self._conn.cursor() as cur:
             cur.execute(_set_stmts(schema, 15000))
@@ -807,13 +808,37 @@ class PgConnection:
         stripped = sql.strip()
         if stripped.lower().startswith("pragma "):
             return self._pragma(stripped)
-        if re.match(r"^(SET|BEGIN|COMMIT|ROLLBACK|CHECKPOINT|VACUUM)\b", stripped, flags=re.I):
+        if re.match(r"^(SAVEPOINT|RELEASE|SET|BEGIN|COMMIT|ROLLBACK|CHECKPOINT|VACUUM)\b", stripped, flags=re.I):
             # BEGIN IMMEDIATE is upstream's cross-process lock primitive; on PG
             # run it as a real transaction (COMMIT/ROLLBACK are handled by the
             # PgTransaction context manager, never by raw passthrough).
             if re.match(r"^BEGIN\b", stripped, flags=re.I):
                 return ("BEGIN TRANSACTION", ())
-            return ("SELECT 1", ())
+            # SAVEPOINT hygiene: upstream's _sqlite_savepoint assumes sqlite's
+            # implicit-transaction semantics (SAVEPOINT outside any tx starts a
+            # deferred one). psycopg pooled conns are autocommit, so a bare
+            # SAVEPOINT errors with NoActiveSqlTransaction. Emulate sqlite: open
+            # a real PG transaction first if none is open; RELEASE/ROLLBACK TO
+            # pass through and ROLLBACK (full) ends the tx like sqlite does.
+            m = re.match(r"^SAVEPOINT\s+([\"\w]+)\s*;?\s*$", stripped, flags=re.I)
+            if m:
+                # psycopg autocommit pool: a bare SAVEPOINT errors outside a tx
+                # block (sqlite would have started one implicitly). If a tx is
+                # already open (BEGIN IMMEDIATE / with-conn) just pass through.
+                if not self._tx_open:
+                    self.begin()
+                return (stripped, ())
+            if re.match(r"^ROLLBACK\s+TO\b", stripped, flags=re.I):
+                return (stripped, ())
+            if re.match(r"^ROLLBACK\b", stripped, flags=re.I):
+                self.end_tx()
+                return ("ROLLBACK", ())
+            if re.match(r"^RELEASE\b", stripped, flags=re.I):
+                # Outermost RELEASE commits sqlite's implicit tx. Mirror that:
+                # after releasing, if no nested savepoint can remain (we never
+                # nest our synthetic BEGIN), commit the opened tx.
+                return (stripped, ())
+            return (stripped, ())
         if isinstance(params, dict):
             return _rewrite_text(stripped), params
         out = _rewrite_text(stripped)
