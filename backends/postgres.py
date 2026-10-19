@@ -517,6 +517,9 @@ def _rewrite_text(sql: str) -> str:
     s = re.sub(r"\bBLOB\b", "bytea", s, flags=re.I)
     s = re.sub(r"\bTINYINT\b", "smallint", s, flags=re.I)
 
+    # sqlite's `temp.` / `tempx.` schema qualifier maps to PG's automatic
+    # temporary-table namespace: bare names already resolve there.
+    s = re.sub(r"\b(temp|tempx|main)\.([A-Za-z_]\w*)", r"\2", s)
     # WITHOUT ROWID clause -> drop
     s = re.sub(r"\bWITHOUT\s+ROWID\b", "", s, flags=re.I)
 
