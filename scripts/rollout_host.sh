@@ -119,7 +119,7 @@ do_verify() {
 B=$B
 PG() { PGHOST=\$B/run PGPORT=54329 PGUSER=lcm01 \$B/pg/bin/psql -d lcm -Atc "\$1"; }
 echo "daemons: \$(systemctl --user is-active \$(systemctl --user list-units --all --no-legend | grep -oE 'hermes-[a-z0-9-]*\.service' | sort -u) | paste -sd' ')"
-echo "failed units: \$(systemctl --user --failed --no-legend | wc -l)"
+echo "failed units: $(systemctl list-units --failed --no-legend | wc -l) sys + \$(systemctl --user list-units --failed --no-legend | wc -l) user"
 echo "lcm timers: \$(systemctl --user list-timers --no-legend | grep -vi boot-audit | grep -ci lcm)"
 echo "schemas: \$(PG "select string_agg(nspname,' ') from pg_namespace where nspname like 'lcm_%'")"
 echo "-- PG messages+FTS per schema --"
