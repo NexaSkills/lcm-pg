@@ -751,7 +751,7 @@ def _ensure_rowid_shim_tables(self):
                 self._raw_exec(
                     "alter table %s add column if not exists rowid bigint "
                     "generated always as "
-                    "(abs(public.has_object_identity(embedded_id::public.blob))) "
+                    "(('x' || substr(md5(embedded_id), 1, 16))::bit(64)::bigint) "
                     "stored" % tbl)
             except Exception:
                 pass

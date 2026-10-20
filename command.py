@@ -234,7 +234,7 @@ def _ensure_inflight_table(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "alter table lcm_embedding_backfill_inflight add column "
                 "if not exists rowid bigint generated always as "
-                "(abs(public.has_object_identity(embedded_id::public.blob))) stored")
+                "(('x' || substr(md5(embedded_id), 1, 16))::bit(64)::bigint) stored")
         except Exception:
             pass
 
