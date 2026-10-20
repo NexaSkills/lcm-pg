@@ -889,18 +889,30 @@ class _Cursor:
     def _guarded(self, sql, parameters):
         if getattr(self._adapter, "_query_only", False) and _WRITE_STMT_RE.match(sql):
             raise RuntimeError("readonly")
+        # TEMP-declaration strip must run BEFORE the multi-statement split (the
+        # CREATE TRIGGER branch passes its _raw_exec list through _guarded and
+        # those parts legitimately start with keywords).
+        if _TEMP_CTAS_RE.search(sql):
+            sql = _TEMP_CTAS_RE.sub("", sql)
+            if not sql.strip():
+                return self
+        if ";" in sql.rstrip().rstrip(";"):
+            # multi-statement script: run parts separately so the per-statement
+            # hooks below apply to each (CREATE TRIGGER path already uses
+            # _raw_exec lists and never reaches here).
+            parts = [s + ";" for s in _split_statements(sql) if s.strip()]
+            if len(parts) > 1:
+                for i, part in enumerate(parts):
+                    if i == len(parts) - 1:
+                        return self._guarded_one(part, parameters)
+                    self._guarded_one(part, None)
+                return self
+        return self._guarded_one(sql, parameters)
+
+    def _guarded_one(self, sql, parameters):
         if sql.strip().lower().startswith("begin"):
             self._adapter.begin()
             _ensure_rowid_shim_tables(self._adapter)
-        if _TEMP_CTAS_RE.search(sql):
-            # SQLite lets a plain (non-temp) table SELECT from a TEMP table in
-            # the same session; PG resolves the same name to pg_temp first, so
-            # an INSERT ... SELECT rowid from a real table into a temp staging
-            # table of the SAME name errors with "column rowid does not exist".
-            # Upstream's staging tables are idempotent DELETE-on-open scratch
-            # tables, so materializing them as regular schema tables is
-            # semantics-preserving and keeps the real table visible.
-            sql = _TEMP_CTAS_RE.sub("", sql)
         if re.match(r"(?i)\s*CREATE\s+VIRTUAL\s+TABLE\b", sql):
             # external-content FTS5 shadow tables are not needed: backends/fts_pg
             # provides trigger-maintained tsvectors on the content table.
@@ -1004,6 +1016,10 @@ class _Cursor:
         return self
 
     def executescript(self, script: str):
+        if _TEMP_CTAS_RE.search(script):
+            script = _TEMP_CTAS_RE.sub("", script)
+            if not script.strip():
+                return self
         for stmt in _split_statements(script):
             stmt = stmt.strip()
             if not stmt:
