@@ -710,6 +710,41 @@ def _neutralize_negative_limit(sql: str, params):
         return sql, params
 
 
+_ROWID_SHIM_TABLES = ("lcm_embedding_backfill_inflight",
+                      "lcm_embedding_backfill_predecessor_batch",
+                      "lcm_embedding_inflight")
+
+
+def _ensure_rowid_shim_tables(self):
+    """SQLite gives EVERY regular table a hidden `rowid`; the upstream
+    backfill lease-maintenance SQL SELECTs `rowid` from tables that have a
+    composite text PK (no PG rowid exists there). The schema_parity.sh shim
+    covers the two vector tables, but inflight-style tables are REBUILT by
+    command._ensure_inflight_table (shape drift -> RENAME+CREATE+copy), which
+    erases the shim column on every ensure pass -> the next `SELECT rowid`
+    dies with UndefinedColumn mid-transaction (the whole backfill run then
+    aborts). Re-add the generated shim column lazily right here, on the first
+    statement per connection per table. Lock-only failures (a concurrent
+    rebuild holds AccessExclusive) are swallowed: the next pass retries, so a
+    live rebuild can never wedge this path."""
+    try:
+        done = self._rowid_shim_done = getattr(self, "_rowid_shim_done", set())
+        for tbl in _ROWID_SHIM_TABLES:
+            if tbl in done:
+                continue
+            done.add(tbl)  # attempt-once per connection, even on failure
+            try:
+                self._raw_exec(
+                    "alter table %s add column if not exists rowid bigint "
+                    "generated always as "
+                    "(abs(public.has_object_identity(embedded_id::public.blob))) "
+                    "stored" % tbl)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 _IS_NOTNULL = "\x00\x02\x00"
 
 
@@ -848,6 +883,7 @@ class _Cursor:
             raise RuntimeError("readonly")
         if sql.strip().lower().startswith("begin"):
             self._adapter.begin()
+            _ensure_rowid_shim_tables(self._adapter)
         if re.match(r"(?i)\s*CREATE\s+VIRTUAL\s+TABLE\b", sql):
             # external-content FTS5 shadow tables are not needed: backends/fts_pg
             # provides trigger-maintained tsvectors on the content table.
