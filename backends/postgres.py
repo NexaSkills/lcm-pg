@@ -731,6 +731,37 @@ _TEMP_CTAS_RE = re.compile(
     r"(?i)\bCREATE\s+(?:GLOBAL\s+|LOCAL\s+)?TEMP(?:ORARY)?\s+TABLE\s+"
     r"(?:IF\s+NOT\s+EXISTS\s+)?(?!.*\bAS\b)", re.S)
 
+# Marker: _DML_LIMIT_CTID
+# SQLite allows LIMIT on DELETE/UPDATE; PG rejects it. Restrict the outer
+# statement to the ctids the inner query would have modified:
+#   DELETE FROM t <pred> [ORDER BY o] LIMIT n [OFFSET m]
+#   -> DELETE FROM t WHERE ctid IN (SELECT ctid FROM t <pred> ORDER BY o LIMIT n OFFSET m)
+# UPDATE keeps its SET clause outside; only the WHERE predicate is wrapped.
+_DML_LIMIT_RE = re.compile(
+    r"(?is)^(\s*(?:DELETE\s+FROM|UPDATE)\s+[\w.\"]+)\b(.*?)\b(ORDER\s+BY\s+.*?)?"
+    r"\bLIMIT\s+(\$\d+|\d+)(\s+OFFSET\s+(\$\d+|\d+))?\s*;?\s*$")
+
+
+def _neutralize_dml_limit(sql):
+    m = _DML_LIMIT_RE.match(sql)
+    if not m:
+        return sql
+    head, body, order, lim, offs, _ = m.groups()
+    tbl = head.split()[-1]
+    inner_order = (" " + order.strip()) if order else ""
+    offs_clause = (" OFFSET " + offs) if offs else ""
+    if head.lstrip().lower().startswith("delete"):
+        pred = body.strip()
+        return ("%s WHERE ctid IN (SELECT ctid FROM %s %s%s LIMIT %s%s)"
+                % (head, tbl, pred, inner_order, lim, offs_clause))
+    w = re.split(r"(?i)\bWHERE\b", body, maxsplit=1)
+    if len(w) != 2:
+        return sql
+    set_part, pred = w[0].strip(), w[1].strip()
+    return ("%s %s WHERE ctid IN (SELECT ctid FROM %s WHERE %s%s LIMIT %s%s)"
+            % (head, set_part, tbl, pred, inner_order, lim, offs_clause))
+
+
 
 def _ensure_rowid_shim_tables(self):
     """SQLite gives EVERY regular table a hidden `rowid`; the upstream
@@ -1202,6 +1233,9 @@ class PgConnection:
 
     # -- translation -------------------------------------------------------
     def _translate(self, sql: str, params):
+        # PG forbids LIMIT on DELETE/UPDATE (SQLite allows) -> ctid rewrite
+        if _DML_LIMIT_RE.match(stripped):
+            stripped = _neutralize_dml_limit(stripped)
         stripped = sql.strip()
         if stripped.lower().startswith("pragma "):
             return self._pragma(stripped)
