@@ -248,7 +248,14 @@ def _sqlite_ddl_for(table: str, conn=None):
     """
     if conn is None:
         return None
-    raw = conn._pool.getconn() if hasattr(conn, "_pool") else conn._conn
+    raw = (conn._pool.getconn() if hasattr(conn, "_pool")
+           else getattr(conn, "_base", None) or conn)
+    if hasattr(raw, "_base"):  # _Connection -> raw psycopg conn
+        raw = raw._base
+    if hasattr(conn, "_pool"):
+        _putback = lambda: conn._pool.putconn(raw)
+    else:
+        _putback = lambda: None
     try:
         # RAW psycopg cursor: bypass _Cursor/_translate (percent protection
         # would turn the %s placeholder into a literal and return 0 rows).
@@ -300,8 +307,7 @@ def _sqlite_ddl_for(table: str, conn=None):
         finally:
             cur.close()
     finally:
-        if hasattr(conn, "_pool"):
-            conn._pool.putconn(raw)
+        _putback()
     if not rows:
         return None
     cols = []
