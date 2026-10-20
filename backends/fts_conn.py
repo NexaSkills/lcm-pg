@@ -426,7 +426,7 @@ class FtsConnection:
         return _FtsCursor(self._base.cursor(), lambda: self._specs)
 
     def execute(self, sql, parameters=()):
-        sql = _lcm_pg_temp_strip(sql)
+        sql = _lcm_pg_temp_rewrite(sql)
         c = self.cursor()
         return c.execute(sql, parameters)
 
@@ -699,7 +699,7 @@ class _FtsCursor:
         return True
 
     def execute(self, sql, parameters=()):
-        sql = _lcm_pg_temp_strip(sql)
+        sql = _lcm_pg_temp_rewrite(sql)
         if self._intercept_maintenance(sql):
             self._rowcount = 0
             return self
@@ -814,3 +814,19 @@ def _lcm_pg_temp_strip(sql):
         r"(?i)\bCREATE\s+(?:GLOBAL\s+|LOCAL\s+)?TEMP(?:ORARY)?\s+TABLE\s+"
         r"(?:IF\s+NOT\s+EXISTS\s+)?(?=\w+\s*\()",
         "", sql, count=1)
+
+def _lcm_pg_temp_rewrite(sql):
+    """Same intent as _lcm_pg_temp_strip but PRESERVES the CREATE keyword:
+    PG resolves a temp-table name to pg_temp first, shadowing the schema table
+    whose rowid shim the backfill lease SQL reads. Upstream staging tables are
+    idempotent scratch tables, so declare them as regular schema tables:
+    'CREATE TEMP TABLE [IF NOT EXISTS] name(' -> 'CREATE TABLE [IF NOT EXISTS] name('.
+    The CTAS form (name AS SELECT ...) is left untouched."""
+    import re as _re
+    if not isinstance(sql, str) or "TEMP" not in sql.upper():
+        return sql
+    return _re.sub(
+        r"(?i)\bCREATE\s+((?:GLOBAL\s+|LOCAL\s+)?TEMP(?:ORARY)?\s+)TABLE\s+"
+        r"(IF\s+NOT\s+EXISTS\s+)?(?=\w+\s*\()",
+        lambda m: "CREATE TABLE " + (m.group(2) or ""),
+        sql, count=1)
