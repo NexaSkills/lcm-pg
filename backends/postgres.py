@@ -212,7 +212,9 @@ def _table_info_sql(value: str, conn=None):
         " LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum"
         " WHERE a.attrelid = (SELECT oid FROM pg_class WHERE relname = %s"
         "   AND relnamespace = current_schema()::regnamespace)"
-        "   AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+        "   AND a.attnum > 0 AND NOT a.attisdropped"
+        "   AND a.attname <> 'rowid'"
+        " ORDER BY a.attnum",
         (value,),
     )
 
@@ -291,6 +293,7 @@ def _sqlite_ddl_for(table: str, conn=None):
                 "   WHERE relname = %s"
                 "     AND relnamespace = current_schema()::regnamespace)"
                 "   AND a.attnum > 0 AND NOT a.attisdropped"
+                "   AND a.attname <> 'rowid'"
                 " ORDER BY a.attnum",
                 (table,))
             rows = cur.fetchall()
