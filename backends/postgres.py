@@ -1116,16 +1116,40 @@ class _Cursor:
 
 
 def _split_statements(script: str) -> list[str]:
-    # naive split on ; outside quotes — adequate for our DDL scripts
-    parts, buf, in_str = [], [], False
-    for ch in script:
+    # split on ; outside quotes AND dollar-quoted strings (PG $$ ... $$ /
+    # $tag$ ... $tag$): plpgsql function bodies contain semicolons and the old
+    # naive split cut them mid-body ("unterminated dollar-quoted string").
+    parts, buf = [], []
+    i, n = 0, len(script)
+    in_str = False
+    while i < n:
+        ch = script[i]
+        if in_str:
+            buf.append(ch)
+            if ch == "'":
+                in_str = False
+            i += 1
+            continue
         if ch == "'":
-            in_str = not in_str
-        if ch == ";" and not in_str:
+            in_str = True
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "$":
+            m = re.match(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$", script[i:])
+            if m:
+                tag = m.group(0)
+                j = script.find(tag, i + len(tag))
+                if j != -1:
+                    buf.append(script[i:j + len(tag)])
+                    i = j + len(tag)
+                    continue
+        if ch == ";":
             parts.append("".join(buf))
             buf = []
         else:
             buf.append(ch)
+        i += 1
     if "".join(buf).strip():
         parts.append("".join(buf))
     return parts
