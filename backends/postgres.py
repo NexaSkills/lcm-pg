@@ -714,6 +714,12 @@ _ROWID_SHIM_TABLES = ("lcm_embedding_backfill_inflight",
                       "lcm_embedding_backfill_predecessor_batch",
                       "lcm_embedding_inflight")
 
+import re as _re
+_ROWID_DDL_RE = _re.compile(
+    r"(?i)\b(?:CREATE|ALTER|DROP)\s+TABLE\b[^;]*\b(?:%s)\b"
+    % "|".join(_ROWID_SHIM_TABLES))
+
+
 # "CREATE TEMP TABLE [IF NOT EXISTS] <name> AS SELECT ..." — a CTAS temp table.
 # (Plain "CREATE TEMP TABLE <name>(cols)" declarations are left alone: PG has
 # native temp tables; only the AS-SELECT form breaks because PG forbids
@@ -910,6 +916,19 @@ class _Cursor:
         return self._guarded_one(sql, parameters)
 
     def _guarded_one(self, sql, parameters):
+        # Marker: _ROWID_RESHIM_FLAG
+        if getattr(self, '_rowid_needs_reshim', False):
+            self._rowid_needs_reshim = False
+            _ensure_rowid_shim_tables(self._adapter)
+        # Marker: _ROWID_INVALIDATE_ON_DDL
+        # The inflight rebuild (RENAME+CREATE) erases the generated rowid
+        # shim; forget done-flags for shim tables touched by DDL so the
+        # shim re-adds the column on the next statement.
+        if _ROWID_DDL_RE.search(sql):
+            done = getattr(self._adapter, '_rowid_shim_done', None)
+            if done:
+                done.difference_update(_ROWID_SHIM_TABLES)
+            self._rowid_needs_reshim = True
         if sql.strip().lower().startswith("begin"):
             self._adapter.begin()
             _ensure_rowid_shim_tables(self._adapter)
