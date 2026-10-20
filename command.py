@@ -225,6 +225,18 @@ def _ensure_inflight_table(conn: sqlite3.Connection) -> None:
             )
             """
         )
+        # Marker: _LCM_PG_RESHIM_AFTER_CREATE
+        # PG: upstream lease SQL expects the hidden SQLite rowid; declare a
+        # deterministic generated column after every CREATE (the rebuild
+        # RENAME+CREATE cycle would otherwise erase it). SQLite rejects
+        # 'generated always' and keeps its implicit rowid -> except: pass.
+        try:
+            conn.execute(
+                "alter table lcm_embedding_backfill_inflight add column "
+                "if not exists rowid bigint generated always as "
+                "(abs(public.has_object_identity(embedded_id::public.blob))) stored")
+        except Exception:
+            pass
 
     def table_info() -> tuple[tuple[object, ...], ...]:
         return tuple(
