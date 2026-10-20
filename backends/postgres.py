@@ -733,6 +733,10 @@ class _HybridRow(dict):
         return dict.keys(self)
 
 
+_WRITE_STMT_RE = re.compile(
+    r"(?i)\s*(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|GRANT|REVOKE|REINDEX|VACUUM|REFRESH|CALL|DO)\b")
+
+
 class _Cursor:
     """sqlite3.Cursor-shaped wrapper over a psycopg cursor."""
 
@@ -760,6 +764,8 @@ class _Cursor:
             raise
 
     def _guarded(self, sql, parameters):
+        if getattr(self._adapter, "_query_only", False) and _WRITE_STMT_RE.match(sql):
+            raise RuntimeError("readonly")
         if sql.strip().lower().startswith("begin"):
             self._adapter.begin()
         if re.match(r"(?i)\s*CREATE\s+VIRTUAL\s+TABLE\b", sql):
@@ -1146,8 +1152,11 @@ class PgConnection:
         return self._conn.cursor(row_factory=dict_row)
 
     def cursor(self):
-        if self._query_only:
-            raise RuntimeError("readonly")  # parity with sqlite READONLY error
+        # NOTE: query_only must NOT refuse cursors here. Upstream opens real
+        # search connections with PRAGMA query_only=ON and then SELECTs through
+        # them; raising here silently killed every FTS arm (proactive recall,
+        # lcm_grep/recall full-text). The guard below in execute() is the
+        # sqlite-parity write refusal point.
         try:
             raw = self._raw_cursor()
         except (psycopg.errors.InterfaceError, psycopg.errors.AdminShutdown):
@@ -1354,8 +1363,10 @@ class PgConnection:
         return bool(self._conn.info.transaction_status)
 
 
-def connect(dsn: str, schema: str, *, min_size: int = 1, max_size: int = 8,
-            lock_timeout_ms: int = 15000) -> PgConnection:
+def connect(dsn: str, schema: str, *,
+            min_size: int = int(os.environ.get("LCM_PG_POOL_MIN", "1")),
+            max_size: int = int(os.environ.get("LCM_PG_POOL_MAX", "8")),
+            lock_timeout_ms: int = 15000, query_only: bool = False) -> PgConnection:
     """Create (or reuse) a pool for this schema and hand back a connection-shaped object.
 
     The pool pins search_path per checkout so any code path — including pooled
@@ -1372,18 +1383,38 @@ def connect(dsn: str, schema: str, *, min_size: int = 1, max_size: int = 8,
                 max_size=max_size,
                 check=ConnectionPool.check_connection,
                 name=f"lcm-pg-{schema}",
-                timeout=30,
+                timeout=10,
             )
-            pool.wait(timeout=30)
+            pool.wait(timeout=10)
             # pin search_path + statement guards on every new physical connection
             pool.configure = None  # explicit instead:
             _POOLS[key] = pool
-    # ensure schema exists (deterministic zero-provisioning for new profiles)
+    # ensure schema exists (deterministic zero-provisioning for new profiles).
+    # A read-only handle must NEVER provision anything: sqlite's mode=ro on a
+    # missing database fails closed, and a retired/moved lcm.db must not be
+    # resurrected (not even as an empty 0-byte file) by a read-only path.
+    if not _SCHEMA_RE.match(schema):
+        raise ValueError(schema)
+    if query_only:
+        probe = pool.getconn()
+        try:
+            with probe.cursor() as cur:
+                cur.execute(_set_stmts(schema, lock_timeout_ms))
+                cur.execute(
+                    "SELECT 1 FROM information_schema.schemata"
+                    " WHERE schema_name = %s", (schema,))
+                if cur.fetchone() is None:
+                    raise RuntimeError(
+                        f"readonly connection to missing schema {schema!r}"
+                        " (sqlite mode=ro parity: no auto-creation)")
+        finally:
+            pool.putconn(probe)
+        conn = PgConnection(pool, schema)
+        conn._query_only = True
+        return conn
     probe = pool.getconn()
     try:
         with probe.cursor() as cur:
-            if not _SCHEMA_RE.match(schema):
-                raise ValueError(schema)
             cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
             cur.execute(_set_stmts(schema, lock_timeout_ms))
             _ensure_catalog_shims(cur, schema)
@@ -1391,7 +1422,10 @@ def connect(dsn: str, schema: str, *, min_size: int = 1, max_size: int = 8,
         pool.putconn(probe)
     # wrap: configure callback pins schema/lock_timeout on every checkout
     _patch_pool_checkout(pool, schema, lock_timeout_ms)
-    return PgConnection(pool, schema)
+    conn = PgConnection(pool, schema)
+    if query_only:
+        conn._query_only = True
+    return conn
 
 
 def _patch_pool_checkout(pool: ConnectionPool, schema: str, lock_timeout_ms: int):
