@@ -840,6 +840,21 @@ def _neutralize_is_forms(sql: str) -> str:
                 out.append(op)
                 i = j + len(op)
                 continue
+            # Marker: _IS_VALUE_OPERAND
+            # IS <value expression> (e.g. IS tbl.col / IS other_alias.col):
+            # SQLite equality semantics = PG's NULL-safe IS [NOT] DISTINCT
+            # FROM. Copy the operand verbatim (up to the next top-level SQL
+            # keyword boundary), only if it is a plain (possibly qualified)
+            # identifier — never a keyword like NULL/DISTINCT/placeholder.
+            m2 = re.match(r"([A-Za-z_][\w.]*)", s[j:])
+            if m2:
+                word = m2.group(1)
+                if word.upper() not in ("NULL", "TRUE", "FALSE", "DISTINCT"):
+                    out.append("IS NOT DISTINCT FROM " if not neg
+                               else "IS DISTINCT FROM ")
+                    out.append(word)
+                    i = j + len(word)
+                    continue
         out.append(ch); i += 1
     s = "".join(out)
     return s.replace(_IS_NOTNULL, "IS NOT NULL")
