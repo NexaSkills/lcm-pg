@@ -37,6 +37,27 @@ begin
         execute format('alter table %I.lcm_chunk_vectors add column rowid bigint '
                        'generated always as (abs(public.has_object_identity(chunk_id::public.blob))) stored', s);
       end if;
+      -- (3) embedding/chunk PK cols must be NULLABLE (bootstrap contract: SQLite
+      -- CREATE TABLE ... PRIMARY KEY(...) without NOT NULL => PK cols report
+      -- notnull=0). The PG migration set attnotnull=true on them => 'malformed
+      -- table'. Relax exactly these (rel,col) pairs via the catalog; ALTER
+      -- cannot relax a PK-implied NOT NULL, and this touches nothing else.
+      begin
+        update pg_attribute a set attnotnull = false
+          from pg_class c
+          where a.attrelid = c.oid and a.attnum > 0 and a.attnotnull
+            and c.relnamespace = s::regnamespace
+            and (c.relname, a.attname) in (
+              ('lcm_embedding_profile','identity_hash'),
+              ('lcm_embedding_meta','embedded_id'),('lcm_embedding_meta','embedded_kind'),('lcm_embedding_meta','identity_hash'),
+              ('lcm_embedding_vectors','embedded_id'),('lcm_embedding_vectors','identity_hash'),
+              ('lcm_embedding_binary','embedded_id'),('lcm_embedding_binary','identity_hash'),
+              ('lcm_chunk_meta','chunk_id'),('lcm_chunk_meta','identity_hash'),
+              ('lcm_chunk_vectors','chunk_id'),('lcm_chunk_vectors','identity_hash'),
+              ('lcm_chunk_binary','chunk_id'),('lcm_chunk_binary','identity_hash'));
+      exception when others then
+        raise notice 'skip relax %: %', s, sqlerrm;
+      end;
       -- rollup invalidations created_at must be NOT NULL (bootstrap: REAL NOT NULL)
       if exists (select 1 from pg_attribute a join pg_class c on c.oid=a.attrelid
                  join pg_namespace n on n.oid=c.relnamespace
