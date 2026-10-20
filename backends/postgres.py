@@ -667,6 +667,8 @@ def _rewrite_text(sql: str) -> str:
             s)
 
     # SQLite FTS MATCH quoting: "col" MATCH '"phrase"' -> to_tsvector/plainto
+    # Parametric `IS [NOT] <placeholder>` (SQLite-only form) -> = / <> .
+    s = _neutralize_is_forms(s)
     return s
 
 
@@ -706,6 +708,58 @@ def _neutralize_negative_limit(sql: str, params):
         return sql, params
     except Exception:
         return sql, params
+
+
+_IS_NOTNULL = "\x00\x02\x00"
+
+
+def _neutralize_is_forms(sql: str) -> str:
+    """SQLite allows `x IS ?` / `x IS NOT ?` (IS against any value); PG
+    restricts IS to NULL/NOT NULL/DISTINCT FROM and rejects the form at parse
+    time (e.g. the backfill lease-maintenance path: 'syntax error at or near
+    $3').  Rewrite ONLY placeholder-operand forms (`IS ?`, `IS NOT ?`, `%s`,
+    `$n` operands) to `=` / `<>`.  `IS [NOT] NULL` and `IS [NOT] DISTINCT
+    FROM` are valid PG and stay untouched; quoted literals are skipped."""
+    if " IS " not in sql and " is " not in sql.lower():
+        return sql
+    s = sql.replace("IS NOT NULL", _IS_NOTNULL)
+    out, i, in_str = [], 0, False
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch == "'":
+            in_str = not in_str
+            out.append(ch); i += 1; continue
+        if not in_str and s[i:i + 2].upper() == "IS" \
+                and not (i and (s[i - 1].isalnum() or s[i - 1] == "_")) \
+                and not (s[i + 2:i + 3].isalnum() or s[i + 2:i + 3] == "_"):
+            j = i + 2
+            while j < n and s[j] in " \t\n":
+                j += 1
+            neg = False
+            if s[j:j + 3].upper() == "NOT" and not (s[j + 3:j + 4].isalnum() or s[j + 3:j + 4] == "_"):
+                neg = True
+                j += 3
+                while j < n and s[j] in " \t\n":
+                    j += 1
+            op = None
+            if s[j:j + 1] == "?":
+                op = "?"
+            elif s[j:j + 2] == "%s":
+                op = "%s"
+            elif s[j:j + 1] == "$" and s[j + 1:j + 2].isdigit():
+                k = j + 1
+                while k < n and s[k].isdigit():
+                    k += 1
+                op = s[j:k]
+            if op is not None:
+                out.append("<> " if neg else "= ")
+                out.append(op)
+                i = j + len(op)
+                continue
+        out.append(ch); i += 1
+    s = "".join(out)
+    return s.replace(_IS_NOTNULL, "IS NOT NULL")
 
 
 def _annotate_param_types(sql: str, _shape=None) -> str:
