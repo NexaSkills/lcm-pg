@@ -37,6 +37,16 @@ begin
         execute format('alter table %I.lcm_chunk_vectors add column rowid bigint '
                        'generated always as (abs(public.has_object_identity(chunk_id::public.blob))) stored', s);
       end if;
+      if exists (select 1 from pg_class c join pg_namespace n on n.oid=c.relnamespace
+                 where n.nspname=s and c.relname='lcm_embedding_backfill_inflight'
+                   and c.relkind='r')
+         and not exists (select 1 from pg_attribute a join pg_class c on c.oid=a.attrelid
+                     join pg_namespace n on n.oid=c.relnamespace
+                     where n.nspname=s and c.relname='lcm_embedding_backfill_inflight'
+                       and a.attname='rowid' and a.attnum>0) then
+        execute format('alter table %I.lcm_embedding_backfill_inflight add column rowid bigint '
+                       'generated always as (abs(public.has_object_identity(embedded_id::public.blob))) stored', s);
+      end if;
       -- (3) embedding/chunk PK cols must be NULLABLE (bootstrap contract: SQLite
       -- CREATE TABLE ... PRIMARY KEY(...) without NOT NULL => PK cols report
       -- notnull=0). The PG migration set attnotnull=true on them => 'malformed
