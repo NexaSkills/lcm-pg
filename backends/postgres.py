@@ -279,6 +279,7 @@ def _sqlite_ddl_for(table: str, conn=None):
                 "       WITH ORDINALITY AS u(k, ord)"
                 "     WHERE i.indrelid = a.attrelid AND i.indisprimary"
                 "       AND u.k = a.attnum LIMIT 1),"
+                " a.attgenerated,"
                 " (SELECT string_agg("
                 "     'CHECK(' || _lcm_checkfold(p.oid) || ')', ', ' ORDER BY p.oid)"
                 "   FROM pg_constraint p"
@@ -301,10 +302,12 @@ def _sqlite_ddl_for(table: str, conn=None):
     if not rows:
         return None
     cols = []
-    pk_cols = sorted((p for p in rows if p[6]), key=lambda p: p[6])
+    pk_cols = sorted((p for p in rows if p[6] and not (len(p) > 7 and p[7] == "s")), key=lambda p: p[6])
     autoincrement_pk = (len(pk_cols) == 1 and pk_cols and pk_cols[0][6] == 1
                         and pk_cols[0][4] and pk_cols[0][2] == "INTEGER")
-    for (attnum, name, stype, notnull, is_seq, dflt, pkord, checks) in rows:
+    for (attnum, name, stype, notnull, is_seq, dflt, pkord, gen, _checks) in rows:
+        if gen == "s":
+            continue  # STORED generated col (rowid); not in upstream shapes
         bits = ['"' + str(name).replace('"', '""') + '"', stype]
         if autoincrement_pk and pkord == 1:
             bits.append("PRIMARY KEY AUTOINCREMENT")
@@ -335,7 +338,7 @@ def _sqlite_ddl_for(table: str, conn=None):
     # every row carries the same aggregated string, take the first non-null).
     # The aggregate is ', '-joined — split on ', ' ONLY at depth 0 so the
     # commas inside IN (...) lists are never cut.
-    checks = next((r[7] for r in rows if len(r) > 7 and r[7]), None)
+    checks = next((r[8] for r in rows if len(r) > 8 and r[8]), None)
     if checks:
         depth = 0; buf = []; parts = []
         for ch in str(checks):
@@ -682,6 +685,29 @@ def _adapt_params(params):
     return tuple(_one(p) for p in params)
 
 
+_BIG_LIMIT = 9223372036854775807
+
+
+def _neutralize_negative_limit(sql: str, params):
+    """SQLite reads a negative LIMIT as 'no limit' (vector_store's
+    _SCAN_ALL_ROWS = -1 rides through `LIMIT ?`); PG rejects it at parse time.
+    When the value bound at the statement-final LIMIT placeholder is negative,
+    rebind it to bigint max (PG's LIMIT accepts it and returns every row,
+    matching SQLite's negative-LIMIT = no-limit semantics; the placeholder
+    count is untouched so nothing downstream shifts)."""
+    try:
+        if isinstance(params, (tuple, list)) and params and not isinstance(params[0], dict) \
+                and params[-1] is not None \
+                and type(params[-1]) is int and params[-1] < 0 \
+                and re.search(r"(?i)\bLIMIT\s+%s\s*$", sql):
+            return sql, tuple(params[:-1]) + (_BIG_LIMIT,)  # PG: LIMIT bigint-max = no limit
+        if re.search(r"(?i)\bLIMIT\s+-\d+\b", sql):
+            sql = re.sub(r"(?i)\bLIMIT\s+-\d+\b", "LIMIT %d" % _BIG_LIMIT, sql)
+        return sql, params
+    except Exception:
+        return sql, params
+
+
 def _annotate_param_types(sql: str, _shape=None) -> str:
     """Cast every positional %s to text EXCEPT after LIMIT/OFFSET (which
     PG needs numeric). String-literal %s are left alone."""
@@ -796,6 +822,11 @@ class _Cursor:
             self._rowcount = len(self._rows)
             return self
         params = _adapt_params(params)
+        # SQLite reads a negative LIMIT as "no limit" (vector_store's
+        # _SCAN_ALL_ROWS sentinel rides through `LIMIT ?`); PG rejects it at
+        # parse time with InvalidRowCountInLimitClause. Rebind the sentinel so
+        # SQLite semantics are preserved. OFFSET untouched.
+        sql, params = _neutralize_negative_limit(sql, params)
         if isinstance(params, dict):
             # sqlite-style :named params -> psycopg %(name)s dictConfig keys
             sql = re.sub(r":([A-Za-z_]\w*)", lambda m: "%%(%s)s" % m.group(1), sql)
