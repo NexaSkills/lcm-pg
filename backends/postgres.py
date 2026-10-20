@@ -714,6 +714,14 @@ _ROWID_SHIM_TABLES = ("lcm_embedding_backfill_inflight",
                       "lcm_embedding_backfill_predecessor_batch",
                       "lcm_embedding_inflight")
 
+# "CREATE TEMP TABLE [IF NOT EXISTS] <name> AS SELECT ..." — a CTAS temp table.
+# (Plain "CREATE TEMP TABLE <name>(cols)" declarations are left alone: PG has
+# native temp tables; only the AS-SELECT form breaks because PG forbids
+# TEMP/UNLOGGED on CREATE TABLE ... AS.)
+_TEMP_CTAS_RE = re.compile(
+    r"(?i)\bCREATE\s+(?:GLOBAL\s+|LOCAL\s+)?TEMP(?:ORARY)?\s+TABLE\s+"
+    r"(?:IF\s+NOT\s+EXISTS\s+)?(?!.*\bAS\b)", re.S)
+
 
 def _ensure_rowid_shim_tables(self):
     """SQLite gives EVERY regular table a hidden `rowid`; the upstream
@@ -884,6 +892,15 @@ class _Cursor:
         if sql.strip().lower().startswith("begin"):
             self._adapter.begin()
             _ensure_rowid_shim_tables(self._adapter)
+        if _TEMP_CTAS_RE.search(sql):
+            # SQLite lets a plain (non-temp) table SELECT from a TEMP table in
+            # the same session; PG resolves the same name to pg_temp first, so
+            # an INSERT ... SELECT rowid from a real table into a temp staging
+            # table of the SAME name errors with "column rowid does not exist".
+            # Upstream's staging tables are idempotent DELETE-on-open scratch
+            # tables, so materializing them as regular schema tables is
+            # semantics-preserving and keeps the real table visible.
+            sql = _TEMP_CTAS_RE.sub("", sql)
         if re.match(r"(?i)\s*CREATE\s+VIRTUAL\s+TABLE\b", sql):
             # external-content FTS5 shadow tables are not needed: backends/fts_pg
             # provides trigger-maintained tsvectors on the content table.
