@@ -426,6 +426,7 @@ class FtsConnection:
         return _FtsCursor(self._base.cursor(), lambda: self._specs)
 
     def execute(self, sql, parameters=()):
+        sql = _lcm_pg_temp_strip(sql)
         c = self.cursor()
         return c.execute(sql, parameters)
 
@@ -698,6 +699,7 @@ class _FtsCursor:
         return True
 
     def execute(self, sql, parameters=()):
+        sql = _lcm_pg_temp_strip(sql)
         if self._intercept_maintenance(sql):
             self._rowcount = 0
             return self
@@ -797,3 +799,18 @@ class _FtsCursor:
 
 def _qvar(q: str) -> str:
     return _SENTINEL if q.strip() in ("%s", "?", _SENTINEL) else q
+
+def _lcm_pg_temp_strip(sql):
+    """SQLite lets a regular table SELECT from a TEMP table; PG resolves the
+    same name to pg_temp first, shadowing the schema table (whose rowid shim
+    the backfill lease SQL reads). Upstream staging tables are idempotent
+    scratch tables, so declare them as regular schema tables instead.
+    Declaration form (name immediately followed by the "(" column list) drops
+    the TEMP keyword; the CTAS form (name AS SELECT ...) is left untouched."""
+    import re as _re
+    if not isinstance(sql, str) or "TEMP" not in sql.upper():
+        return sql
+    return _re.sub(
+        r"(?i)\bCREATE\s+(?:GLOBAL\s+|LOCAL\s+)?TEMP(?:ORARY)?\s+TABLE\s+"
+        r"(?:IF\s+NOT\s+EXISTS\s+)?(?=\w+\s*\()",
+        "", sql, count=1)
