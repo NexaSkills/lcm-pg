@@ -19,7 +19,7 @@ from typing import Any
 # fts_table, content_table, indexed_column — mirrors upstream FtsSpec objects
 _FTS_SPECS = (
     ("messages_fts", "messages", "content"),
-    ("nodes_fts", "summary_nodes", "content"),
+    ("nodes_fts", "summary_nodes", "summary"),
 )
 
 
