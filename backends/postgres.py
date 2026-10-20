@@ -1233,10 +1233,10 @@ class PgConnection:
 
     # -- translation -------------------------------------------------------
     def _translate(self, sql: str, params):
+        stripped = sql.strip()
         # PG forbids LIMIT on DELETE/UPDATE (SQLite allows) -> ctid rewrite
         if _DML_LIMIT_RE.match(stripped):
             stripped = _neutralize_dml_limit(stripped)
-        stripped = sql.strip()
         if stripped.lower().startswith("pragma "):
             return self._pragma(stripped)
         if re.match(r"^(SAVEPOINT|RELEASE|SET|BEGIN|COMMIT|ROLLBACK|CHECKPOINT|VACUUM)\b", stripped, flags=re.I):
