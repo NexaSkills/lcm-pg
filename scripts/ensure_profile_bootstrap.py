@@ -115,6 +115,10 @@ ENSURE_FNS = (
     "ensure_message_origin_columns", "ensure_temporal_rollup_tables",
     "ensure_embedding_tables", "ensure_chunk_tables", "ensure_assertion_tables",
 )
+# command.py's own inflight-table ensure (lcm_embedding_backfill_inflight +
+# predecessor_batch are NOT part of db_bootstrap; the shipped backfill creates
+# them lazily only when its engine is constructed with an active profile).
+ENSURE_MODULES = {}  # reserved; command-module ensures listed below
 
 
 def main() -> int:
@@ -154,6 +158,15 @@ def main() -> int:
                 f(conn)
             except Exception as exc:
                 print(f"[{schema}] {fn}: {str(exc)[:120]}")
+        # command.py owns lcm_embedding_backfill_inflight (created lazily by
+        # the shipped backfill lease path; a never-run schema lacks it and the
+        # backfill aborts on the first lease probe). Call its private ensure
+        # with the module's OWN import (same code path, no reimplementation).
+        try:
+            cmd = importlib.import_module("lcmpg.command")
+            cmd._ensure_inflight_table(conn)
+        except Exception as exc:
+            print(f"[{schema}] inflight-ensure: {str(exc)[:120]}")
         total += 1
         # release this schema's pool before the next (never accumulate)
         for pool in list(getattr(pg, "_POOLS", {}).values()):
