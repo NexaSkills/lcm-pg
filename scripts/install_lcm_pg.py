@@ -144,6 +144,17 @@ def main():
     # headroom without competing with the daemons. Chunk embeddings (raw-message
     # text) are opt-in separately. Non-fatal: an embedding hiccup must not fail an
     # otherwise-good install.
+    print("== 3a. schema parity (rowid shims; backfill maintenance SELECTs rowid on inflight) ==")
+    parity = f"{FORK}/scripts/schema_parity.sh"
+    if os.path.isfile(parity):
+        r = subprocess.run(["bash", parity], capture_output=True, text=True)
+        for line in (r.stdout or "").splitlines()[-3:]:
+            print("  ", line)
+        if r.returncode != 0:
+            print(f"  schema_parity exited {r.returncode} (non-fatal): "
+                  f"{(r.stderr or '').strip()[:200]}")
+    else:
+        print("  skipped (schema_parity.sh not found; run it manually before backfill)")
     print("== 4. auto-backfill summary embeddings ==")
     runner = f"{FORK}/scripts/embed_auto_backfill.py"
     interpreters = [f"{VENV}/bin/python", f"{BASE}/venv/bin/python", sys.executable]

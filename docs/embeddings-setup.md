@@ -105,10 +105,11 @@ You do not need to run `/lcm embed backfill` by hand. Both setup paths populate
 summary embeddings for every profile schema automatically, so hybrid
 (vector + FTS) recall is live the moment lcm-pg is installed:
 
-- `scripts/install_lcm_pg.py` runs step 4 — `scripts/embed_auto_backfill.py
-  --limit 500` (apply + summary corpus by default) — right after cluster +
-  plugin symlink + DSN env config, enumerating the root and every `profiles/*`
-  schema.
+- `scripts/install_lcm_pg.py` runs step 3a (`scripts/schema_parity.sh`, the
+  rowid shims the backfill's lease-maintenance SQL needs) then step 4 —
+  `scripts/embed_auto_backfill.py --limit 500` (apply + summary corpus by
+  default) — right after cluster + plugin symlink + DSN env config, enumerating
+  the root and every `profiles/*` schema.
 - `scripts/rollout_host.sh install` runs it as step 7b, after the daemons
   restart (the bundle's `~/lcm-pg/venv/bin/python` provides psycopg + fastembed;
   an embedding hiccup is logged and non-fatal, never failing a good install).
