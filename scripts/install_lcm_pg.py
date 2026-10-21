@@ -58,6 +58,8 @@ def main():
         print(f"would: symlink {ROOT_PLUGIN} -> {FORK} (backup old hermes-lcm dirs)")
         print(f"would: point profiles/*/plugins/hermes-lcm at {ROOT_PLUGIN}")
         print(f"would: set LCM_PG_DSN={NEW_DSN} in root + profile .env files")
+        print("would: auto-backfill summary embeddings into every profile schema "
+              "(scripts/embed_auto_backfill.py, summary corpus)")
         return 0
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -133,6 +135,35 @@ def main():
         lines.append(f"LCM_PG_DSN={NEW_DSN}")
         open(ef, "w").write("\n".join(lines) + "\n")
         print("updated:", ef)
+
+    # -- 4. auto-embed summaries (semantic recall live from install) --------------
+    # Populate summary embeddings for every profile schema so hybrid (vector+FTS)
+    # recall is active out of the box. The runner defaults to apply + summary
+    # corpus; --limit bounds per-schema work. Postgres-native borrow-per-operation
+    # means it holds only 1 idle backend/schema, so it slots into the cluster
+    # headroom without competing with the daemons. Chunk embeddings (raw-message
+    # text) are opt-in separately. Non-fatal: an embedding hiccup must not fail an
+    # otherwise-good install.
+    print("== 4. auto-backfill summary embeddings ==")
+    runner = f"{FORK}/scripts/embed_auto_backfill.py"
+    interpreters = [f"{VENV}/bin/python", f"{BASE}/venv/bin/python", sys.executable]
+    interp = next((p for p in interpreters
+                   if p and os.path.exists(p)), None)
+    if interp and os.path.isfile(runner):
+        env = dict(os.environ,
+                   LCM_BACKEND="postgres", LCM_PG_DSN=NEW_DSN,
+                   LCM_PG_POOL_MIN="1", LCM_PG_POOL_MAX="2")
+        # runner defaults to apply + summary corpus; --limit bounds per-schema work
+        r = subprocess.run([interp, runner, "--limit", "500"], env=env,
+                           capture_output=True, text=True)
+        for line in (r.stdout or "").splitlines():
+            print("  ", line)
+        if r.returncode != 0:
+            print(f"  backfill exited {r.returncode} (non-fatal): "
+                  f"{(r.stderr or '').strip()[:200]}")
+    else:
+        print("  skipped (runner or interpreter not found; run "
+              "scripts/embed_auto_backfill.py --apply manually)")
 
     print("done. DSN:", NEW_DSN)
     print("next: restart hermes daemons (systemctl --user restart <units>) then run verify_lcm_pg.py")

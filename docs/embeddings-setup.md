@@ -99,6 +99,28 @@ optional `LCM_EMBEDDING_BACKFILL_BUDGET_S` still caps the whole apply run
 between batches (`0`, the default, means no whole-run cap); the lease and
 post-call ownership CAS remain authoritative independently of both timeouts.
 
+## Automatic on install (no manual backfill needed)
+
+You do not need to run `/lcm embed backfill` by hand. Both setup paths populate
+summary embeddings for every profile schema automatically, so hybrid
+(vector + FTS) recall is live the moment lcm-pg is installed:
+
+- `scripts/install_lcm_pg.py` runs step 4 — `scripts/embed_auto_backfill.py
+  --limit 500` (apply + summary corpus by default) — right after cluster +
+  plugin symlink + DSN env config, enumerating the root and every `profiles/*`
+  schema.
+- `scripts/rollout_host.sh install` runs it as step 7b, after the daemons
+  restart (the bundle's `~/lcm-pg/venv/bin/python` provides psycopg + fastembed;
+  an embedding hiccup is logged and non-fatal, never failing a good install).
+
+This works because the postgres backend now uses borrow-per-operation
+connections (an idle helper holds zero backends), so the backfill slots into the
+cluster's connection headroom instead of competing with the daemons for sockets.
+Chunk embeddings (raw-message text) are opt-in separately; raw-text population
+is gated per the recall-policy consent model. To re-run a drift correction any
+time: `~/lcm-pg/venv/bin/python
+~/.hermes/forks/lcm-pg/scripts/embed_auto_backfill.py` (or `--dry-run` to preview).
+
 ## What you get
 
 `lcm_grep` gains two modes on top of the existing ones:

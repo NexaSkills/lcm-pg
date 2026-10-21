@@ -123,6 +123,16 @@ unit is enabled. (Install script notes this; enabling it is an explicit step.)
 
 ## Gotchas (verified on this host)
 
+- **Connection model = borrow-per-operation (postgres-native).** The
+  SQLite-era design (each store/DAG/vector helper opens one connection and keeps
+  it for its whole lifetime) is replaced: a `PgConnection` borrows a pooled
+  physical conn per operation and holds it open only inside a transaction /
+  savepoint scope (`with conn:` / `begin()` / `SAVEPOINT`). An idle helper holds
+  ZERO backends, so ~5 schemas × 3 daemons pin ~min_size each instead of ~8
+  apiece. This is what freed the 50-slot cluster (was 49 idle, now ~15-25). If
+  idle counts creep back toward the ceiling after a code change, suspect a path
+  that opens a conn but never enters a tx scope — not a pool-sizing problem.
+  Covered by `tests/test_connection_borrow.py`.
 - The private cluster's `max_connections=50`: daemons + CLI sessions + probes
   share it. A wedged session leaves idle-in-transaction connections; check
   `pg_stat_activity` before blaming LCM.

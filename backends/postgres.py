@@ -948,6 +948,11 @@ class _Cursor:
             raise
 
     def _guarded(self, sql, parameters):
+        # A reused held connection may carry an aborted transaction from a prior
+        # failed statement; reset before dispatch so this statement runs. Skip
+        # the reset inside an explicit BEGIN the caller just opened (begin()
+        # tracks _tx_open) — there the caller owns the transaction.
+        self._adapter._reset_if_aborted()
         if getattr(self._adapter, "_query_only", False) and _WRITE_STMT_RE.match(sql):
             raise RuntimeError("readonly")
         # TEMP-declaration strip must run BEFORE the multi-statement split (the
@@ -1235,22 +1240,130 @@ class PgConnection:
     def __init__(self, pool: ConnectionPool, schema: str):
         self._pool = pool
         self._schema = schema
-        self._ctx = pool.connection()
-        try:
-            self._conn = self._ctx.__enter__()
-        except psycopg.errors.AdminShutdown:
-            # An operator ran pg_terminate_backend (e.g. clearing a poisoned
-            # idle-in-transaction conn). One failed checkout is not a dead
-            # pool — retry so the tool call survives the cleanup.
-            self._ctx = pool.connection()
-            self._conn = self._ctx.__enter__()
+        # postgres-native: a PgConnection holds NO backend while idle. It borrows
+        # a pooled physical connection per standalone operation (open -> run ->
+        # release-to-idle) and holds it open only for an explicit transaction /
+        # savepoint scope (begin()/with-conn). This is the deliberate departure
+        # from the SQLite carry-over where each store kept one connection open
+        # for its whole lifetime (the source of the idle-backend pileup).
+        self._ctx = None
+        self._conn = None
+        self._keep = False
         self._query_only = False
         self._tx = None
         self._tx_open = False
         self._ensure_tx_probe = "SELECT 1"
         self.row_factory = None  # accepted & ignored (dict rows always)
+
+    # -- borrow lifecycle ----------------------------------------------------
+    def _rollback_and_return(self):
+        """Roll the physical connection back (clearing an aborted transaction
+        from a failed statement) and return it to the pool in a clean,
+        autocommit state so the next borrower never inherits aborted state.
+        """
+        if self._conn is not None:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+        self._release_held()
+
+    def _reset_if_aborted(self):
+        """If the held physical conn is in an aborted transaction, roll it back.
+
+        A failed statement inside a scope that never committed/rolled back
+        leaves the pooled conn aborted; without this the NEXT statement fails
+        with 'current transaction is aborted'. Call before executing.
+        """
+        c = self._conn
+        if c is not None and getattr(c.info, "transaction_status", 0) == 3:  # IN_FAILED
+            try:
+                c.rollback()
+            except Exception:
+                pass
+
+    def _open(self):
+        """Borrow a pooled physical connection unless one is already held.
+
+        Re-uses a live held connection; heals a physically-closed one (e.g. an
+        operator ran pg_terminate_backend / a server restart); otherwise checks
+        out a fresh one. Pins search_path/lock_timeout the moment it opens so
+        subsequent statements (and _Cursor's raw re-fetch) run schema-correct.
+        """
+        c = self._conn
+        if c is not None and not getattr(c, "closed", 0):
+            self._reset_if_aborted()
+            return
+        if c is not None:
+            self._release_held(discard=True)
+        self._ctx = self._pool.connection()
+        try:
+            self._conn = self._ctx.__enter__()
+        except psycopg.errors.AdminShutdown:
+            # One failed checkout is not a dead pool; cycle once and retry.
+            try:
+                self._ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+            self._ctx = self._pool.connection()
+            self._conn = self._ctx.__enter__()
+        # reset any aborted transaction from a path that skipped rollback
+        self._reset_if_aborted()
         with self._conn.cursor() as cur:
-            cur.execute(_set_stmts(schema, 15000))
+            cur.execute(_set_stmts(self._schema, 15000))
+
+    def _release_held(self, *, discard=False):
+        """Return the held physical connection to the pool.
+
+        On discard we roll the connection back first so the pool throws it away
+        rather than recycling a poisoned backend; otherwise it returns to the
+        idle pool for reuse. NOTE: this does NOT touch `_tx_ctx` (the psycopg
+        Transaction) — that is owned by __enter__/__exit__; clearing it here
+        would strand an open `with conn:` scope's transaction manager.
+        """
+        ctx = self._ctx
+        c = self._conn
+        self._conn = None
+        self._ctx = None
+        if discard and c is not None:
+            try:
+                c.rollback()  # end any open tx so the pool discards a clean corpse
+            except Exception:
+                pass
+        if ctx is not None:
+            try:
+                ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+
+    def _release_if_idle(self):
+        """Return the connection to the pool once idle (no explicit tx/savepoint open).
+
+        No-op inside a transaction or savepoint scope (_keep/_tx_open) — those
+        must hold the physical connection for the block's whole duration so
+        BEGIN/SAVEPOINT/RELEASE/ROLLBACK stay atomic on one backend.
+        """
+        if self._tx_open or self._keep:
+            return
+        if self._ctx is not None:
+            self._release_held()
+
+    def _begin_keep(self):
+        """Begin a physical transaction AND hold the connection for the scope.
+
+        Upstream's savepoint primitive (SAVEPOINT outside a tx) needs an open
+        transaction to survive on psycopg autocommit conns; we open BEGIN here
+        and set _keep so the connection is NOT released between the SAVEPOINT
+        and the matching RELEASE/ROLLBACK.
+        """
+        self._keep = True
+        self._open()
+        if not self._tx_open:
+            try:
+                self._conn.execute("BEGIN TRANSACTION")
+            except Exception:
+                pass
+            self._tx_open = True
 
     # -- translation -------------------------------------------------------
     def _translate(self, sql: str, params):
@@ -1407,6 +1520,11 @@ class PgConnection:
         return self._conn.cursor(row_factory=dict_row)
 
     def cursor(self):
+        # Borrow on demand (the single funnel for every execute/executemany/
+        # executescript path). Outside a tx/savepoint scope the conn is not yet
+        # open, so idle helpers never pin a backend.
+        self._open()
+        self._reset_if_aborted()  # a failed prior statement must not poison this one
         # NOTE: query_only must NOT refuse cursors here. Upstream opens real
         # search connections with PRAGMA query_only=ON and then SELECTs through
         # them; raising here silently killed every FTS arm (proactive recall,
@@ -1432,36 +1550,19 @@ class PgConnection:
     def _rebind_physical_conn(self):
         # Swap the borrowed physical connection for a fresh one from the same
         # pool (used after AdminShutdown / closed-physical detection). Explicit
-        # transactions cannot survive; drop the tracking (nothing to commit).
+        # transactions cannot survive; drop the tx tracking (an open tx cannot
+        # survive the corpse; the caller re-enters its scope if it still needs one).
         self._tx_open = False
-        self._tx_ctx = None
-        if getattr(self._conn, "closed", 0) != 2:
-            # psycopg only marks a terminated conn FAILED (closed=2) lazily,
-            # often at the next touch. Force it so the pool's putconn discards
-            # it instead of recycling the corpse to the next checkout.
+        discard = getattr(self._conn, "closed", 0) == 2
+        if self._ctx is not None:
+            # Force the corpse to a known state so the pool discards it rather
+            # than recycling it to the next checkout, then release.
             try:
                 self._conn.info.transaction_status
             except Exception:
                 pass
-            try:
-                self._conn.close()
-            except Exception:
-                pass
-        old_ctx, self._ctx = self._ctx, None
-        if old_ctx is not None:
-            try:
-                old_ctx.__exit__(None, None, None)
-            except Exception:
-                pass
-        self._ctx = self._pool.connection()
-        try:
-            self._conn = self._ctx.__enter__()
-        except psycopg.errors.AdminShutdown:
-            # terminate raced this checkout too; one more cycle is enough
-            self._ctx = self._pool.connection()
-            self._conn = self._ctx.__enter__()
-        with self._conn.cursor() as cur:
-            cur.execute(_set_stmts(self._schema, 15000))
+            self._release_held(discard=discard or True)
+        self._open()
 
     # -- sqlite3 parity surface ----------------------------------------------
     # BEGIN IMMEDIATE tracking: psycopg runs the pooled connection in autocommit,
@@ -1471,6 +1572,8 @@ class PgConnection:
     # COMMIT/ROLLBACK via the adapter actually commit/roll back it).
     def begin(self):
         if not self._tx_open:
+            self._keep = True
+            self._open()
             try:
                 self._conn.execute("BEGIN TRANSACTION")
             except Exception:
@@ -1509,11 +1612,17 @@ class PgConnection:
 
     def end_tx(self):
         self._tx_open = False
+        self._keep = False
+        # Roll the physical conn back (clears an aborted tx left by a failed
+        # statement, so the pool stays clean) and return it to idle.
+        self._rollback_and_return()
 
     # sqlite3 `with conn:` == transaction scope. The psycopg connection ctx
     # manager IS transaction scope (BEGIN..COMMIT/ROLLBACK around the block).
     # It must wrap the PHYSICAL psycopg connection, not re-issue BEGIN.
     def __enter__(self):
+        self._keep = True  # hold the backend for the whole transaction scope
+        self._open()
         inner = getattr(self, "_tx_ctx", None)
         if inner is None:
             from psycopg import Transaction
@@ -1528,44 +1637,66 @@ class PgConnection:
 
     def __exit__(self, *exc):
         inner = getattr(self, "_tx_ctx", None)
-        if inner is not None:
-            self._tx_ctx = None
-            try:
-                return inner.__exit__(*exc)
-            except Exception:
-                if exc[0] is not None:
-                    try:
-                        self._conn.rollback()
-                    except Exception:
-                        pass
-                return False
-        if exc[0] is not None:
-            self.rollback()
-        return False
+        try:
+            if inner is not None:
+                self._tx_ctx = None
+                try:
+                    return inner.__exit__(*exc)
+                except Exception:
+                    if exc[0] is not None:
+                        try:
+                            self._conn.rollback()
+                        except Exception:
+                            pass
+                    return False
+            if exc[0] is not None:
+                self.rollback()
+            return False
+        finally:
+            # transaction scope is over: clear the hold and return the backend
+            # in a CLEAN state (roll back first in case the block's last
+            # statement aborted the transaction -> an aborted backend must never
+            # go back to the idle pool).
+            self._tx_open = False
+            self._keep = False
+            self._rollback_and_return()
 
     def execute(self, sql: str, parameters=()):
+        # Borrow on demand via cursor(); the backend is returned at transaction/
+        # savepoint scope close (__exit__ / end_tx / commit / rollback / close),
+        # NOT here. A statement sequence (CREATE TEMP TABLE ... then use it) must
+        # stay on ONE connection for its whole scope, so releasing per-statement
+        # would drop PG temp tables. Idle helpers still hold zero backends
+        # because _open is lazy and each scope's close returns the connection.
+        self._reset_if_aborted()
         c = self.cursor()
         return c.execute(sql, parameters)
 
-
-
     def executemany(self, sql, seq):
+        self._reset_if_aborted()
         c = self.cursor()
         return c.executemany(sql, seq)
 
     def executescript(self, script: str):
+        self._reset_if_aborted()
         c = self.cursor()
         return c.executescript(script)
 
     def commit(self):
-        # No-op outside an explicit BEGIN IMMEDIATE transaction (autocommit pool);
-        # inside one, it ends the real PG transaction opened by begin().
-        if self._tx_open:
-            try:
+        # Ends any transaction scope. If a statement already aborted the tx,
+        # commit raises — in that case we roll back so the backend returns to
+        # the pool in a clean autocommit state (never poisoned for the borrower).
+        self._keep = False
+        try:
+            if self._conn is not None:
                 self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
             except Exception:
                 pass
-            self.end_tx()
+        self._tx_open = False
+        self._rollback_and_return()
 
     def rollback(self):
         if self._tx_open:
@@ -1573,13 +1704,17 @@ class PgConnection:
                 self._conn.rollback()
             except Exception:
                 pass
-            self.end_tx()
+            self._tx_open = False
+            self._keep = False
+        # return to pool in a clean autocommit state regardless
+        self._rollback_and_return()
 
     def close(self):
-        try:
-            self._ctx.__exit__(None, None, None)
-        finally:
-            self._ctx = None
+        # Permanent teardown: return any held physical connection to the pool.
+        self._tx_open = False
+        self._keep = False
+        if getattr(self, "_ctx", None) is not None:
+            self._release_held()
 
     # -- sqlite3 connect() kwargs we tolerate -------------------------------
     def create_function(self, *a, **k):
@@ -1615,6 +1750,14 @@ class PgConnection:
 
     @property
     def in_transaction(self):
+        # A connection we never borrowed holds no transaction. (A savepoint
+        # scope sets _tx_open without going through psycopg's Transaction, so
+        # report True in that case too — the caller must not treat it as a
+        # fresh transaction to start.)
+        if self._tx_open:
+            return True
+        if self._conn is None:
+            return False
         return bool(self._conn.info.transaction_status)
 
 

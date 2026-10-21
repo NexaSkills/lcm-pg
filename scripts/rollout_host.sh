@@ -110,6 +110,10 @@ echo "== 7. restart daemons =="
 systemctl --user restart \$(systemctl --user list-units --all --no-legend | grep -oE 'hermes-(gateway|webui|dashboard)[a-z0-9-]*\.service' | sort -u) 2>/dev/null
 sleep 6
 systemctl --user is-active lcm-pg.service
+echo "== 7b. auto-embed summaries (hybrid recall live; non-fatal) =="
+LCM_PG_DSN=$DSN LCM_PG_POOL_MIN=1 LCM_PG_POOL_MAX=2 $B/venv/bin/python \
+  ~/.hermes/forks/lcm-pg/scripts/embed_auto_backfill.py --limit 500 2>&1 | tail -5 \
+  || echo "  embed backfill non-fatal (run manually if recall looks FTS-only)"
 echo "INSTALL_DONE"
 EOSCRIPT
 }
