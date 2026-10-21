@@ -237,6 +237,48 @@ def _pg_default_to_sqlite(d: str) -> str:
 
 
 
+
+# >>> lcm-pg pragma-notnull patch >>>
+import os as _pn_os
+
+_CANON_DDL_CACHE: dict[str, dict[str, bool]] = {}
+
+
+def _canonical_declared_notnull(table: str) -> dict[str, bool]:
+    """attname -> column line declares NOT NULL, from db_bootstrap's own
+    canonical sqlite DDL (single source of truth for expected shapes)."""
+    cached = _CANON_DDL_CACHE.get(table)
+    if cached is not None:
+        return cached
+    out: dict[str, bool] = {}
+    try:
+        here = _pn_os.path.dirname(_pn_os.path.abspath(__file__))
+        src = open(_pn_os.path.join(here, "..", "db_bootstrap.py"),
+                   encoding="utf-8").read()
+        import re as _pn_re
+        m = _pn_re.search(
+            r"CREATE TABLE (?:IF NOT EXISTS )?" + _pn_re.escape(table) +
+            r"\s*\((.*?)\n\s*\)", src, _pn_re.S)
+        if m:
+            for line in m.group(1).splitlines():
+                line = line.strip().rstrip(",")
+                if not line or line.upper().startswith(
+                        ("PRIMARY KEY", "CHECK", "UNIQUE", "FOREIGN KEY",
+                         "CONSTRAINT")):
+                    continue
+                mm = _pn_re.match(r'(?:"?\w+"?|\w+)\s+\w+(\s+.*)?', line)
+                if not mm:
+                    continue
+                name = _pn_re.match(r'"?(\w+)"?', line).group(1)
+                out[name] = bool(
+                    line.upper().find(" NOT NULL") >= 0
+                    or line.upper().endswith("NOT NULL"))
+    except Exception:
+        out = {}
+    _CANON_DDL_CACHE[table] = out
+    return out
+# <<< lcm-pg pragma-notnull patch <<<
+
 def _sqlite_ddl_for(table: str, conn=None):
     """Reconstruct sqlite CREATE TABLE text from PG catalog rows.
 
@@ -332,7 +374,14 @@ def _sqlite_ddl_for(table: str, conn=None):
             # columns, breaking verify_temporal_rollup_schema's column-shape
             # check (lcm_rollup_state/sources) and failing plugin load.
             if notnull and not (autoincrement_pk and pkord == 1):
-                bits.append("NOT NULL")
+                # PK members: trust the canonical DDL declaration (PG's
+                # attnotnull fires for every PK member, declared or not).
+                # Non-PK columns: attnotnull IS the declaration.
+                if pkord:
+                    if _canonical_declared_notnull(table).get(name, False):
+                        bits.append("NOT NULL")
+                else:
+                    bits.append("NOT NULL")
             if dflt is not None:
                 d = str(dflt)
                 d = _pg_default_to_sqlite(d)
@@ -407,16 +456,20 @@ def _translate_sqlite_trigger(sql: str):
     m = re.match(
         r"(?is)\s*CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?"
         r"(\w+)\s+(AFTER|BEFORE)\s+(INSERT|UPDATE|DELETE)(?:\s+OF\s+([\w,\s]+))?"
-        r"\s+ON\s+(\w+)\s+BEGIN\s+(.*?)\s*END\s*;?\s*$",
+        r"\s+ON\s+(\w+)"
+        r"(?:\s+WHEN\s+((?:NOT\s+)?(?:EXISTS\s*\((?:[^()]|\([^()]*\))*\)|[^;()]+)))?"
+        r"\s+BEGIN\s+(.*?)\s*END\s*;?\s*$",
         sql)
     if not m:
         return None
-    name, when, event, of_cols, table, body = m.groups()
+    name, when, event, of_cols, table, trg_when, body = m.groups()
+    _when_cond = None
     stmts = [s.strip() for s in re.split(r";\s*(?=\S)", body) if s.strip()]
     translated = []
     for st in stmts:
         mr = re.match(r"(?is)^\s*SELECT\s+RAISE\s*\(\s*(ABORT|FAIL|IGNORE|ROLLBACK)"
-                      r"\s*,\s*'((?:[^']|'')*)'\s*\)(?:\s+WHERE\s+(.+?))?\s*$", st)
+                      r"\s*,\s*'((?:[^']|'')*)'\s*\)(?:\s+WHERE\s+(.+?))?\s*;?\s*$",
+                      st)
         if mr:
             _kind, msg, cond = mr.groups()
             cond = (cond or "TRUE").replace("new.", "NEW.").replace("old.", "OLD.")
@@ -438,14 +491,30 @@ def _translate_sqlite_trigger(sql: str):
         "; ".join(_rewrite_text(part).rstrip(";").strip()
                   for part in _split_statements(s))
         for s in translated)
+    if trg_when:
+        # fold WHEN NOT EXISTS(...) into the body (PG cannot put subqueries
+        # in a trigger's WHEN clause). _when_cond set in the guard block.
+        _wc = "(" + _rewrite_text(trg_when).rstrip(";").strip() + ")"
+        body_sql = ("IF " + _wc + " THEN\n                "
+                    + body_sql.replace("\n            ", "\n                ")
+                    + ";\n            END IF")
     # sentinel: authoritative event kind for the sqlite_master shim's trigger
     # reverse-translation (tgtype bits are unreliable across WHEN guards).
     body_sql = "/*lcm-event: " + event + "*/ " + body_sql
     guard = ""
+    conds = []
     if of_cols and event == "UPDATE":
         cols = [c.strip() for c in of_cols.split(",") if c.strip()]
-        conds = " OR ".join(f"OLD.{c} IS DISTINCT FROM NEW.{c}" for c in cols)
-        guard = "\n            WHEN (" + conds + ")"
+        conds.append("(" + " OR ".join(
+            f"OLD.{c} IS DISTINCT FROM NEW.{c}" for c in cols) + ")")
+    if trg_when:
+        w = _rewrite_text(trg_when.replace("NEW.", "NEW.").replace(
+            "new.", "NEW.")).rstrip(";").strip()
+        # PG forbids subqueries in trigger WHEN conditions: fold the guard
+        # INTO THE FUNCTION BODY instead (the IF there may subquery freely).
+        _when_cond = "(" + w + ")"
+    if conds:
+        guard = "\n            WHEN " + " AND ".join(conds)
     op = {"INSERT": "INSERT", "DELETE": "DELETE", "UPDATE": "UPDATE"}[event]
     ret = "OLD" if (when == "BEFORE" and event == "DELETE") else "NEW"
     return f"""
@@ -1099,7 +1168,28 @@ class _Cursor:
             script = _TEMP_CTAS_RE.sub("", script)
             if not script.strip():
                 return self
-        for stmt in _split_statements(script):
+        # Re-merge fragments of sqlite triggers cut by the naive ';' split:
+        # a CREATE TRIGGER whose text lacks 'END' is incomplete (body holds
+        # semicolons) — keep appending following fragments until END lands.
+        # (DOLLAR-quoted PG bodies need no help: the splitter respects them.)
+        frags = _split_statements(script)
+        stmts = []
+        k = 0
+        while k < len(frags):
+            f = frags[k]
+            if re.match(r"(?i)\s*CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\b", f) and \
+                    not re.search(r"(?is)\bEND\s*;?\s*$", f):
+                j = k + 1
+                while j < len(frags) and \
+                        not re.search(r"(?is)\bEND\s*;?\s*$", f):
+                    f = f + ";" + frags[j]
+                    j += 1
+                stmts.append(f)
+                k = j
+                continue
+            stmts.append(f)
+            k += 1
+        for stmt in stmts:
             stmt = stmt.strip()
             if not stmt:
                 continue

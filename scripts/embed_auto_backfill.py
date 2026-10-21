@@ -158,7 +158,19 @@ def _release_pools(pg_backend) -> None:
     pools = getattr(pg_backend, "_POOLS", None)
     if not pools:
         return
-    for pool in list(pools.values()):
+    # POP before close: closing in place leaves the cache entry pointing at a
+    # dead pool, and connect() happily reuses it -> every later getconn() on
+    # that (dsn,schema) waits forever (pool max=1). Pop-first is race-safe
+    # under _POOLS_LOCK and matches embed_warmup_all's proven hygiene.
+    live = []
+    lock = getattr(pg_backend, "_POOLS_LOCK", None)
+    import threading as _th
+    if lock is None:
+        lock = _th.Lock()
+    with lock:
+        for key in list(pools.keys()):
+            live.append(pools.pop(key, None))
+    for pool in [p for p in live if p is not None]:
         for closer in ("closeall", "close"):
             fn = getattr(pool, closer, None)
             if callable(fn):
