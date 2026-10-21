@@ -159,11 +159,45 @@ def main() -> int:
     # 'couldn't get a connection after 10.00 sec'). The shipped daemons
     # ensure these anyway; this path must not *depend* on that timing.
     import lcmpg.db_bootstrap as dbb
+    import psycopg as _psycopg
+    registered, todo = 0, []
+    # Steady-state fast path: an ACTIVE row for (model, provider, dim) means
+    # the schema is warm — skip without touching the provider (its import
+    # costs minutes; the probe below is only for genuine first-runs).
     for home, schema in schemas:
         try:
+            with _psycopg.connect(os.environ["LCM_PG_DSN"], autocommit=True,
+                                  connect_timeout=10) as raw:
+                raw.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+                n = raw.execute(
+                    "SELECT count(*) FROM information_schema.tables"
+                    " WHERE table_schema = %s AND table_name = 'lcm_embedding_profile'",
+                    (schema,)).fetchone()[0]
+                active = 0
+                if n:
+                    active = raw.execute(
+                        f'SELECT count(*) FROM "{schema}".lcm_embedding_profile'
+                        " WHERE active = 1 AND model_name = %s"
+                        " AND provider = %s AND dim = %s",
+                        (model, provider_id, dim)).fetchone()[0]
+                if active:
+                    registered += 1
+                    continue
+            todo.append((home, schema))
+        except Exception as exc:
+            print(f"  [{schema}] probe note: {str(exc)[:120]}")
+            todo.append((home, schema))
+    if not todo:
+        print(f"embed_warmup_all: all {registered} schemas already registered"
+              f" (model={model} dim={dim}) — nothing to do")
+        return 0
+    print(f"embed_warmup_all: model={model} provider={provider_id} dim={dim}"
+          f" registered={registered} to-register={len(todo)}")
+    for home, schema in todo:
+        try:
             # ensure via db_bootstrap through a PgConnection (executescript
-            # available), then DROP the pool from the module cache (closing a
-            # cached pool would poison its entry for the next connect()).
+            # available), then DROP the schema's pool from the module cache
+            # (closing a cached pool in place poisons its entry).
             conn = pg.connect(os.environ["LCM_PG_DSN"], schema)
             dbb.ensure_metadata_table(conn)
             dbb.ensure_embedding_tables(conn)
@@ -174,7 +208,7 @@ def main() -> int:
                 if key[1] == schema:
                     try: pg._POOLS.pop(key).close()
                     except Exception: pass
-    for home, schema in schemas:
+    for home, schema in todo:
         os.environ["HERMES_HOME"] = home
         if a.dry_run:
             print(f"  [{schema}] would register profile")
