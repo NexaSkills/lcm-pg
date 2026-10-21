@@ -29,6 +29,7 @@ Environment=LCM_PG_POOL_MIN=1
 Environment=LCM_PG_POOL_MAX=2
 Environment=LCM_FASTEMBED_CACHE_DIR=$B/fastembed
 Environment=LCM_VENV_PY=$B/venv/bin/python
+ExecStart=$B/venv/bin/python $FORK/scripts/ensure_profile_bootstrap.py
 ExecStart=$B/venv/bin/python $FORK/scripts/embed_auto_backfill.py --limit 400
 TimeoutStartSec=3600
 Nice=10
