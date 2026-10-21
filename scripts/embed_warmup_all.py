@@ -158,16 +158,22 @@ def main() -> int:
     # pass can wedge pool-waits under daemon pool floors (observed 2026-10-21
     # 'couldn't get a connection after 10.00 sec'). The shipped daemons
     # ensure these anyway; this path must not *depend* on that timing.
-    import psycopg as _psycopg
+    import lcmpg.db_bootstrap as dbb
     for home, schema in schemas:
         try:
-            import lcmpg.db_bootstrap as dbb
-            with _psycopg.connect(os.environ["LCM_PG_DSN"], autocommit=True,
-                                  connect_timeout=10) as raw:
-                dbb.ensure_metadata_table(raw)
-                dbb.ensure_embedding_tables(raw)
+            # ensure via db_bootstrap through a PgConnection (executescript
+            # available), then DROP the pool from the module cache (closing a
+            # cached pool would poison its entry for the next connect()).
+            conn = pg.connect(os.environ["LCM_PG_DSN"], schema)
+            dbb.ensure_metadata_table(conn)
+            dbb.ensure_embedding_tables(conn)
         except Exception as exc:
             print(f"  [{schema}] ensure-tables note: {str(exc)[:120]}")
+        finally:
+            for key in list(getattr(pg, "_POOLS", {})):
+                if key[1] == schema:
+                    try: pg._POOLS.pop(key).close()
+                    except Exception: pass
     for home, schema in schemas:
         os.environ["HERMES_HOME"] = home
         if a.dry_run:
