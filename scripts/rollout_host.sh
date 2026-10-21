@@ -111,11 +111,14 @@ systemctl --user restart \$(systemctl --user list-units --all --no-legend | grep
 sleep 6
 systemctl --user is-active lcm-pg.service
 echo "== 7a. schema parity (rowid shims: backfill maintenance SELECTs rowid on inflight; idempotent) =="
-bash \$B/forks/lcm-pg/scripts/schema_parity.sh 2>&1 | tail -3 || echo "  schema_parity non-fatal"
+bash ~/.hermes/forks/lcm-pg/scripts/schema_parity.sh 2>&1 | tail -3 || echo "  schema_parity non-fatal"
 echo "== 7b. auto-embed summaries (hybrid recall live; non-fatal) =="
 LCM_PG_DSN=$DSN LCM_PG_POOL_MIN=1 LCM_PG_POOL_MAX=2 $B/venv/bin/python \
   ~/.hermes/forks/lcm-pg/scripts/embed_auto_backfill.py --limit 500 2>&1 | tail -5 \
   || echo "  embed backfill non-fatal (run manually if recall looks FTS-only)"
+echo "== 7c. auto-embed timer (drift self-heal; non-fatal) =="
+bash ~/.hermes/forks/lcm-pg/scripts/embed_timer_install.sh 2>&1 | tail -2 \
+  || echo "  embed timer install non-fatal"
 echo "INSTALL_DONE"
 EOSCRIPT
 }
