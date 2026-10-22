@@ -49,13 +49,13 @@ DDL_STATEMENTS = (
     # DDL_STATEMENTS entry (install runs each entry as one execute()).
     # CHECK-fold helpers (schema-local): pure text surgery (position/substr/left, NO regex, NO backreferences, NO backslashes in any body).
     # _peel strips wrapping parens; _start finds the identifier start; _fold_any/_range/_eq canonicalize to IN/between.
-    """DROP FUNCTION IF EXISTS "{schema}"._lcm_checkfold(oid);
-DROP FUNCTION IF EXISTS "{schema}"._peel(text);
-DROP FUNCTION IF EXISTS "{schema}"._start(text,int);
-DROP FUNCTION IF EXISTS "{schema}"._fold_range(text);
-DROP FUNCTION IF EXISTS "{schema}"._fold_eq(text);
-DROP FUNCTION IF EXISTS "{schema}"._fold_any(text);
-DROP FUNCTION IF EXISTS "{schema}"._fold(text);
+    """DROP FUNCTION IF EXISTS "{schema}"._lcm_checkfold(oid) CASCADE;
+DROP FUNCTION IF EXISTS "{schema}"._peel(text) CASCADE;
+DROP FUNCTION IF EXISTS "{schema}"._start(text,int) CASCADE;
+DROP FUNCTION IF EXISTS "{schema}"._fold_range(text) CASCADE;
+DROP FUNCTION IF EXISTS "{schema}"._fold_eq(text) CASCADE;
+DROP FUNCTION IF EXISTS "{schema}"._fold_any(text) CASCADE;
+DROP FUNCTION IF EXISTS "{schema}"._fold(text) CASCADE;
 
 -- CHECK-fold as PURE plpgsql: position()/substr()/left() only.
 -- ZERO regex, ZERO backreferences, ZERO backslashes in the body.
