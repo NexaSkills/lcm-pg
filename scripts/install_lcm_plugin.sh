@@ -17,10 +17,16 @@ log() { printf '[install-plugin] %s\n' "$*"; }
 
 SRC="$LOCAL_REPO"
 [[ -z "$SRC" ]] && SRC="https://github.com/NexaSkills/lcm-pg.git"
-# dev fork stays a valid git source: prefer it when present (same repo), else origin
-for d in "$HERMES_ROOT/forks/lcm-pg"; do
-  [[ -d "$d/.git" ]] && { SRC="$d"; log "git source: $d"; break; }
-done
+# The deploy source is GitHub origin on EVERY host — including the dev host.
+# The dev fork is an authoring copy only: it must never become a deploy source,
+# otherwise a dev host would deploy unreviewed/unpushed fork commits that GitHub
+# (and therefore the rest of the fleet) has never seen, which is precisely the
+# per-host divergence this pipeline exists to prevent.
+if [[ -z "$LOCAL_REPO" && -d "$HERMES_ROOT/forks/lcm-pg/.git" ]]; then
+  log "git source: $SRC (local fork is authoring-only, not a deploy source)"
+else
+  log "git source: $SRC"
+fi
 
 targets=()
 [[ -d "$HERMES_ROOT/plugins" ]] && targets+=("$HERMES_ROOT/plugins/lcm-pg")
@@ -36,7 +42,12 @@ fetch_into() {
   # fetch a local source repo's heads into $1 as remote 'src', and publish
   # src/main so callers can resolve it by a stable name.
   local d="$1"
-  [[ -d "$d/.git" ]] || { git init -q "$d" 2>/dev/null || return 1; git -C "$d" remote add src "$SRC" 2>/dev/null || git -C "$d" remote set-url src "$SRC"; }
+  # 'origin' must name the canonical remote (GitHub), not a host-local path, so
+  # any later `git fetch origin` on this host resolves to the same source the
+  # fleet uses. A local --local bundle is still carried as 'src'.
+  git -C "$d" remote get-url origin >/dev/null 2>&1 \
+    || git -C "$d" remote add origin "$CANON_URL" 2>/dev/null || true
+  git -C "$d" remote add src "$SRC" 2>/dev/null || git -C "$d" remote set-url src "$SRC"
   git -C "$d" fetch -q src 'refs/heads/*:refs/remotes/src/*' 2>/dev/null || git -C "$d" fetch -q "$SRC" 2>/dev/null || return 1
   # if the fetched repo names its head something other than main (upstream
   # naming), expose the fetched FETCH_HEAD/main as src/main for stable resolve
@@ -46,8 +57,11 @@ fetch_into() {
   fi
   return 0
 }
+# Fetch from GitHub into the deployment clone itself; never stage through the
+# dev fork (that would let unpushed fork commits reach the plugin location).
+CANON_URL="https://github.com/NexaSkills/lcm-pg.git"
 FETCH_DIR=""
-for cand in "$HERMES_ROOT/forks/lcm-pg" "${targets[0]:-/dev/null}"; do
+for cand in "${targets[0]:-/dev/null}" "$HERMES_ROOT/plugins/lcm-pg"; do
   [[ "$cand" == /dev/null ]] && continue
   if [[ -z "$DRY" ]]; then fetch_into "$cand" && { FETCH_DIR="$cand"; break; }; else FETCH_DIR="$cand"; break; fi
 done
@@ -55,6 +69,20 @@ done
 REFFULL="$REF"; [[ -z "$REFFULL" ]] && REFFULL=$(git -C "$FETCH_DIR" rev-parse src/main 2>/dev/null || git -C "$FETCH_DIR" rev-parse FETCH_HEAD 2>/dev/null || echo "")
 [[ -z "$REFFULL" ]] && { log "FAIL: cannot resolve ref from $FETCH_DIR"; exit 1; }
 log "resolved ref: $REFFULL ($(git -C "$FETCH_DIR" log -1 --format='%s' "$REFFULL" 2>/dev/null | head -c 60))"
+
+# Provenance guard: the deployed plugin must trace back to the canonical remote.
+# A host whose clone only knows a host-local path would silently deploy code the
+# fleet never saw, so say so loudly instead of pretending the deploy is uniform.
+for t in "${targets[@]}"; do
+  [[ -d "$t/.git" ]] || continue
+  url="$(git -C "$t" remote get-url origin 2>/dev/null || true)"
+  case "$url" in
+    *github.com*NexaSkills/lcm-pg*) ;;
+    "") log "WARN: $t has no 'origin' remote; adding $CANON_URL so updates come from GitHub"
+        [[ -z "$DRY" ]] && git -C "$t" remote add origin "$CANON_URL" 2>/dev/null ;;
+    *)  log "WARN: $t 'origin' is '$url', not the canonical repo — deployment provenance diverges from GitHub" ;;
+  esac
+done
 
 # root plugins/lcm-pg becomes the real clone; profile plugin dirs become
 # symlinks to it (agent resolves profile HERMES_HOME/plugins; a symlink keeps

@@ -32,7 +32,9 @@ _POSTGRES = ("postgres", "postgresql", "pg")
 
 
 def is_postgres() -> bool:
-    return (os.environ.get("LCM_BACKEND") or "sqlite").strip().lower() in _POSTGRES
+    # Default is postgres (see factory.backend_for): an unset LCM_BACKEND must
+    # not silently select SQLite. SQLite requires an explicit declaration.
+    return factory.backend_for() == "postgres"
 
 
 class _CompatModule:

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import os
 
-from .factory import connect
+from .factory import connect, backend_for as factory_backend
 
 _INSTALLED = False
 
@@ -29,9 +29,5 @@ def install() -> None:
     global _INSTALLED
     if _INSTALLED:
         return
-    backend = (os.environ.get("LCM_BACKEND") or "sqlite").strip().lower()
-    if backend not in ("sqlite", "postgres"):
-        raise RuntimeError(
-            f"LCM_BACKEND={backend!r} is not a supported backend (sqlite|postgres)"
-        )
+    backend = factory_backend()  # validates and defaults to postgres
     _INSTALLED = True

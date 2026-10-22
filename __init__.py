@@ -36,7 +36,8 @@ def _bootstrap_pg_dependencies():
     pre-fix failure if the venv is absent.
     """
     try:
-        if (os.environ.get("LCM_BACKEND") or "sqlite").strip().lower() != "postgres":
+        from .backends import factory as _factory
+        if _factory.backend_for() != "postgres":
             return
         for dep in ("psycopg", "psycopg_pool"):
             try:

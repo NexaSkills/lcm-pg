@@ -57,7 +57,27 @@ def _existing_fts_tables(base) -> tuple:
 
 
 def backend_for() -> str:
-    return (os.environ.get("LCM_BACKEND") or "sqlite").strip().lower()
+    """Backend in force for this process.
+
+    Postgres is the DEFAULT: an unset LCM_BACKEND must never select SQLite,
+    because a host or profile missing that env var would otherwise silently run
+    the whole engine against SQLite while its operators believe the fleet is on
+    the Postgres solution — silent divergence, not a failure.
+
+    SQLite remains reachable only by explicit declaration: set
+    LCM_BACKEND=sqlite deliberately (upstream's SQLite-only test suite uses
+    this). Any other value is a mistake and is reported as one.
+    """
+    b = (os.environ.get("LCM_BACKEND") or "postgres").strip().lower()
+    if b in ("postgres", "postgresql", "pg"):
+        return "postgres"
+    if b == "sqlite":
+        return "sqlite"
+    raise RuntimeError(
+        f"LCM_BACKEND={b!r} is not supported; this solution runs on PostgreSQL "
+        "(use LCM_BACKEND=postgres; LCM_BACKEND=sqlite exists solely for "
+        "upstream's SQLite-only tests)"
+    )
 
 
 def _pg_dsn() -> str:
