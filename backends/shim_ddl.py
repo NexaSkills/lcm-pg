@@ -29,7 +29,8 @@ _SCHEMA_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 
 
 DDL_STATEMENTS = (
-    """CREATE TABLE IF NOT EXISTS "{schema}".sqlite_sequence (name text, seq bigint)""",
+    # sqlite_sequence is deliberately absent: nothing reads or writes it, and it
+    # existed only so SQLite-shaped probes found a table with SQLite's name.
     # default-expression mapper ------------------------------------------------
     """CREATE OR REPLACE FUNCTION "{schema}"._lcm_sqlite_default(expr text)
        RETURNS text LANGUAGE sql STABLE AS $df$

@@ -142,13 +142,17 @@ def native_table_info(conn, table: str) -> list[tuple]:
     for row in rows:
         attnum, name, pgtype, notnull, default = _vals(row)
         attnum = int(attnum)
+        # sqlite's cid counts from 0 while pg_attribute.attnum counts from 1;
+        # the first column must report cid 0 or every positional comparison a
+        # caller makes is shifted by one.
+        cid = attnum - 1
         auto = _is_autoincrement_pk(cur, oid, attnum)
         # SQLite's INTEGER PRIMARY KEY is the rowid alias and carries no NOT
         # NULL, whether or not a sequence feeds it; every other column keeps
         # the constraint the server actually enforces.
         implicit_notnull = auto or bool(pk_position.get(attnum))
         out.append((
-            attnum,
+            cid,
             str(name),
             _sqlite_type(str(pgtype)),
             0 if implicit_notnull else (1 if notnull else 0),

@@ -102,9 +102,10 @@ def _ensure_catalog_shims(cur, schema: str) -> None:
     """
     if not _SCHEMA_RE.match(schema):
         raise ValueError(schema)
-    cur.execute(f'''
-        CREATE TABLE IF NOT EXISTS "{schema}".sqlite_sequence (name text, seq bigint)
-    ''')
+    # sqlite_sequence is not provisioned any more. Nothing in the engine reads
+    # or writes it; it existed only so SQLite-shaped probes would find a table
+    # with SQLite's name. Sequences that actually matter are owned by the
+    # columns that use them (IDENTITY / serial), which Postgres maintains.
     from . import shim_ddl
     shim_ddl.install(cur, schema)
 

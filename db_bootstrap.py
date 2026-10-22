@@ -1371,6 +1371,13 @@ def _native_temporal_rollup_gaps(conn) -> list[str]:
         "lcm_rollup_invalidations": ("scope", "covered_start", "covered_end",
                                      "operation", "created_at"),
     }
+    # Columns whose value the database must supply from the clock. Without this
+    # the gate accepts created_at DEFAULT 0, i.e. a constant timestamp, which is
+    # how the shim's has_object_identity() rowid ended up as a constant without
+    # any check ever objecting.
+    epoch_default = {
+        "lcm_rollup_invalidations": ("created_at",),
+    }
     for table in tables:
         if f"table:{table}" in gaps:
             continue
@@ -1388,30 +1395,49 @@ def _native_temporal_rollup_gaps(conn) -> list[str]:
         expr = ("coalesce(_lcm_sqlite_default(" + _raw_expr + "), '')" if has_mapper
                 else "coalesce(" + _raw_expr + ", '')")
         rows = conn.execute(
-            "select a.attname, a.attnotnull, " + expr +
+            "select a.attname, a.attnotnull, " + expr + ", a.attidentity::text"
             " from pg_attribute a"
             " left join pg_attrdef d on d.adrelid=a.attrelid and d.adnum=a.attnum"
             " where a.attrelid = (current_schema() || '.' || ?)::regclass"
             "   and a.attnum > 0 and not a.attisdropped and a.attname <> 'rowid'",
             (table,),
         ).fetchall()
-        actual = {str(r[0]): (bool(r[1]), str(r[2])) for r in rows}
+        # attidentity is 'a' (generated always) or 'b' (by default). An identity
+        # column has no pg_attrdef row, so default text alone cannot show that
+        # the value is assigned: treat identity as satisfying a serial/column
+        # that the database populates, which is exactly what it is.
+        actual = {str(r[0]): (bool(r[1]), str(r[2]), str(r[3])) for r in rows}
         for col in sorted(set(serial.get(table, ())) | set(not_null.get(table, ()))
                           | set(defaults.get(table, {}))):
             if col not in actual:
                 gaps.append(f"column:{table}.{col}")
         for col in serial.get(table, ()):
-            if col in actual and not actual[col][1].startswith("nextval("):
-                gaps.append(f"column-shape:{table}.{col}")
+            if col not in actual:
+                continue
+            # A sequence-owned column: nextval default (serial) or an identity
+            # column. Either satisfies the contract.
+            if actual[col][1].startswith("nextval(") or actual[col][2] in ("a", "b"):
+                continue
+            gaps.append(f"column-shape:{table}.{col}")
         for col in not_null.get(table, ()):
             if col in actual and not actual[col][0]:
                 gaps.append(f"column-shape:{table}.{col}")
+        for col in epoch_default.get(table, ()):
+            if col not in actual:
+                continue
+            got = actual[col][1]
+            compact = got.lower().replace(" ", "")
+            if ("extract(epochfromnow())" in compact
+                    or "strftime('%s','now')" in compact
+                    or "current_timestamp" in compact):
+                continue
+            gaps.append(f"column-shape:{table}.{col}")
         for col, want in defaults.get(table, {}).items():
             if col not in actual:
                 continue
             got = actual[col][1]
-            if got.startswith("nextval("):
-                continue  # identity column; handled by the serial check
+            if got.startswith("nextval(") or actual[col][2] in ("a", "b"):
+                continue  # database-assigned value; handled by the serial check
             if has_mapper:
                 ok = (got == want) or (got.strip("'") == want.strip("'"))
             else:
