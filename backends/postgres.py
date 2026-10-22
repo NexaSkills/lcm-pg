@@ -447,17 +447,34 @@ def _translate_sqlite_trigger(sql: str):
     """Return PG trigger DDL (multi-statement) or None for unsupported shapes."""
     # sqlite "CREATE [VIRTUAL TABLE|TRIGGER] IF NOT EXISTS" — PG has no IF NOT
     # EXISTS on either, so pre-normalize: virtual tables become no-ops (the
-    # tsvector shim needs no shadow table), triggers keep the name.
-    if re.search(r"(?is)\bIF\s+NOT\s+EXISTS\b", sql):
-        if re.match(r"(?is)\s*CREATE\s+VIRTUAL\s+TABLE\b", sql):
-            return ["SELECT 1"]
-        sql = re.sub(r"(?is)\bCREATE\s+TRIGGER\s+IF\s+NOT\s+EXISTS\s+",
-                     "CREATE TRIGGER ", sql, count=1)
+    # tsvector shim needs no shadow table). Triggers: PG CREATE TRIGGER has no
+    # IF NOT EXISTS at all, so strip it unconditionally — the emitted script
+    # starts with DROP TRIGGER/FUNCTION IF EXISTS ... CASCADE, so reinstall is
+    # idempotent anyway. (Previously the strip sat INSIDE the IF-NOT-EXISTS
+    # probe and the regex still carried an optional IF-NOT-EXISTS group; any
+    # statement reaching here another way hit PG with raw sqlite text.)
+    if re.match(r"(?is)\s*CREATE\s+VIRTUAL\s+TABLE\b", sql):
+        return ["SELECT 1"]
+    # unanchored: executescript fragments can carry leading text before the
+    # CREATE keyword; count=1 keeps only the statement header.
+    sql = re.sub(r"(?is)CREATE\s+TRIGGER\s+IF\s+NOT\s+EXISTS\s+",
+                 "CREATE TRIGGER ", sql, count=1)
     m = re.match(
-        r"(?is)\s*CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+        r"(?is)\s*CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\s+"
         r"(\w+)\s+(AFTER|BEFORE)\s+(INSERT|UPDATE|DELETE)(?:\s+OF\s+([\w,\s]+))?"
         r"\s+ON\s+(\w+)"
-        r"(?:\s+WHEN\s+((?:NOT\s+)?(?:EXISTS\s*\((?:[^()]|\([^()]*\))*\)|[^;()]+)))?"
+        # sqlite trigger-level WHEN clauses cannot contain ';' — so the guard
+        # is everything up to the next semicolon that is not inside the
+        # guard itself (the \bBEGIN\b lookahead stops capture at the body
+        # keyword; the [^;] class stops it at body statements). The old
+        # alternation's "[^;()]+" arm couldn't cross parens and its
+        # balanced-paren arm only covered 2 nesting levels, so NOT
+        # EXISTS(...COALESCE(...)...) guards never captured: the optional
+        # group matched empty, \s+BEGIN swallowed the guard, and the match
+        # failed — PG got the raw sqlite DDL (assertion V4 bootstrap error).
+        # PG forbids subqueries in trigger WHEN, so the body-fold below puts
+        # the guard inside the plpgsql function instead.
+        r"(?:\s+WHEN\s+((?:(?!\bBEGIN\b)[^;])*))?"
         r"\s+BEGIN\s+(.*?)\s*END\s*;?\s*$",
         sql)
     if not m:
@@ -507,12 +524,8 @@ def _translate_sqlite_trigger(sql: str):
         cols = [c.strip() for c in of_cols.split(",") if c.strip()]
         conds.append("(" + " OR ".join(
             f"OLD.{c} IS DISTINCT FROM NEW.{c}" for c in cols) + ")")
-    if trg_when:
-        w = _rewrite_text(trg_when.replace("NEW.", "NEW.").replace(
-            "new.", "NEW.")).rstrip(";").strip()
-        # PG forbids subqueries in trigger WHEN conditions: fold the guard
-        # INTO THE FUNCTION BODY instead (the IF there may subquery freely).
-        _when_cond = "(" + w + ")"
+    # (the sqlite WHEN guard is folded into the function body above; PG
+    # forbids subqueries in a trigger-level WHEN, so nothing goes here.)
     if conds:
         guard = "\n            WHEN " + " AND ".join(conds)
     op = {"INSERT": "INSERT", "DELETE": "DELETE", "UPDATE": "UPDATE"}[event]
@@ -1177,11 +1190,16 @@ class _Cursor:
         k = 0
         while k < len(frags):
             f = frags[k]
-            if re.match(r"(?i)\s*CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\b", f) and \
-                    not re.search(r"(?is)\bEND\s*;?\s*$", f):
+            # A CREATE TRIGGER is incomplete until its terminator lands as a
+            # LINE ("END;"), not merely text ending "END": a WHEN guard like
+            # NOT EXISTS (... = NEW.source_timestamp) ends in a column named
+            # END, so the old \bEND\s*;?\s*$ test stopped the merge before the
+            # real body and PG got a body-less fragment (assertion V4 DDL).
+            if re.search(r"(?i)CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\b", f) and \
+                    not re.search(r"(?im)^\s*END\s*;?\s*$", f):
                 j = k + 1
                 while j < len(frags) and \
-                        not re.search(r"(?is)\bEND\s*;?\s*$", f):
+                        not re.search(r"(?im)^\s*END\s*;?\s*$", f):
                     f = f + ";" + frags[j]
                     j += 1
                 stmts.append(f)
