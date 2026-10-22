@@ -72,6 +72,17 @@ fi
 # hosts without GitHub: their origin remote is pre-configured (staging repo/bundle) — this script honours whatever origin says. Host-agnostic.
 
 fetch_ok=0
+# fetch the EXPLICIT ref: a plain `git fetch origin` leaves FETCH_HEAD at
+# origin/HEAD (repo default branch), which silently ignores --ref and can
+# deploy the wrong code while reporting success.
+git -C "$PLUGIN_DIR" fetch -q origin "$REF" 2>/dev/null && fetch_ok=1
+[[ $fetch_ok -eq 0 && "$REF" == origin/* ]] \
+  && git -C "$PLUGIN_DIR" fetch -q origin "${REF#origin/}" 2>/dev/null && fetch_ok=1
+if [[ $fetch_ok -eq 0 ]] && git -C "$PLUGIN_DIR" rev-parse -q --verify "$REF^{commit}" >/dev/null 2>&1; then
+  # already-present ref (fully-crafted remote ref or local object): FETCH_HEAD from a full fetch
+  git -C "$PLUGIN_DIR" fetch -q origin 2>/dev/null
+  git -C "$PLUGIN_DIR" rev-parse "$REF^{commit}" > "$(git -C "$PLUGIN_DIR" rev-parse --git-dir)/FETCH_HEAD" && fetch_ok=1
+fi
 if git -C "$PLUGIN_DIR" fetch -q origin 2>/dev/null; then fetch_ok=1; fi
 # fallback: --local may point at a git repo dir or a .bundle file
 if [[ $fetch_ok -eq 0 && -n "$LOCAL_REPO" && -e "$LOCAL_REPO" ]]; then
