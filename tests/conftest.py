@@ -47,3 +47,36 @@ if pkg_name not in sys.modules:
                 sub_spec.loader.exec_module(sub_mod)
             except Exception:
                 pass  # some modules may fail (e.g. engine needs agent)
+
+
+# --- PG test isolation -------------------------------------------------
+# In postgres mode every store handle lands in the profile's schema
+# (factory.connect -> schema_for_profile), so tests that derive session ids
+# from tmp_path (e.g. test_active_tool_stubbing's make_engine) leave rows
+# behind that contaminate the NEXT run: session ids repeat across runs while
+# the PG schema persists. Give every test its own schema via LCM_PG_SCHEMA,
+# keyed by tmp_path so all handles of one test share it. sqlite path is
+# untouched (LCM_PG_SCHEMA stays unset).
+import os as _os
+import hashlib as _hashlib
+
+if _os.environ.get("LCM_BACKEND", "sqlite").strip().lower() == "postgres":
+    import pytest as _pytest
+
+    @_pytest.fixture(autouse=True)
+    def _lcm_pg_test_isolation(tmp_path, monkeypatch):
+        tag = _hashlib.sha1(str(tmp_path).encode()).hexdigest()[:10]
+        name = f"lcm_t_{tag}"
+        monkeypatch.setenv("LCM_PG_SCHEMA", name)
+        yield
+        # drop the test schema (idempotent GC; connection is lazy so this is
+        # cheap and never creates a pool). Bounds schema sprawl.
+        try:
+            import importlib as _il
+            _factory = _il.import_module("hermes_lcm.backends.factory")
+            dsn = _factory._pg_dsn()
+            import psycopg as _psycopg
+            with _psycopg.connect(dsn) as _c:
+                _c.execute(f'DROP SCHEMA IF EXISTS "{name}" CASCADE')
+        except Exception:
+            pass
