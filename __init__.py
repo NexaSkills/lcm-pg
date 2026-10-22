@@ -644,7 +644,7 @@ def register(ctx):
                 )
                 active_engine.ingest(history)
             except Exception as exc:
-                logger.debug("LCM post_llm_call ingest error: %s", exc)
+                logger.warning("LCM post_llm_call ingest error: %s", exc)
 
         _mgr._hooks.setdefault("post_llm_call", []).append(_on_post_llm_call)
         logger.debug("LCM registered post_llm_call hook for per-turn ingest")
