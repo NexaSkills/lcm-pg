@@ -211,12 +211,23 @@ def s_verifier(schemas):
         ok = len(have.get(s, set())) == 2
         add("VERIFIER", f"rollup-checks:{s}", "PASS" if ok else "FAIL",
             "both CHECK constraints present in pg_constraint" if ok else f"present={sorted(have.get(s,set()))}")
-        # if constraints are present but code-path verifier still complains in journal => VERIFIER-BUG
+        # Constraints present yet the code path still complains => VERIFIER-BUG.
+        # Count since service start, not since midnight: before the native
+        # pg_catalog gate these complaints were emitted on every load, so a
+        # since-midnight count reports a fixed bug as if it were still firing.
         rc, out = sh(["journalctl", "--user", "--since", "today", "--no-pager"])
-        complaints = [ln for ln in out.splitlines() if "temporal rollup schema incomplete" in ln]
+        today_total = len([ln for ln in out.splitlines() if "temporal rollup schema incomplete" in ln])
+        rc_s, out_s = sh(["journalctl", "--user", "--since",
+                          subprocess.run(["systemctl", "--user", "show", "hermes-gateway.service",
+                                          "-p", "ActiveEnterTimestamp", "--value"],
+                                         capture_output=True, text=True).stdout.strip(),
+                          "--no-pager"])
+        complaints = [ln for ln in (out_s if rc_s == 0 else "").splitlines()
+                      if "temporal rollup schema incomplete" in ln]
         if ok and complaints:
             add("VERIFIER", f"verifier-bug:{s}", "VERIFIER-BUG",
-                f"DB correct but code path complains ({len(complaints)}x today) — synthetic sqlite_master DDL / default-text compare bug, see backends/postgres.py _sqlite_ddl_for")
+                f"DB correct but the code path still complains ({len(complaints)}x since "
+                f"service start, {today_total}x today) — DDL-synthesis/shape compare bug")
             break
 
 def s_ingest(schemas):
