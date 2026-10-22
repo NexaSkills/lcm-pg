@@ -412,4 +412,12 @@ def main():
     return 1 if fails else 0
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # os._exit, not sys.exit: under Python 3.14 the interpreter's finalization
+    # can raise PythonFinalizationError ("cannot join thread at interpreter
+    # shutdown") on the subprocess bookkeeping this script does after main()
+    # returns. Everything relevant is already flushed above (report written,
+    # summary printed); letting finalization fail would turn a clean exit code
+    # into a traceback after the verdict line.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(main())
