@@ -819,6 +819,48 @@ _TEMP_CTAS_RE = re.compile(
     r"(?i)\bCREATE\s+(?:GLOBAL\s+|LOCAL\s+)?TEMP(?:ORARY)?\s+TABLE\s+"
     r"(?:IF\s+NOT\s+EXISTS\s+)?(?!.*\bAS\b)", re.S)
 
+# Lead keyword of a translated-DDL string that _raw_exec may split and run
+# statement-by-statement (only DDL heads; never SELECT/INSERT/DML data paths,
+# whose multi-statement strings must stay single-command for atomicity).
+_SQL_DDL_HEAD_RE = re.compile(
+    r"(?is)^\s*(DROP|CREATE|ALTER|COMMENT)\b")
+
+# Split a top-level ';' separated SQL string WITHOUT cutting inside dollar-
+# quoted ($...$/$trg$) or single-quoted spans (the plpgsql trigger body). The
+# naive `re.split(";")` used by _split_statements cuts RAISE bodies and
+# $trg$ bodies at interior semicolons; this scan is delimiter-aware.
+def _split_toplevel_statements(sql):
+    out, buf, i, n = [], [], 0, len(sql)
+    dollar = None  # active $tag$ delimiter text
+    while i < n:
+        ch = sql[i]
+        if dollar:
+            if sql.startswith(dollar, i):
+                buf.append(dollar); i += len(dollar); dollar = None; continue
+            buf.append(ch); i += 1; continue
+        if ch == "'":
+            j = i + 1
+            while j < n:
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'":  # doubled '' escape
+                        j += 2; continue
+                    break
+                j += 1
+            buf.append(sql[i:j + 1]); i = j + 1; continue
+        if ch == "$":
+            m = re.match(r"\$\w*\$", sql[i:])
+            if m:
+                dollar = m.group(0); buf.append(dollar); i += len(dollar); continue
+            buf.append(ch); i += 1; continue
+        if ch == ";":
+            s = "".join(buf).strip()
+            if s: out.append(s)
+            buf = []; i += 1; continue
+        buf.append(ch); i += 1
+    s = "".join(buf).strip()
+    if s: out.append(s)
+    return out
+
 # Session-scoped (temp-schema) DDL that a read-only handle must still be allowed
 # to run. On SQLite a `mode=ro` connection freely creates/drops temp tables —
 # the temp schema is connection-local and never touches the persistent DB. The
@@ -1249,12 +1291,33 @@ class _Cursor:
         binding nothing, so '%%' -> '%' reaches the server. Without this,
         LIKE '%x%%' patterns baked into translated DDL break silently.
         A list/tuple is executed statement-by-statement.
+
+        Multi-statement STRING DDL (the trigger translator emits
+        DROP TRIGGER; DROP FUNCTION; CREATE FUNCTION $trg$...$trg$;
+        CREATE TRIGGER as ONE string) must be run statement-by-statement.
+        Under psycopg's pooled autocommit a single execute takes the
+        simple-query path and runs the whole string, but whenever the
+        connection is inside a transaction — bootstrap wrapped in BEGIN, or a
+        savepoint/txn scope — psycopg switches to the extended protocol, and
+        an extended-protocol multi-command string executes ONLY its first
+        statement: the CREATE FUNCTION lands and the trailing CREATE TRIGGER is
+        SILENTLY dropped (assertion V4: source_insert_guard present as a
+        _trg_ function but with no trigger, 5/6 not 6/6). Splitting on
+        top-level ';' (skipping semicolons inside dollar-quoted and single-
+        quoted spans) makes bootstrap deterministic on a real connection.
         """
         if isinstance(sql, (list, tuple)):
             last = None
             for s in sql:
                 last = self._raw.execute(s, ())
             return last
+        if isinstance(sql, str) and ";" in sql and _SQL_DDL_HEAD_RE.match(sql):
+            parts = _split_toplevel_statements(sql)
+            if len(parts) > 1:
+                last = None
+                for s in parts:
+                    last = self._raw.execute(s, ())
+                return last
         return self._raw.execute(sql, ())
 
     @staticmethod
