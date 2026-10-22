@@ -1041,6 +1041,174 @@ REQUIRED_TEMPORAL_ROLLUP_INDEXES = (
 )
 
 
+def _native_temporal_rollup_gaps(conn) -> list[str]:
+    """Native Postgres rollup-schema check — catalog facts only.
+
+    Used INSTEAD of verify_temporal_rollup_schema() when the backend is
+    postgres. That function is written for SQLite (sqlite_master DDL text,
+    PRAGMA table_info, column-level CHECK substring probes); under the PG
+    backend every answer it needs must first be reverse-translated out of the
+    catalog into synthetic SQLite text by backends/{postgres,shim_ddl}.py.
+    That translation is the single largest source of false 'schema incomplete'
+    verdicts: a CHECK clause that loses one paren in folding, or a default
+    rendered as ``EXTRACT(epoch FROM now())`` instead of ``strftime('%s','now')``,
+    makes the rebuilt DDL unparseable, PRAGMA silently falls back to raw
+    catalog rows, and BOTH 'check:<table>' and 'column-shape:<t>.<c>' fire on
+    databases that are fully correct. Because RollupStore raises on any gap
+    (and the same function gates derived-table rebuilds), a false negative
+    there blocks plugin load — and therefore message ingest — on healthy DBs.
+
+    Reading pg_class/pg_constraint/pg_attribute/pg_attrdef directly has no
+    lossy round-trip: it states the same contract (tables, columns, types,
+    nullability, defaults, CHECK coverage) in the database's own terms.
+    Returns a gap list shaped like verify_temporal_rollup_schema()'s.
+    """
+    schema = conn.execute("select current_schema()").fetchone()[0]
+    gaps: list[str] = []
+    tables = tuple(REQUIRED_TEMPORAL_ROLLUP_TABLES)
+    for name in tables:
+        row = conn.execute(
+            "select 1 from pg_class c join pg_namespace n on n.oid=c.relnamespace"
+            " where n.nspname=current_schema() and c.relname=? and c.relkind in ('r','p')",
+            (name,),
+        ).fetchone()
+        if row is None:
+            gaps.append(f"table:{name}")
+    for name in REQUIRED_TEMPORAL_ROLLUP_INDEXES:
+        row = conn.execute(
+            "select 1 from pg_class c join pg_namespace n on n.oid=c.relnamespace"
+            " where n.nspname=current_schema() and c.relname=? and c.relkind='i'",
+            (name,),
+        ).fetchone()
+        if row is None:
+            gaps.append(f"index:{name}")
+
+    # Column contract in PG terms. SQLite's `INTEGER PRIMARY KEY AUTOINCREMENT`
+    # rowid alias is a sequence-backed BIGINT here (identity, not a defect), so
+    # "serial" means: nextval default, regardless of integer width.
+    # Expected default per column, rendered the way SQLite's PRAGMA reports it.
+    # `_lcm_sqlite_default` is scalar text surgery on one pg_get_expr() string
+    # (epoch -> strftime, ::type casts stripped) — no DDL is synthesised, so
+    # this keeps the check native while matching the SQLite path's power.
+    defaults = {
+        "lcm_rollups": {"status": "'building'", "generation": "0", "lease_nonce": "''"},
+        "lcm_rollup_state": {"scope": "''"},
+    }
+    serial = {  # table -> columns that must be sequence-backed identity columns
+        "lcm_rollups": ("rollup_id",),
+        "lcm_rollup_invalidations": ("event_id",),
+    }
+    not_null = {  # columns SQLite declares NOT NULL (beyond PK members)
+        "lcm_rollups": ("period_kind", "period_start", "scope", "status",
+                        "generation", "lease_nonce"),
+        "lcm_rollup_sources": ("rollup_id", "node_id"),
+        "lcm_rollup_state": ("period_kind", "scope"),
+        "lcm_rollup_invalidations": ("scope", "covered_start", "covered_end",
+                                     "operation", "created_at"),
+    }
+    for table in tables:
+        if f"table:{table}" in gaps:
+            continue
+        # Prefer the shim's scalar default-renderer when this schema has it.
+        # Failing to use it must never hard-fail the check (plugin load).
+        try:
+            has_mapper = conn.execute(
+                "select 1 from pg_proc p join pg_namespace n on n.oid=p.pronamespace"
+                " where n.nspname=current_schema() and p.proname='_lcm_sqlite_default'"
+                "   and p.pronargs=1",
+            ).fetchone() is not None
+        except Exception:
+            has_mapper = False
+        _raw_expr = "pg_get_expr(d.adbin, d.adrelid)"
+        expr = ("coalesce(_lcm_sqlite_default(" + _raw_expr + "), '')" if has_mapper
+                else "coalesce(" + _raw_expr + ", '')")
+        rows = conn.execute(
+            "select a.attname, a.attnotnull, " + expr +
+            " from pg_attribute a"
+            " left join pg_attrdef d on d.adrelid=a.attrelid and d.adnum=a.attnum"
+            " where a.attrelid = (current_schema() || '.' || ?)::regclass"
+            "   and a.attnum > 0 and not a.attisdropped and a.attname <> 'rowid'",
+            (table,),
+        ).fetchall()
+        actual = {str(r[0]): (bool(r[1]), str(r[2])) for r in rows}
+        for col in sorted(set(serial.get(table, ())) | set(not_null.get(table, ()))
+                          | set(defaults.get(table, {}))):
+            if col not in actual:
+                gaps.append(f"column:{table}.{col}")
+        for col in serial.get(table, ()):
+            if col in actual and not actual[col][1].startswith("nextval("):
+                gaps.append(f"column-shape:{table}.{col}")
+        for col in not_null.get(table, ()):
+            if col in actual and not actual[col][0]:
+                gaps.append(f"column-shape:{table}.{col}")
+        for col, want in defaults.get(table, {}).items():
+            if col not in actual:
+                continue
+            got = actual[col][1]
+            if got.startswith("nextval("):
+                continue  # identity column; handled by the serial check
+            if has_mapper:
+                ok = (got == want) or (got.strip("'") == want.strip("'"))
+            else:
+                # Without the renderer PG prints e.g. `'building'::text`;
+                # compare loosely rather than skip, so power never regresses.
+                stripped = re.sub(r"::[a-z_ ]+$", "", got).strip()
+                ok = (stripped == want) or (stripped.strip("'") == want.strip("'"))
+            if not ok:
+                gaps.append(f"column-shape:{table}.{col}")
+        # CHECK coverage: which columns are constrained, not what text the
+        # constraint happens to print as (that comparison is what made the
+        # SQLite path brittle).
+        want = {"lcm_rollups": ("period_kind", "status"),
+                "lcm_rollup_invalidations": ("operation",)}.get(table, ())
+        if want:
+            rows = conn.execute(
+                "select distinct a.attname"
+                " from pg_constraint p"
+                " join pg_attribute a"
+                "   on a.attrelid = p.conrelid"
+                "  and a.attnum = any (p.conkey)"
+                " where p.conrelid = (current_schema() || '.' || ?)::regclass"
+                "   and p.contype = 'c'",
+                (table,),
+            ).fetchall()
+            covered = {str(r[0]) for r in rows}
+            for col in want:
+                if col not in covered:
+                    gaps.append(f"check:{table}")
+                    break
+    # The correctness-bearing uniqueness on lcm_rollups.
+    if "table:lcm_rollups" not in gaps:
+        row = conn.execute(
+            "select 1 from pg_index i join pg_class c on c.oid=i.indrelid"
+            " where c.oid = (current_schema() || '.lcm_rollups')::regclass"
+            "   and i.indisunique"
+            "   and (select array_agg(a.attname::text order by u.ord)"
+            "         from unnest(i.indkey::int[]) with ordinality as u(attnum, ord)"
+            "         join pg_attribute a on a.attrelid=c.oid and a.attnum=u.attnum)"
+            "       = array['period_kind','period_start','scope']",
+        ).fetchone()
+        if row is None:
+            gaps.append("unique:lcm_rollups.period_kind,period_start,scope")
+    return gaps
+
+
+def _is_postgres_conn(conn) -> bool:
+    """True when this connection is served by the Postgres backend.
+
+    Introspected from the live connection rather than LCM_BACKEND, because a
+    module-level env check would also catch ':memory:' scratch connections
+    (those stay real SQLite by design)."""
+    seen = set()
+    node = conn
+    while node is not None and id(node) not in seen:
+        seen.add(id(node))
+        if node.__class__.__module__.startswith("backends") or hasattr(node, "_pool"):
+            return True
+        node = getattr(node, "_base", None) or getattr(node, "_conn", None)
+    return False
+
+
 def verify_temporal_rollup_schema(conn: sqlite3.Connection) -> list[str]:
     """Return the temporal-rollup tables/indexes that are absent.
 
@@ -1052,6 +1220,15 @@ def verify_temporal_rollup_schema(conn: sqlite3.Connection) -> list[str]:
     ``"index:<name>"`` entries for every required object that is missing; an
     empty list means the schema is present and consistent.
     """
+    # On the Postgres backend, ask Postgres. The SQLite checks below depend on
+    # a full catalog->SQLite reverse translation (synthetic sqlite_master DDL,
+    # PRAGMA row shapes) whose lossy details — CHECK paren folding, epoch
+    # default text — have repeatedly reported healthy databases as incomplete,
+    # and a false gap here hard-fails plugin load (rollup_store) and gates
+    # derived-table rebuilds. The native check asserts the same contract from
+    # pg_catalog with no round-trip.
+    if _is_postgres_conn(conn):
+        return _native_temporal_rollup_gaps(conn)
     missing: list[str] = []
     for name in REQUIRED_TEMPORAL_ROLLUP_TABLES:
         row = conn.execute(
