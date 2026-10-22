@@ -77,11 +77,13 @@ fetch_ok=0
 # deploy the wrong code while reporting success. The ref-name fetch must
 # SUCCEED on its own — never fall back to the generic fetch.
 REFSPEC="$REF"
-[[ "$REFSPEC" == */* && "$REFSPEC" != refs/* ]] || REFSPEC=refs/heads/$REFSPEC
+[[ "$REFSPEC" == refs/* ]] || REFSPEC=refs/heads/${REF#origin/}
 git -C "$PLUGIN_DIR" fetch -q origin "$REFSPEC" 2>/dev/null && fetch_ok=1
 if [[ $fetch_ok -eq 0 ]] && git -C "$PLUGIN_DIR" rev-parse -q --verify "$REF^{commit}" >/dev/null 2>&1; then
-  # ref already present locally (bare branch name / local object): point FETCH_HEAD at it
-  git -C "$PLUGIN_DIR" rev-parse "$REF^{commit}" > "$(git -C "$PLUGIN_DIR" rev-parse --git-dir)/FETCH_HEAD" && fetch_ok=1
+  # ref already present locally (bare branch name / local object): FETCH_HEAD
+  # format wants '<sha>\t<why>' — a bare sha line parses as a bad ref name.
+  printf '%s\t\tlocal ref\n' "$(git -C "$PLUGIN_DIR" rev-parse "$REF^{commit}")" \
+    > "$(git -C "$PLUGIN_DIR" rev-parse --git-dir)/FETCH_HEAD" && fetch_ok=1
 fi
 if [[ $fetch_ok -eq 0 && "$REF" == "origin/HEAD" ]]; then
   git -C "$PLUGIN_DIR" fetch -q origin 2>/dev/null && fetch_ok=1
