@@ -73,8 +73,17 @@ if _os.environ.get("LCM_BACKEND", "sqlite").strip().lower() == "postgres":
         # cheap and never creates a pool). Bounds schema sprawl.
         try:
             import importlib as _il
+            _pg = _il.import_module("hermes_lcm.backends.postgres")
             _factory = _il.import_module("hermes_lcm.backends.factory")
             dsn = _factory._pg_dsn()
+            # Close every pool bound to this test's schema FIRST: without this
+            # each test's min_size=1 backend lingers for the whole session
+            # (~90 tests -> saturates max_connections=100).
+            for k in [k for k in list(_pg._POOLS) if k[1] == name]:
+                try:
+                    _pg._POOLS.pop(k).close()
+                except Exception:
+                    _pg._POOLS.pop(k, None)
             import psycopg as _psycopg
             with _psycopg.connect(dsn) as _c:
                 _c.execute(f'DROP SCHEMA IF EXISTS "{name}" CASCADE')

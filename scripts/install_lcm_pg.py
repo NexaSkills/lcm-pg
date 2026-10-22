@@ -163,7 +163,7 @@ def main():
     if interp and os.path.isfile(runner):
         env = dict(os.environ,
                    LCM_BACKEND="postgres", LCM_PG_DSN=NEW_DSN,
-                   LCM_PG_POOL_MIN="1", LCM_PG_POOL_MAX="2")
+                   LCM_PG_POOL_MIN="1", LCM_PG_POOL_MAX="1")
         # runner defaults to apply + summary corpus; --limit bounds per-schema work
         r = subprocess.run([interp, runner, "--limit", "500"], env=env,
                            capture_output=True, text=True)

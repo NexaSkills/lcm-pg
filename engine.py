@@ -6710,3 +6710,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._assertions.close()
         if self._query_views is not None:
             self._query_views.close()
+        # Postgres pools are intentionally NOT closed here: store close()
+        # paths run final statements (sqlite-parity wal_checkpoint) and a
+        # profile rebind may re-create an engine in-process. Pool churn is
+        # bounded by backends.postgres (one pool per dsn; superseded pools
+        # retired on next connect) and closed at process exit via atexit.

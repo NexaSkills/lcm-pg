@@ -1973,22 +1973,64 @@ def connect(dsn: str, schema: str, *,
     reuse across threads — always lands inside its own profile schema.
     """
     key = (dsn, schema, lock_timeout_ms)
+    # Lifecycle churn must never abandon an old pool's backends. Engine
+    # lifecycles allocate a FRESH tmp lcm.db path, so the schema differs every
+    # time (the (dsn, schema) key never collides) and an equal-guard re-churn
+    # (same lock_timeout default) leaks by key-match, not key-mismatch. So:
+    # retire ANY other pool over this dsn whose guard params differ, and
+    # EXACTLY the previous same-schema pool when params match (the new engine
+    # supersedes the old one's handle). query_only probes share the schema's
+    # rw pool via the same key and are untouched by the equal-key swap below
+    # (it pops the old key, the new pool inherits its backends' schema pin).
+    if not query_only:
+        # Engine-lifecycle churn: one pool per dsn at a time. The latest rw
+        # connect() supersedes ALL other pools over this dsn (their schemas'
+        # backends were abandoned by whichever engine opened them; the cache
+        # alone was leaking +2 server conns per lifecycle). Closing older pools
+        # is safe for sqlite parity: each store handle returns its borrow on
+        # every statement, so no backend is pinned by an idle handle.
+        _stale: dict = {k: _POOLS[k] for k in _POOLS if k[0] == dsn and k != key}
+    else:
+        _stale = {}
+    # Best practice (psycopg docs / multi-tenant pooling guidance): durable
+    # session settings (search_path, lock_timeout) belong at connection
+    # ESTABLISHMENT (libpq `options`), not on every borrow. Per-borrow `SET`
+    # leaves a server-side state marker on the pooled backend that makes
+    # psycopg's check_connection discard-and-replace connections under
+    # churn (measured: +2 physical conns per pool), i.e. the pin-per-borrow
+    # design IS the connection leak. Borrow-level pinning remains only as a
+    # defence on the getconn patch below (covers raw pool.getconn callers).
+    import urllib.parse as _up
+    opts = f"-c search_path={schema},public -c lock_timeout={int(lock_timeout_ms)}"
+    base = dict(psycopg.conninfo.conninfo_to_dict(dsn))
+    prev = (base.get("options") or "").strip()
+    base["options"] = (prev + " " + opts).strip()
     with _POOLS_LOCK:
         pool = _POOLS.get(key)
         if pool is None:
             pool = ConnectionPool(
-                conninfo=dsn,
-                kwargs={"autocommit": True},
+                conninfo="",
+                kwargs={**base, "autocommit": True},
                 min_size=min_size,
                 max_size=max_size,
                 check=ConnectionPool.check_connection,
                 name=f"lcm-pg-{schema}",
                 timeout=10,
+                # psycopg >=3.2: conn.close() on a pooled handle RETURNS it to
+                # the pool instead of killing the backend, so sqlite-parity
+                # code that closes-then-lazily-reopens a handle never drains
+                # the pool (PoolTimeout class).
+                close_returns=True,
             )
             pool.wait(timeout=10)
-            # pin search_path + statement guards on every new physical connection
-            pool.configure = None  # explicit instead:
+            _stale = {k: _POOLS.pop(k) for k in list(_stale) if k in _POOLS and k != key}
             _POOLS[key] = pool
+            _arm_atexit()
+        for _p in _stale.values():
+            try:
+                _p.close()
+            except Exception:
+                pass
     # ensure schema exists (deterministic zero-provisioning for new profiles).
     # A read-only handle must NEVER provision anything: sqlite's mode=ro on a
     # missing database fails closed, and a retired/moved lcm.db must not be
@@ -2049,3 +2091,28 @@ def _patch_pool_checkout(pool: ConnectionPool, schema: str, lock_timeout_ms: int
 
 _POOLS: dict[tuple, ConnectionPool] = {}
 _POOLS_LOCK = threading.Lock()
+_ATEXIT_ARMED = False
+
+
+def shutdown_all_pools():
+    """Close every pool this process opened (psycopg guidance: pools must be
+    closed at owner lifetime end, or their idle backends linger until the
+    postmaster notices). Safe to call repeatedly; idempotent under lock."""
+    global _ATEXIT_ARMED
+    _ATEXIT_ARMED = False
+    with _POOLS_LOCK:
+        items = list(_POOLS.items())
+        _POOLS.clear()
+    for k, p in items:
+        try:
+            p.close()
+        except Exception:
+            pass
+
+
+def _arm_atexit():
+    global _ATEXIT_ARMED
+    if not _ATEXIT_ARMED:
+        _ATEXIT_ARMED = True
+        import atexit
+        atexit.register(shutdown_all_pools)
