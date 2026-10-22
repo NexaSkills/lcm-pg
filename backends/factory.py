@@ -137,6 +137,14 @@ def connect(db_path: Any, *, mode: str = "rw", **sqlite_kwargs: Any):
             base = pg_connect(_pg_dsn(), schema)
             fts_pg.ensure_helper(base)
         conn = FtsConnection(base)
+        # Durability is configured where the handle is created so every store
+        # gets it without each one having to opt in; the upstream
+        # configure_connection() call sites only carry SQLite pragmas.
+        try:
+            from .. import db_bootstrap
+            db_bootstrap.configure_postgres_connection(conn)
+        except Exception:
+            pass
         if mode == "ro":
             set_spec(conn, _existing_fts_tables(base))
         else:

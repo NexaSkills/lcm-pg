@@ -144,6 +144,40 @@ def configure_connection(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA mmap_size=0")
 
 
+def configure_postgres_connection(conn) -> None:
+    """Configure a native PostgreSQL connection for durable commits.
+
+    The SQLite path needs a WAL/journal ritual because several processes open
+    one file and SQLite's rollback journal serialises them; PostgreSQL does not
+    have that problem, so this sets the one equivalent knob and leaves the rest
+    to the server.
+
+    - ``synchronous_commit = on`` is the direct counterpart of SQLite's
+      ``synchronous = FULL``: the commit waits for the write-ahead log to reach
+      stable storage, so a power loss cannot lose an acknowledged transaction.
+      A Postgres crash is recovered from the WAL, so there is no analogue of
+      SQLite's WAL-index durability caveat.
+    - ``lock_timeout`` bounds a statement that is waiting on another session
+      instead of blocking indefinitely, standing in for SQLite's busy timeout.
+      It is deliberately far larger because Postgres reports contention as a
+      clean error rather than an in-process retry.
+    - ``isolation_level`` is left at the server default; ``read_committed`` is
+      what the engine's read-modify-write paths assume.
+
+    ``lock_timeout`` is not set when the server already carries a value, so a
+    value provisioned by the cluster bootstrap stays authoritative.
+    """
+    conn.execute("SET synchronous_commit = on")
+    try:
+        current = conn.execute("show lock_timeout").fetchone()[0]
+        if str(current).strip() in ("", "0", "0ms", "0s"):
+            conn.execute("SET lock_timeout = '15s'")
+    except Exception:
+        # Not every handle accepts SET (a read-only or pooled handle may
+        # reject it); durability above is the part that must hold.
+        pass
+
+
 def _execute_wal_conversion_with_lock_retry(
     conn: sqlite3.Connection,
     *,
