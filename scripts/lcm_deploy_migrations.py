@@ -73,6 +73,21 @@ def _run(mig, schema, dry):
         return False, f"missing {script}"
     env = dict(os.environ, LCM_PG_SCHEMAS=schema)
     if kind == "sql":
+        # psql reads no LCM_PG_DSN: point it at the same cluster via libpq env.
+        # Without this it defaults to /run/postgresql and dies with
+        # 'role "<osuser>" does not exist' while psycopg steps succeed.
+        try:
+            from psycopg.conninfo import conninfo_to_dict
+            kv = {k: v for k, v in conninfo_to_dict(_dsn()).items() if v}
+        except Exception:
+            kv = {}
+        for k in ("host", "port", "dbname", "user"):
+            if kv.get(k):
+                env[k.upper()] = str(kv[k])
+        env.setdefault("PGHOST", str(Path.home() / "lcm-pg/run"))
+        env.setdefault("PGPORT", "54329")
+        env.setdefault("PGUSER", "lcm01")
+        env.setdefault("PGDATABASE", "lcm")
         cmd = ["psql", "-v", "ON_ERROR_STOP=1", "-q", "-f", str(path)]
     elif kind == "py":
         cmd = [_py(), str(path)]
