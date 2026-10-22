@@ -207,6 +207,38 @@ def _execute_wal_conversion_with_lock_retry(
         delay_seconds = min(delay_seconds * 2, 0.25)
 
 
+# ALTER TABLE [schema.]table ADD [COLUMN] <rest>
+_ADD_COLUMN_WORD_RE = re.compile(r"(?i)\bADD\b(\s+COLUMN\b)?")
+
+
+def _alter_add_column_if_not_exists(alter_sql: str) -> str:
+    """Rewrite ``ALTER TABLE t ADD [COLUMN] c ...`` to the IF NOT EXISTS form.
+
+    Postgres supports ``ADD COLUMN [IF NOT EXISTS]`` since 9.6, which makes the
+    concurrent-startup race this helper exists for a property of the statement
+    rather than of error handling. Only ALTER TABLE statements are touched.
+    """
+    if not re.match(r"(?is)^\s*ALTER\s+TABLE\b", alter_sql):
+        return alter_sql
+    m = _ADD_COLUMN_WORD_RE.search(alter_sql)
+    if not m:
+        return alter_sql
+    rest = alter_sql[m.end():]
+    if re.search(r"(?i)\bIF\s+NOT\s+EXISTS\b", rest[:40]):
+        return alter_sql
+    return alter_sql[:m.end()] + " IF NOT EXISTS" + rest
+
+
+def _is_duplicate_column_error(exc: BaseException, *, backend: str) -> bool:
+    """True when `exc` is the server saying the column already exists."""
+    if backend == "postgres":
+        # 42701 duplicate_column; 42P16 also surfaces on some ADD COLUMN forms.
+        code = str(getattr(getattr(exc, "pgcode", None), "sqlstate", "") or
+                   getattr(exc, "pgcode", "") or "")
+        return code in ("42701",)
+    return "duplicate column name" in str(exc).lower()
+
+
 def add_column_if_missing(
     conn: sqlite3.Connection,
     existing_columns: set[str],
@@ -227,6 +259,17 @@ def add_column_if_missing(
     """
     if column in existing_columns:
         return
+    if _is_postgres_conn(conn):
+        # Postgres expresses the same race guard declaratively, so the outcome
+        # never depends on matching the wording of an error message. Tested per
+        # connection because a process can hold both kinds of handle.
+        try:
+            conn.execute(_alter_add_column_if_not_exists(alter_sql))
+            return
+        except Exception as exc:
+            if not _is_duplicate_column_error(exc, backend="postgres"):
+                raise
+            return
     try:
         conn.execute(alter_sql)
     except sqlite3.OperationalError as exc:
@@ -762,6 +805,158 @@ def ensure_message_origin_columns(conn: sqlite3.Connection) -> None:
     )
 
 
+def _pg_index_definition(conn, name: str) -> str | None:
+    """Index definition from pg_indexes, or None when absent.
+
+    sqlite_master must not be used for this on Postgres: it lists only
+    explicitly-created indexes, so an index that already exists as the backing
+    object of a UNIQUE or CHECK constraint reads back as missing and a plain
+    CREATE INDEX then fails with DuplicateTable.
+    """
+    rows = conn.execute(
+        "select indexdef from pg_indexes"
+        " where schemaname = current_schema() and indexname = %s",
+        (name,),
+    ).fetchall()
+    if not rows:
+        return None
+    row = rows[0]
+    return str(tuple(row.values())[0] if isinstance(row, dict) else row[0])
+
+
+def ensure_index_statement(conn, name: str, create_sql: str) -> None:
+    """Idempotent index creation on the native Postgres path.
+
+    Keeps the upstream contract: an index that exists with the same definition
+    is left alone, and a stale definition is replaced (CASCADE, because
+    constraints and their dependent objects can sit on it). When the name is
+    already taken by an equivalent index -- typically a UNIQUE constraint's
+    backing index -- the statement is skipped instead of failing.
+    """
+    existing = _pg_index_definition(conn, name)
+    if existing is None:
+        conn.execute(create_sql)
+        return
+    if _index_def_equivalent(existing, create_sql):
+        return
+    conn.execute(f"DROP INDEX IF EXISTS {name} CASCADE")
+    conn.execute(create_sql)
+
+
+def _index_def_equivalent(existing_def: str, create_sql: str) -> bool:
+    """True when both statements describe the same index.
+
+    Compares the normalised ON/WHERE shape and treats an unnamed
+    UNIQUE-constraint backing index as equivalent to an explicit UNIQUE index
+    over the same columns, which is exactly the case sqlite_master hides.
+    """
+    def norm(text: str) -> str:
+        t = str(text or "").lower().replace('"', "")
+        t = re.sub(r"\s+", " ", t).strip().rstrip(";")
+        t = re.sub(r"^create\s+(unique\s+)?(index\s+)(if\s+not\s+exists\s+)?",
+                   "create \1index ", t)
+        t = re.sub(r"^create\s+unique\s+index\s+[\w.]+\s+", "create unique index ", t)
+        t = re.sub(r"^create\s+index\s+[\w.]+\s+", "create index ", t)
+        return t
+
+    a, b = norm(existing_def), norm(create_sql)
+    if a == b:
+        return True
+    # same columns + same predicate is the substantive test
+    def shape(text: str) -> tuple:
+        on = re.search(r"\bon\s+(.+?)(\s+where\s+.*)?$", text)
+        where = re.search(r"\bwhere\s+(.+)$", text)
+        return (on.group(1).strip() if on else "",
+                where.group(1).strip() if where else "")
+    return shape(a) == shape(b)
+
+
+def _ensure_temporal_rollup_tables_pg(conn) -> None:
+    """Native Postgres DDL for the temporal-rollup tables.
+
+    Same contract as the SQLite statements in
+    :func:`ensure_temporal_rollup_tables`, expressed in Postgres so nothing has
+    to be translated at runtime:
+
+    - ``INTEGER PRIMARY KEY AUTOINCREMENT`` -> ``bigint GENERATED ALWAYS AS
+      IDENTITY``. SQLite's rowid alias is implicit-NULL and sequence-fed, and
+      Postgres records an identity column as NOT NULL by definition; both
+      assign the value implicitly and reject an explicit NULL, so a caller
+      inserting without the column sees the same behaviour. Identity (rather
+      than ``nextval`` on a serial) states the dependency on the column, which
+      is why the retired shim could not express it.
+    - ``(strftime('%s','now'))`` -> ``EXTRACT(epoch FROM now())``, the same
+      ``double precision`` epoch seconds the columns already hold.
+    - ``CREATE TRIGGER``/``INDEX``/``TABLE`` all carry ``IF NOT EXISTS``: this
+      runs concurrently from several processes at startup and must stay
+      idempotent. Postgres has accepted ``IF NOT EXISTS`` on triggers natively
+      since 9.5, so the guard needs no support object or error handling.
+    - ``MIN(a,b)``/``MAX(a,b)`` -> ``LEAST``/``GREATEST`` (the SQLite two-argument
+      aggregate form is an aggregate in Postgres and is not valid in UPDATE).
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lcm_rollups (
+            rollup_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            period_kind text NOT NULL CHECK (period_kind IN ('day', 'week', 'month')),
+            period_start text NOT NULL,
+            scope text NOT NULL,
+            summary text,
+            token_count integer,
+            status text NOT NULL DEFAULT 'building'
+                CHECK (status IN ('building', 'ready', 'stale', 'failed')),
+            built_at text,
+            source_fingerprint text,
+            error text,
+            generation integer NOT NULL DEFAULT 0,
+            lease_expires_at text,
+            lease_nonce text NOT NULL DEFAULT '',
+            failed_at text,
+            UNIQUE (period_kind, period_start, scope)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lcm_rollup_sources (
+            rollup_id bigint NOT NULL,
+            node_id bigint NOT NULL,
+            PRIMARY KEY (rollup_id, node_id)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_lcm_rollup_sources_node "
+        "ON lcm_rollup_sources (node_id)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lcm_rollup_invalidations (
+            event_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            node_id bigint,
+            scope text NOT NULL,
+            covered_start double precision NOT NULL,
+            covered_end double precision NOT NULL,
+            next_day text,
+            operation text NOT NULL CHECK (operation IN ('insert', 'delete', 'update')),
+            created_at double precision NOT NULL DEFAULT EXTRACT(epoch FROM now())
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_lcm_rollup_invalidations_pending "
+        "ON lcm_rollup_invalidations (event_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_lcm_rollup_invalidations_scope_event "
+        "ON lcm_rollup_invalidations (scope, event_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_lcm_rollup_invalidations_scope_coverage "
+        "ON lcm_rollup_invalidations (scope, covered_start, covered_end, event_id)"
+    )
+
+
 def ensure_temporal_rollup_tables(conn: sqlite3.Connection) -> None:
     """Lazily create the opt-in temporal-rollup feature tables.
 
@@ -776,10 +971,18 @@ def ensure_temporal_rollup_tables(conn: sqlite3.Connection) -> None:
     invalidation; ``lease_expires_at`` bounds a ``building`` row so a crashed
     build can be reclaimed. See :mod:`hermes_lcm.rollup_store`.
     """
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS lcm_rollups (
-            rollup_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    if _is_postgres_conn(conn):
+        # Native path: statements go to the server as written, with no DDL
+        # synthesis, PRAGMA emulation or in-process SQLite. The column-backfill
+        # checks and the coverage-interval reorder below stay on the shared code
+        # path and switch on the same predicate, so this function has exactly
+        # one statement set per backend.
+        _ensure_temporal_rollup_tables_pg(conn)
+    else:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS lcm_rollups (
+                rollup_id INTEGER PRIMARY KEY AUTOINCREMENT,
             period_kind TEXT NOT NULL CHECK (period_kind IN ('day', 'week', 'month')),
             period_start TEXT NOT NULL,
             scope TEXT NOT NULL,
@@ -831,9 +1034,15 @@ def ensure_temporal_rollup_tables(conn: sqlite3.Connection) -> None:
     )
     # Backfill the generation/lease columns for a table created by an earlier
     # lazy revision that predates optimistic concurrency.
-    rollup_columns = {
-        row[1] for row in conn.execute("PRAGMA table_info(lcm_rollups)").fetchall()
-    }
+    if _is_postgres_conn(conn):
+        # Backfill check reads the live catalog (see native_introspect) rather
+        # than a reconstructed sqlite_master/PRAGMA view.
+        from .native_introspect import native_column_names
+        rollup_columns = native_column_names(conn, "lcm_rollups")
+    else:
+        rollup_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(lcm_rollups)").fetchall()
+        }
     add_column_if_missing(
         conn, rollup_columns, "generation",
         "ALTER TABLE lcm_rollups ADD COLUMN generation INTEGER NOT NULL DEFAULT 0",
@@ -859,28 +1068,50 @@ def ensure_temporal_rollup_tables(conn: sqlite3.Connection) -> None:
     ):
         add_column_if_missing(conn, rollup_columns, column, ddl)
 
-    invalidation_columns = {
-        row[1]
-        for row in conn.execute(
-            "PRAGMA table_info(lcm_rollup_invalidations)"
-        ).fetchall()
-    }
+    if _is_postgres_conn(conn):
+        from .native_introspect import native_column_names
+        invalidation_columns = native_column_names(conn, "lcm_rollup_invalidations")
+    else:
+        invalidation_columns = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(lcm_rollup_invalidations)"
+            ).fetchall()
+        }
     add_column_if_missing(
         conn,
         invalidation_columns,
         "next_day",
         "ALTER TABLE lcm_rollup_invalidations ADD COLUMN next_day TEXT",
     )
-    conn.execute(
-        """
-        UPDATE lcm_rollup_invalidations
-        SET covered_start = MIN(covered_start, covered_end),
-            covered_end = MAX(covered_start, covered_end)
-        WHERE covered_start > covered_end
-        """
-    )
+    if _is_postgres_conn(conn):
+        # LEAST/GREATEST are Postgres' two-argument scalar equivalents of the
+        # SQLite min/max forms (the two-argument aggregate syntax is not valid
+        # in an UPDATE here). Both right-hand sides see the pre-update row, so
+        # the pair is reordered in one pass and the invariant
+        # covered_start <= covered_end holds without an intermediate state.
+        conn.execute(
+            """
+            UPDATE lcm_rollup_invalidations
+            SET covered_start = LEAST(covered_start, covered_end),
+                covered_end   = GREATEST(covered_start, covered_end)
+            WHERE covered_start > covered_end
+            """
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE lcm_rollup_invalidations
+            SET covered_start = MIN(covered_start, covered_end),
+                covered_end = MAX(covered_start, covered_end)
+            WHERE covered_start > covered_end
+            """
+        )
 
     def ensure_index(name: str, create_sql: str) -> None:
+        if _is_postgres_conn(conn):
+            ensure_index_statement(conn, name, create_sql)
+            return
         existing = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
             (name,),
