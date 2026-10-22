@@ -20,6 +20,20 @@ from typing import Any
 _FTS_SPECS = (
     ("messages_fts", "messages", "content"),
     ("summary_nodes_fts", "summary_nodes", "summary"),
+    # dag.SummaryDAG.search (the primary summary-node FTS path feeding
+    # lcm_expand_query / lcm_recall) queries `FROM nodes_fts fts JOIN
+    # summary_nodes n ON n.node_id = fts.rowid ... WHERE nodes_fts MATCH ?`.
+    # nodes_fts is a SQLite external-content FTS5 table over summary_nodes
+    # (dag.build_nodes_fts_spec) but was missing here, so on the PG backend the
+    # rewrite never fired: `rank` (an FTS5 hidden column) leaked into the SQL
+    # verbatim and PG raised `column "rank" does not exist`. Registering the
+    # spec installs summary.summary_summary_tsv + its own triggers/docsize
+    # (ensure_fts names every object after (table,column), so these never
+    # collide with the summary_nodes_* pair above) and lets _rewrite_ts rewrite
+    # the query. This schema already carries summary_nodes_message_link/
+    # summary_children (see fix_summary_nodes_content_tsv.sql), confirming
+    # nodes_fts was always meant to be one of these specs.
+    ("nodes_fts", "summary_nodes", "summary"),
 )
 
 

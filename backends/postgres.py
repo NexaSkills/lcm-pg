@@ -819,6 +819,24 @@ _TEMP_CTAS_RE = re.compile(
     r"(?i)\bCREATE\s+(?:GLOBAL\s+|LOCAL\s+)?TEMP(?:ORARY)?\s+TABLE\s+"
     r"(?:IF\s+NOT\s+EXISTS\s+)?(?!.*\bAS\b)", re.S)
 
+# Session-scoped (temp-schema) DDL that a read-only handle must still be allowed
+# to run. On SQLite a `mode=ro` connection freely creates/drops temp tables —
+# the temp schema is connection-local and never touches the persistent DB. The
+# KNN two-stage helper (vector_store._two_stage_knn) opens an ro handle and
+# issues a bare `CREATE TEMP TABLE <name>(id TEXT PRIMARY KEY)` (no AS clause,
+# so _TEMP_CTAS_RE above deliberately leaves it alone — PG supports native temp
+# tables). _WRITE_STMT_RE otherwise flags the leading CREATE and raises
+# RuntimeError("readonly"), killing every vector path (degraded_reason
+# "semantic vector search failed: readonly", knn_unavailable). This regex
+# exempts ONLY statements whose entire effect is temp-schema DDL: CREATE/DROP
+# TEMP[ORARY] TABLE (incl. IF [NOT] EXISTS). The DROP branch anchors on the
+# required `TABLE` keyword so it cannot also match `... AS <expr>` and clash
+# with _TEMP_CTAS_RE's AS-clause stripping. Persistent DDL on an ro handle
+# stays fail-closed.
+_TEMP_DDL_RO_OK_RE = re.compile(
+    r"(?is)^\s*(?:CREATE\s+(?:GLOBAL\s+|LOCAL\s+)?TEMP(?:ORARY)?\s+TABLE"
+    r"|DROP\s+TEMP(?:ORARY)?\s+TABLE)\b")
+
 # Marker: _DML_LIMIT_CTID
 # SQLite allows LIMIT on DELETE/UPDATE; PG rejects it. Restrict the outer
 # statement to the ctids the inner query would have modified:
@@ -1035,7 +1053,8 @@ class _Cursor:
         # the reset inside an explicit BEGIN the caller just opened (begin()
         # tracks _tx_open) — there the caller owns the transaction.
         self._adapter._reset_if_aborted()
-        if getattr(self._adapter, "_query_only", False) and _WRITE_STMT_RE.match(sql):
+        if (getattr(self._adapter, "_query_only", False) and _WRITE_STMT_RE.match(sql)
+                and not _TEMP_DDL_RO_OK_RE.match(sql)):
             raise RuntimeError("readonly")
         # TEMP-declaration strip must run BEFORE the multi-statement split (the
         # CREATE TRIGGER branch passes its _raw_exec list through _guarded and

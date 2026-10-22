@@ -645,6 +645,22 @@ class _FtsCursor:
                         + tsexpr + ", 'StartSel=>>>, StopSel=<<<, MaxFragments=1, MaxWords=40')")
             out = re.sub(r"SNIP(\w+)", _snip_sub, out)
             out = re.sub(rf"\b{alias}\.rank\b", ref, out, flags=re.I)
+            # Bare SELECT-list `rank [AS x]` when the FTS relation resolved to
+            # an alias that is NOT the content table's own name (e.g. dag.py's
+            # `FROM nodes_fts fts JOIN summary_nodes n` collapses to
+            # `FROM summary_nodes fts`): the alias-remap only rewrites
+            # `<alias>.`-qualified refs, so an unqualified `rank` survives as
+            # FTS5's hidden column and PG rejects it with `column "rank" does
+            # not exist`. Convert it here, gated so it fires ONLY when the
+            # visible FROM alias differs from the content table (the nodes_fts
+            # shape). The messages path emits `FROM messages m` (alias==content)
+            # and already rewrites rank via the qualified/alias-def subs, so it
+            # is left byte-for-byte unchanged.
+            if _vis.lower() != content_table.lower():
+                out = re.sub(
+                    r"(?i)((?<![\w.])rank)(\s+(?:AS\s+)?[a-z_]\w*)",
+                    lambda m: ref + m.group(2),
+                    out, count=1)
             # `rank AS x` / `rank x` in a SELECT list is an ALIAS DEFINITION —
             # FTS5's hidden `rank` column does not exist on PG, so substitute
             # the full ts_rank expression while keeping the alias clause.

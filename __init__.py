@@ -9,10 +9,55 @@ Based on the LCM paper by Ehrlich & Blackman (Voltropy PBC, Feb 2026).
 import json
 import logging
 import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def _bootstrap_pg_dependencies():
+    """Make psycopg/fastembed importable under the Hermes launcher's `-I`.
+
+    The packaged `hermes` CLI runs CPython in isolated mode (`python -I`) and
+    pops PYTHONPATH from its own environ (see ~/.hermes/hermes-agent/.hermes/bin/
+    hermes), so the fork's self-contained venv (`~/lcm-pg/venv/.../site-packages`,
+    where psycopg + psycopg_binary + psycopg_pool + fastembed live — the
+    interpreter is 3.12, matching that venv's ABI) is invisible to plugin import.
+    Every cron/title/vision spawn then logs
+    `Failed to load plugin 'hermes-lcm': No module named 'psycopg'` and falls
+    back to the built-in compressor with no LCM.
+
+    This appends (never prepends — so the host interpreter's own packages always
+    win and there is no ABI surprise) that site-packages to sys.path, and ONLY
+    when a backend that needs it is active and the deps are otherwise missing.
+    Safe in every mode: the gateway already sets PYTHONPATH (deps resolve first,
+    so this no-ops), sqlite backend skips it, and it silently degrades to the
+    pre-fix failure if the venv is absent.
+    """
+    try:
+        if (os.environ.get("LCM_BACKEND") or "sqlite").strip().lower() != "postgres":
+            return
+        for dep in ("psycopg", "psycopg_pool"):
+            try:
+                __import__(dep)
+                continue
+            except Exception:
+                pass
+            for cand in (os.environ.get("LCM_PG_VENV_SITE"),
+                         os.path.expanduser("~/lcm-pg/venv/lib/python3.12/site-packages")):
+                if cand and cand not in sys.path and os.path.isdir(cand):
+                    sys.path.append(cand)
+                    try:
+                        __import__(dep)
+                        break
+                    except Exception:
+                        continue
+    except Exception:
+        logger.debug("LCM pg dependency bootstrap skipped", exc_info=True)
+
+
+_bootstrap_pg_dependencies()
 
 
 def get_recall_policy() -> str:
