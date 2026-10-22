@@ -69,6 +69,48 @@ def inspect(service):
     return "%s: TRIPWIRE — %s" % (service, tail[:160]), False
 
 
+def check_triggers(dsn: str) -> bool:
+    """Assertion V4 invariant: every lcm_* schema has all 6 lcm_assertion_*
+    triggers. A partial set = the bootstrap ran while an old partial state
+    aborted it mid-script; fix = drop the 3 assertion tables CASCADE +
+    orphan _trg_lcm_assertion_* functions, then re-run ensure (idempotent)."""
+    import psycopg
+
+    want = {
+        "lcm_assertion_source_insert_guard",
+        "lcm_assertion_row_insert_guard",
+        "lcm_assertion_relation_insert_guard",
+        "lcm_assertion_message_update",
+        "lcm_assertion_message_delete",
+        "lcm_assertion_source_delete",
+    }
+    try:
+        conn = psycopg.connect(dsn, autocommit=True)
+    except Exception as exc:
+        print("assertion triggers: connect failed:", str(exc)[:100])
+        return False
+    rows = conn.execute(
+        "select n.nspname, t.tgname from pg_trigger t "
+        "join pg_class c on c.oid = t.tgrelid "
+        "join pg_namespace n on n.oid = c.relnamespace "
+        "where t.tgname like 'lcm_assertion%%' and n.nspname ~ '^lcm_[a-z0-9]+$' "
+        "and n.nspname not like 'lcm\\_test\\_%' and n.nspname not like 'lcm\\_probe%%'"
+    ).fetchall()
+    conn.close()
+    by_schema = {}
+    for schema, trig in rows:
+        by_schema.setdefault(schema, set()).add(trig)
+    ok = True
+    for schema in sorted(set(s for s, _ in rows) | {"lcm_default"}):
+        missing = want - by_schema.get(schema, set())
+        if missing:
+            print("%s: MISSING triggers: %s" % (schema, ",".join(sorted(missing))))
+            ok = False
+        else:
+            print("%s: 6/6 assertion triggers" % schema)
+    return ok
+
+
 def main():
     services = sys.argv[1:] or ["hermes-gateway"]
     ok = True
@@ -76,6 +118,8 @@ def main():
         msg, good = inspect(svc)
         print(msg)
         ok = ok and good
+    if os.environ.get("LCM_PG_DSN"):
+        ok = check_triggers(os.environ["LCM_PG_DSN"]) and ok
     db = Path.home() / ".hermes/lcm.db"
     if db.exists():
         print("note: %s exists, mtime %s (resurrection would show a recent mtime)" % (
