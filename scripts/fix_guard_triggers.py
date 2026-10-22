@@ -77,8 +77,12 @@ def fix_one(conn):
         conn.commit()
         return "rebuilt via ensure (no fn): now %d/6" % len(_assert_triggers(conn))
     conn.execute('DROP TRIGGER IF EXISTS "%s" ON "%s"' % (GUARD, SRC))
+    # The connection's search_path is "<schema>, public" (pool-pinned per
+    # schema in postgres.connect), so the bare EXECUTE FUNCTION name
+    # resolves into the bound schema exactly — no current_schema() call
+    # (which is invalid in a function name-qualifier position on PG).
     conn.execute('CREATE TRIGGER "%s" BEFORE INSERT ON "%s" '
-                 'FOR EACH ROW EXECUTE FUNCTION current_schema()."%s"()'
+                 'FOR EACH ROW EXECUTE FUNCTION "%s"()'
                  % (GUARD, SRC, TRG_FN))
     conn.commit()
     n = len(_assert_triggers(conn))
