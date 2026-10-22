@@ -1118,6 +1118,18 @@ class _Cursor:
             if not sql.strip():
                 return self
         if ";" in sql.rstrip().rstrip(";"):
+            # A raw sqlite CREATE TRIGGER carries ';' INSIDE its BEGIN...END
+            # body. Splitting first would hand _guarded_one a body-less
+            # fragment (translate declines -> raw sqlite text hits PG:
+            # 'syntax error at or near "BEGIN"') plus a stray 'END'. Give the
+            # whole statement to the trigger translator first — same rule
+            # executescript uses for its merged fragments.
+            if re.match(r"(?i)\s*CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\b", sql):
+                tr = _translate_sqlite_trigger(sql)
+                if tr is not None:
+                    self._raw_exec(tr)
+                    self._rowcount = 0
+                    return self
             # multi-statement script: run parts separately so the per-statement
             # hooks below apply to each (CREATE TRIGGER path already uses
             # _raw_exec lists and never reaches here).
