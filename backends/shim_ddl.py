@@ -83,6 +83,18 @@ BEGIN
   IF length(s) > 1 AND left(s, 2) = '((' THEN
     s := btrim(substr(s, 2));
   END IF;
+  -- PG's pg_get_constraintdef nests ('CHECK (((expr)))'), so the fold's
+  -- substr(cd,8) CHECK-prefix strip can leave a trailing ')' the loop above
+  -- cannot see (s no longer starts with '('). Those are NOT harmless here:
+  -- the reconstruction wraps each folded clause as CHECK(<clause>), so a
+  -- stray closer yields 'CHECK(length(x) = 64))' -- an extra paren that
+  -- makes the rebuilt sqlite DDL unparseable (verify's PRAGMA table_info
+  -- then silently falls back to the catalog view and reports every
+  -- PRIMARY KEY column as nullable -> false 'malformed table'). Drop any
+  -- residual trailing closers so _peel returns a balanced expression.
+  WHILE length(s) > 0 AND right(s, 1) = ')' LOOP
+    s := btrim(rtrim(s, ')'));
+  END LOOP;
   RETURN s;
 END $fn$;
 
@@ -192,8 +204,17 @@ END $fn$;
 -- top level: CHECK(...) -> folded
 CREATE OR REPLACE FUNCTION {schema}._fold(cd text) RETURNS text
 LANGUAGE plpgsql IMMUTABLE AS $fn$
-DECLARE f text := substr(cd, 8);     -- drop 'CHECK (' (7 chars), keep content
+DECLARE f text;
 BEGIN
+  -- PG renders pg_get_constraintdef as either 'CHECK (expr)' (simple, one
+  -- space) or 'CHECK ((expr))' (when it adds its own paren layer). The old
+  -- hardcoded substr(cd, 8) assumed the two-space form ONLY; on the simple
+  -- form it cut one char INTO the first token (e.g. 'length(' -> 'ength('),
+  -- leaving a stray ')' that corrupted the reconstructed CHECK clause. Peel
+  -- either prefix by its actual length so _peel always sees clean content.
+  IF left(cd, 7) = 'CHECK (' THEN f := substr(cd, 8);
+  ELSEIF left(cd, 6) = 'CHECK(' THEN f := substr(cd, 7);
+  ELSE f := substr(cd, 7); END IF;
   f := {schema}._peel(f);
   f := replace(f, '::text', '');
   f := replace(f, '::integer', '');

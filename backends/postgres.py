@@ -565,13 +565,24 @@ def _drop_trigger_pg(m: re.Match) -> str:
         return "DROP TRIGGER %s %s ON %s CASCADE" % (
             "IF EXISTS" if if_exists else "", name, table)
     head = "DROP TRIGGER " + ("IF EXISTS " if if_exists else "")
-    cond = "NOT tgisinternal AND tgname = " + repr(name)
+    # Must be search-path CURRENT-SCHEMA scoped, like every other catalog read
+    # here (117/432/1648/...). A global `tgname = name` with LIMIT 1 is
+    # search-path-dependent (search_path = "<schema>, public") and, on the
+    # one-schema-per-profile fleet where the SAME trigger name lives in many
+    # schemas, resolves to an ARBITRARY schema -- and the trailing ' CASCADE'
+    # drops that schema's shadow _trg_<name>() function, wiping an unrelated
+    # schema's guard (the source_insert_guard 5/6 drift). EXISTS short-circuits
+    # on a match, so the single-schema path stays index-fast.
+    cond = ("NOT t.tgisinternal AND t.tgname = " + repr(name) +
+            " AND t.tgrelid::regclass::text LIKE current_schema() || '.%'")
+    lookup = ("FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
+              "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE " + cond)
     return (
         "DO $$ BEGIN EXECUTE '" + head + "' || ("
-        "SELECT quote_ident(tgname) || ' ON ' || tgrelid::regclass::text"
-        " || ' CASCADE' FROM pg_trigger WHERE " + cond + " LIMIT 1);"
+        "SELECT quote_ident(t.tgname) || ' ON ' || t.tgrelid::regclass::text "
+        "|| ' CASCADE' " + lookup + " LIMIT 1);"
         " EXCEPTION WHEN OTHERS THEN"
-        " IF (SELECT count(*) FROM pg_trigger WHERE " + cond + ") = 0 THEN"
+        " IF (SELECT count(*) " + lookup + ") = 0 THEN"
         " NULL; ELSE RAISE; END IF;"
         " END $$;")
 
