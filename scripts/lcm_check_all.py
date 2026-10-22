@@ -113,9 +113,29 @@ def s_version():
                     + ("" if ok2 else " -> restart needed to load current code"))
             except Exception:
                 add("VERSION-LOAD", u, "INFO", f"ActiveEnterTimestamp={ts!r}")
-    bad = [ln for ln in out.splitlines() if "Failed to load plugin" in ln and "lcm" in ln.lower()]
+    # Gate on errors since each service STARTED, not since midnight: a host
+    # repaired at 14:41 must not stay FAIL because of lines the pre-fix code
+    # logged at 13:36 — that reads as an unfixed defect and buries whatever is
+    # actually broken now. The since-midnight total stays visible as INFO.
+    bad = []
+    for u in sorted(set(re.findall(r"hermes-\S+\.service", subprocess.run(
+            ["systemctl", "--user", "list-units", "--type=service",
+             "--state=loaded", "--no-legend"],
+            capture_output=True, text=True).stdout))):
+        ts = subprocess.run(["systemctl", "--user", "show", u,
+                             "-p", "ActiveEnterTimestamp", "--value"],
+                            capture_output=True, text=True).stdout.strip()
+        if not ts or ts == "n/a":
+            continue
+        rc_u, out_u = sh(["journalctl", "--user", "-u", u, "--since", ts, "--no-pager"])
+        if rc_u == 0:
+            bad += [ln for ln in out_u.splitlines() if "Failed to load plugin" in ln]
     add("VERSION-LOAD", "plugin-load-errors", "PASS" if not bad else "FAIL",
-        f"{len(bad)} 'Failed to load plugin' lines today" + (f" e.g. {bad[0][-160:]}" if bad else ""))
+        f"{len(bad)} 'Failed to load plugin' since service start"
+        + (f" e.g. {bad[0][-160:]}" if bad else " (clean boot)"))
+    today = [ln for ln in out.splitlines() if "Failed to load plugin" in ln]
+    add("VERSION-LOAD", "plugin-load-errors-today", "INFO",
+        f"{len(today)} such lines since midnight (historical, incl. pre-restart)")
     rc, out = sh(["hermes", "plugins", "list"])
     add("VERSION-LOAD", "plugins-list", "PASS" if "hermes-lcm" in out and "error" not in out.lower()[-200:] else "INFO",
         "hermes-lcm visible" if "hermes-lcm" in out else out[-160:])
