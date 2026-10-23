@@ -37,6 +37,59 @@ _SPEC_REGISTRY: dict[int, tuple[tuple[str, str, str], ...]] = {}
 # RETURNING for sqlite lastrowid parity. Extend if another store needs it.
 _INSERT_ROWID_TABLES = {"messages"}
 
+_PK_CACHE: dict[str, dict[str, str | None]] = {}
+
+
+def _serial_pk_column(schema, table):
+    """sqlite lastrowid parity: return the table's server-generated PK column
+    (identity or nextval default) for RETURNING augmentation, else None.
+    Cached per (schema, table); None is cached too so each table costs at
+    most one catalog probe per process."""
+    if not schema or not table:
+        return None
+    tbl = _PK_CACHE.setdefault(schema, {})
+    if table in tbl:
+        return tbl[table]
+    pk = None
+    try:
+        import psycopg as _psycopg
+        _raw = _psycopg.connect(_pg_dsn_local(), autocommit=True)
+        _raw.execute("SET statement_timeout = 5000")
+        try:
+            with _raw.cursor() as cur:
+                cur.execute(
+                    "SELECT a.attname FROM pg_index i "
+                    "JOIN pg_attribute a ON a.attrelid = i.indrelid "
+                    "   AND a.attnum = ANY(i.indkey) "
+                    "JOIN pg_class c ON c.oid = i.indrelid "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid "
+                    "   AND d.adnum = a.attnum "
+                    "WHERE n.nspname = %s AND c.relname = %s AND i.indisprimary "
+                    "  AND (a.attidentity IN ('a','b') "
+                    "       OR pg_get_expr(d.adbin, d.adrelid) LIKE %s)",
+                    (schema, table, "nextval%"))
+                r = cur.fetchone()
+            pk = str(r[0]) if r and _PK_NAME_RE.match(str(r[0])) else None
+        finally:
+            try:
+                _raw.close()
+            except Exception:
+                pass
+    except Exception:
+        pk = None
+    tbl[table] = pk
+    return pk
+
+
+_PK_NAME_RE = __import__("re").compile(r"^[a-z_][a-z0-9_]*$")
+
+
+def _pg_dsn_local():
+    import os
+    return os.environ.get("LCM_PG_DSN") or ""
+
+
 # SQL keywords that can never be a table alias
 _KW = r"(?:WHERE|JOIN|ON|ORDER|GROUP|LIMIT|OFFSET|SET|USING|AS|UNION|LEFT|RIGHT|INNER|CROSS|HAVING|RETURNING)"
 
@@ -423,7 +476,18 @@ class FtsConnection:
         return getattr(self._base, name)
 
     def cursor(self):
-        return _FtsCursor(self._base.cursor(), lambda: self._specs)
+        return _FtsCursor(self._base.cursor(), lambda: self._specs,
+                          schema_of=self)
+
+    @property
+    def _schema(self):
+        # resolve the owning backend's schema lazily and cache it
+        s = getattr(self, "_schema_cache", None)
+        if s is None:
+            base = getattr(self, "_base", None)
+            s = getattr(base, "_schema", None)
+            self._schema_cache = s
+        return s
 
     def execute(self, sql, parameters=()):
         sql = _lcm_pg_temp_rewrite(sql)
@@ -457,14 +521,19 @@ class FtsConnection:
 
 
 class _FtsCursor:
-    def __init__(self, cur, specs):
+    def __init__(self, cur, specs, schema_of=None):
         # specs may arrive as an empty tuple at connect time (tables not yet
         # created); re-read the connection's current specs at use time so
         # ensure_external_content_fts running later still gets the rewrite.
         self._parent_specs_ref = specs
+        self._schema_owner = schema_of
         self._cur = cur
         self._specs = specs
         self._extra_params = 0
+        # lastrowid-parity helper: schema of the owning backend (None-safe).
+        # FtsConnection passes itself in so the cursor can resolve the
+        # connection's schema without probing the physical conn.
+        self._pk_schema = schema_of
 
     def _live_specs(self):
         specs = self.__dict__.get("_parent_specs_ref", self.__dict__.get("_specs", ()))
@@ -763,11 +832,15 @@ class _FtsCursor:
                 and "RETURNING" not in up and " SELECT" not in up
                 and re.search(r"\bVALUES\b", up)
                 and not re.search(r"DO\s+(NOTHING|UPDATE|SELECT)\b", up)):
-            t = re.match(r"^\s*INSERT\s+INTO\s*\W?(\w+)", final, flags=re.I).group(1)
             # RETURNING * would type the INSERT's literal binds through the
-            # target columns; RETURNING store_id keeps them independent and
-            # still serves lastrowid for the content-less-PK tables.
-            aug = " RETURNING store_id" if t in _INSERT_ROWID_TABLES else ""
+            # target columns; RETURNING <pk> (the single server-generated key
+            # column) keeps binds independent and serves lastrowid parity for
+            # EVERY identity/sequence-PK table (summary_nodes.node_id, rollup
+            # tables, ...), not just the historical hardcoded set.
+            t = re.match(r"^\s*INSERT\s+INTO\s*(?:(?:\w+)\s*\.\s*)?(\w+)", final, flags=re.I).group(1)
+            owner = getattr(self, "_schema_owner", None)
+            pk = _serial_pk_column(getattr(owner, "_schema", None), t)
+            aug = f" RETURNING {pk}" if pk else (" RETURNING store_id" if t in _INSERT_ROWID_TABLES else "")
         try:
             self._cur.execute(final + aug, params)
         except Exception as exc:

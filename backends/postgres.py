@@ -772,6 +772,24 @@ def _rewrite_text(sql: str) -> str:
     # SQLite FTS MATCH quoting: "col" MATCH '"phrase"' -> to_tsvector/plainto
     # Parametric `IS [NOT] <placeholder>` (SQLite-only form) -> = / <> .
     s = _neutralize_is_forms(s)
+    # sqlite's EXPLAIN QUERY PLAN -> PG's EXPLAIN (callers probe the plan text
+    # for 'Scan'/'USING INDEX'; PG's plan carries the same info verbatim).
+    s = re.sub(r"(?i)\bEXPLAIN\s+QUERY\s+PLAN\b", "EXPLAIN", s)
+    # sqlite joins a set-returning function against a table with a bare
+    # comma/JOIN (FROM t, json_each(t.c) e / JOIN json_each(t.c) e ON 1);
+    # PG requires LATERAL + an ON clause. Canonicalise every sqlite shape
+    # to CROSS JOIN LATERAL f(...) AS a (semantics are identical).
+    s = re.sub(
+        r"(?i)\bJOIN\s+(json_each|json_each_text|jsonb_each|jsonb_each_text)"
+        r"\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)\s+(?:AS\s+)?(\w+)"
+        r"(?:\s+ON\s+(?:1\s*=\s*1|TRUE|json_each\.rowid\s*=\s*1|1))?(?=\s|$)",
+        lambda m: f"CROSS JOIN LATERAL {m.group(1)}({m.group(2)}) AS {m.group(3)}",
+        s)
+    s = re.sub(
+        r"(?i)\bFROM\s+(\w+)\s*,\s*(json_each|json_each_text|jsonb_each|jsonb_each_text)"
+        r"\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)\s*(?:AS\s+)?(\w+)",
+        lambda m: f"FROM {m.group(1)} CROSS JOIN LATERAL {m.group(2)}({m.group(3)}) AS {m.group(4)}",
+        s)
     return s
 
 
