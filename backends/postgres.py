@@ -1860,6 +1860,10 @@ class PgConnection:
                     self._savepoint_depth = getattr(self, "_savepoint_depth", 0) + 1
                 return (stripped, ())
             if re.match(r"^ROLLBACK\s+TO\b", stripped, flags=re.I):
+                # sqlite starts an implicit tx for SAVEPOINT hygiene statements
+                # too; without the guard PG raises NoActiveSqlTransaction.
+                if not self._tx_open:
+                    self.begin()
                 self._savepoint_depth = max(0, getattr(self, "_savepoint_depth", 0) - 1)
                 return (stripped, ())
             if re.match(r"^ROLLBACK\b", stripped, flags=re.I):
