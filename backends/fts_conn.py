@@ -784,6 +784,11 @@ class _FtsCursor:
         return True
 
     def execute(self, sql, parameters=()):
+        # sqlite3 parity: sqlite3.Cursor.execute(sql) accepts None params;
+        # normalize here (FtsConnection.execute takes no default override at
+        # its call sites, so a bare None would crash the tuple() below).
+        if parameters is None:
+            parameters = ()
         # sqlite trace parity: report the CALLER's statement (bound params
         # rendered) BEFORE the ts rewrite; the inner _Cursor.execute is
         # suppressed for the dispatch below via the _tp.SUPPRESS token.

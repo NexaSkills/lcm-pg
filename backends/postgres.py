@@ -575,8 +575,15 @@ def _drop_trigger_pg(m: re.Match) -> str:
     # drops that schema's shadow _trg_<name>() function, wiping an unrelated
     # schema's guard (the source_insert_guard 5/6 drift). EXISTS short-circuits
     # on a match, so the single-schema path stays index-fast.
+    # Schema scoping avoids LIKE (whose '%' literal trips psycopg's
+    # placeholder scanner on this raw-statement path) via a regex compare:
+    # regclass text is schema-qualified, and characters safe as trigger
+    # names cannot terminate the quoted regex, so the concatenation stays
+    # %-free.
+    _pat = "^" + re.escape(repr(name)[1:-1]).replace("\\'", "'") \
+        .replace("\\\\", "\\\\\\\\") + "\\."
     cond = ("NOT t.tgisinternal AND t.tgname = " + repr(name) +
-            " AND t.tgrelid::regclass::text LIKE current_schema() || '.%'")
+            " AND t.tgrelid::regclass::text ~ " + repr(_pat))
     lookup = ("FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
               "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE " + cond)
     return (
@@ -812,15 +819,62 @@ def _rewrite_text(sql: str) -> str:
                 i += 1
             return "".join(out)
         esc = lambda pat: " ESCAPE '\\\\'" if any(c in pat for c in "%_\\") else ""
-        # expr GLOB 'pat'   (pattern on RHS)
-        m = re.search(r"\bGLOB\s+'((?:[^']|'')*)'", s, flags=re.I)
-        if m:
+        # expr GLOB 'pat'   (pattern on RHS) — translate EVERY such pair
+        # (a statement may hold several GLOBs; the old single re.search
+        # translated only the FIRST one and left the rest as bare GLOB).
+        def _one(m: re.Match) -> str:
             pat = m.group(1).replace("''", "'")
-            return (s[:m.start()] + "LIKE" + esc(pat) + " '" + _tr(pat).replace("'", "''")
-                    + "'" + s[m.end():])
-        # 'pat' GLOB expr is not valid sqlite; not handled.
+            return "LIKE" + esc(pat) + " '" + _tr(pat).replace("'", "''") + "'"
+        out, nsub = re.subn(r"\bGLOB\s+'((?:[^']|'')*)'", _one, s, flags=re.I)
+        if nsub:
+            s = out
+        # 'pat' GLOB expr is not valid sqlite; any GLOB left has a
+        # non-literal pattern operand -> plain keyword swap.
         return re.sub(r"\bGLOB\b", "LIKE", s, flags=re.I)
     s = _glob_to_like(s)
+    # psycopg (and DB-API in general) treats ANY literal % in the statement
+    # text as a placeholder-introducer, even when no params are bound (it
+    # scans before deciding). GLOB->LIKE translation and hand-written LIKE
+    # patterns introduce bare %/_ wildcard chars inside QUOTED literals;
+    # those must be doubled to %% so psycopg's placeholder scanner skips
+    # them (PG LIKE semantics are unaffected: %% in a literal collapses to
+    # a single % at parse time). Only touch text OUTSIDE quoted literals,
+    # and never the real placeholders (%s/%b/%t/%(name)s) or already-doubled
+    # %%.
+    def _double_literal_percents(s: str) -> str:
+        # Inside a single-quoted literal, a bare % makes psycopg's
+        # placeholder scanner explode (it scans literals in EVERY mode,
+        # including the no-params path where it hands psycopg the None
+        # param marker). Double every % inside literals; PG's parser
+        # collapses %% back to one % inside a string so LIKE semantics are
+        # unchanged. Quoted literals can only START outside a literal
+        # (SQL escapes '' only inside one), so the state machine is simple.
+        out, i, n, in_lit = [], 0, len(s), False
+        while i < n:
+            ch = s[i]
+            if in_lit:
+                if ch == "'":
+                    if i + 1 < n and s[i + 1] == "'":  # doubled quote = literal quote
+                        out.append("''")
+                        i += 2
+                        continue
+                    in_lit = False
+                    out.append(ch)
+                    i += 1
+                    continue
+                if ch == "%":
+                    out.append("%%")
+                    i += 1
+                    continue
+                out.append(ch)
+                i += 1
+                continue
+            if ch == "'":
+                in_lit = True
+            out.append(ch)
+            i += 1
+        return "".join(out)
+    s = _double_literal_percents(s)
     # WITHOUT ROWID clause -> drop
     s = re.sub(r"\bWITHOUT\s+ROWID\b", "", s, flags=re.I)
 
@@ -855,11 +909,26 @@ def _rewrite_text(sql: str) -> str:
     # avoids literal % tokens in the statement (psycopg treats them as
     # placeholders).
     if re.search(r"(?i)\bDROP\s+TRIGGER\b", s):
+        # Only rewrite a DROP TRIGGER that is statement-initial (optionally
+        # after leading whitespace). Mid-string matches inside dollar-quoted
+        # bodies (e.g. the probe's own DO body emitted by a previous rewrite)
+        # must stay verbatim — re-entering the rewriter on generated SQL is
+        # how the '%' of LIKE's literal fed psycopg's placeholder parser.
+        # _drop_trigger_pg expects the 5-group match shape, so strip the
+        # leading-whitespace group before delegating.
+        def _initial_drop(m):
+            inner = re.match(
+                r"(?i)DROP\s+TRIGGER\s+(?:(IF\s+EXISTS)\s+)?"
+                r"(?:\"([^\"]+)\"|([\w$]+))(?:\s+ON\s+(?:\"([^\"]+)\"|([\w$]+)))?",
+                m.group(0).lstrip())
+            if inner is None:  # defensive: never rewrite on unexpected shape
+                return m.group(0)
+            return m.group(1) + _drop_trigger_pg(inner)
         s = re.sub(
-            r"(?i)\bDROP\s+TRIGGER\s+(?:(IF\s+EXISTS)\s+)?"
-            r"(?:\"([^\"]+)\"|([\w$]+))(?:\s+ON\s+(?:\"([^\"]+)\"|([\w$]+)))?",
-            _drop_trigger_pg,
-            s)
+            r"(?i)^(\s*)DROP\s+TRIGGER\s+(?:(?:IF\s+EXISTS)\s+)?"
+            r"(?:\"[^\"]+\"|[\w$]+)(?:\s+ON\s+(?:\"[^\"]+\"|[\w$]+))?",
+            _initial_drop,
+            s, count=1)
 
     # SQLite FTS MATCH quoting: "col" MATCH '"phrase"' -> to_tsvector/plainto
     # Parametric `IS [NOT] <placeholder>` (SQLite-only form) -> = / <> .
@@ -1155,6 +1224,28 @@ def _annotate_param_types(sql: str, _shape=None) -> str:
     return "".join(out)
 
 
+def _hybrid_row(cursor):
+    """psycopg row factory: positional column names made unique, then wrapped
+    in _HybridRow. dict_row alone collapses repeated default labels (an
+    unaliased SELECT list with several SUM()/COUNT() columns yields the keys
+    count/coalesce/sum/sum, dropping a positional slot — positional
+    row[3]/row[4] access then fails). Positional-first unique keys preserve
+    SELECT order for _HybridRow's positional branch while keeping name
+    access for aliased columns."""
+    names = [d.name for d in (cursor.description or ())]
+    seen: dict = {}
+    cols = []
+    for n in names:
+        c = seen.get(n, 0)
+        seen[n] = c + 1
+        cols.append(n if c == 0 else f"{n}_{c}")
+
+    def _row(values):
+        return _HybridRow(zip(cols, values))
+
+    return _row
+
+
 class _HybridRow(dict):
     """Row with BOTH dict and tuple semantics.
 
@@ -1171,14 +1262,33 @@ class _HybridRow(dict):
         if isinstance(key, int):
             return list(self.values())[key]
         if isinstance(key, slice):
-            return list(self.values())[key]
+            # sqlite3.Row slicing yields a plain TUPLE (tests assert
+            # row[0:3] == (...) and list != tuple in pytest rewrites).
+            return tuple(self.values())[key]
         return dict.__getitem__(self, key)
 
     def __iter__(self):
         return iter(list(self.values()))  # sqlite3.Row iterates values
 
+    def __eq__(self, other):
+        # sqlite3.Row equality is ELEMENTWISE SEQUENCE equality: tests do
+        # `assert rows == [("user", "root", None), ...]` and
+        # `assert row[0:3] == ("assistant", None, None)` (slicing yields a
+        # plain tuple in sqlite3.Row). Accept the tuple/list shape
+        # (positional, SELECT order) and the plain-dict shape both; other
+        # types defer to the normal machinery.
+        if isinstance(other, _HybridRow):
+            return dict.__eq__(self, other)
+        if isinstance(other, (tuple, list)):
+            return tuple(self.values()) == tuple(other)
+        if isinstance(other, dict):
+            return dict.__eq__(self, other)
+        return NotImplemented
+
     def keys(self):
         return dict.keys(self)
+
+    __hash__ = None
 
 
 _WRITE_STMT_RE = re.compile(
@@ -1317,14 +1427,9 @@ class _Cursor:
         if isinstance(params, dict):
             # sqlite-style :named params -> psycopg %(name)s dictConfig keys
             sql = re.sub(r":([A-Za-z_]\w*)", lambda m: "%%(%s)s" % m.group(1), sql)
-        if not params and not isinstance(params, dict):
-            # psycopg treats ANY params value (even empty tuple) as "has
-            # placeholders" and scans literals for %s/%b/%t; a stray literal
-            # `%` inside a string (LIKE 'a%') then explodes. sqlite would
-            # ignore it, so hand psycopg a None (no-placeholder mode) when
-            # nothing is bound and nothing was substituted.
-            if "%s" not in sql and "%(" not in sql:
-                params = None
+        # (literal % inside quoted strings is already doubled to %% by
+        # _rewrite_text._double_literal_percents, so psycopg's placeholder
+        # scanner never explodes on LIKE patterns.)
         try:
             self._raw.execute(sql, params)
         except Exception:
@@ -1334,6 +1439,21 @@ class _Cursor:
             # connection (one bad query used to break every later tool call).
             self._adapter._self_heal()
             raise
+        # Synthetic savepoint tx (sqlite implicit-transaction parity): once
+        # the OUTERMOST RELEASE has run, sqlite's implicit tx is finished —
+        # commit and hand the backend back so it can never sit idle-in-
+        # transaction holding locks (the rollup-introspection ALTER deadlock).
+        if (sql.lstrip().upper().startswith("RELEASE")
+                and getattr(self._adapter, "_synthetic_tx", False)
+                and getattr(self._adapter, "_savepoint_depth", 0) == 0):
+            self._adapter._synthetic_tx = False
+            try:
+                self._adapter.commit()
+            except Exception:
+                try:
+                    self._adapter.rollback()
+                except Exception:
+                    pass
         self._rowcount = self._raw.rowcount
         if "INSERT" in sql.upper() and "RETURNING" in sql.upper():
             try:
@@ -1588,6 +1708,8 @@ class PgConnection:
         self._query_only = False
         self._tx = None
         self._tx_open = False
+        self._synthetic_tx = False
+        self._savepoint_depth = 0
         self._ensure_tx_probe = "SELECT 1"
         self.row_factory = None  # accepted & ignored (dict rows always)
 
@@ -1727,19 +1849,36 @@ class PgConnection:
                 # block (sqlite would have started one implicitly). If a tx is
                 # already open (BEGIN IMMEDIATE / with-conn) just pass through.
                 if not self._tx_open:
+                    # Bare SAVEPOINT starts sqlite's implicit tx; open a real
+                    # PG tx and mark it synthetic. A nested SAVEPOINT inside an
+                    # already-open tx does NOT reset this (the block's final
+                    # RELEASE must not commit an outer BEGIN IMMEDIATE early).
+                    self._synthetic_tx = True
+                    self._savepoint_depth = 1
                     self.begin()
+                else:
+                    self._savepoint_depth = getattr(self, "_savepoint_depth", 0) + 1
                 return (stripped, ())
             if re.match(r"^ROLLBACK\s+TO\b", stripped, flags=re.I):
+                self._savepoint_depth = max(0, getattr(self, "_savepoint_depth", 0) - 1)
                 return (stripped, ())
             if re.match(r"^ROLLBACK\b", stripped, flags=re.I):
+                self._synthetic_tx = False
+                self._savepoint_depth = 0
                 self.end_tx()
                 return ("ROLLBACK", ())
             if re.match(r"^RELEASE\b", stripped, flags=re.I):
                 # Outermost RELEASE commits sqlite's implicit tx. Mirror that:
                 # after releasing, if no nested savepoint can remain (we never
                 # nest our synthetic BEGIN), commit the opened tx.
+                self._savepoint_depth = max(0, getattr(self, "_savepoint_depth", 0) - 1)
+                # sqlite parity: the OUTERMOST RELEASE commits the implicit tx.
+                # Only run the passthrough RELEASE while a server-side tx is
+                # actually open; if our synthetic BEGIN already ended (e.g. a
+                # COMMIT ran mid-scope), skip the statement — sqlite would have
+                # no tx either and its RELEASE would error, but a skipped
+                # no-op keeps the parity layer from crashing the whole write.
                 return (stripped, ())
-            return (stripped, ())
         if isinstance(params, dict):
             return _rewrite_text(stripped), params
         out = _rewrite_text(stripped)
@@ -1761,6 +1900,44 @@ class PgConnection:
             self._query_only = value not in ("", "0", "OFF", "off", "false")
             return ("SELECT 1", ())
         if name in ("table_info", "table_xinfo"):
+            # FTS facade names (X_fts) have no PG rel of their own — the
+            # shim's sqlite_master exposes them as virtual tables over
+            # content table X. sqlite's FTS5 table_info lists the FTS
+            # columns; the facade indexes X's tsvector content column set,
+            # so answer with the content table's shape.
+            _v = value
+            if _v.split(".")[-1].endswith("_fts"):
+                _base = _v.split(".")[-1][:-len("_fts")]
+                from . import shim_ddl as _sd
+                probe_sql = (
+                    "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace"
+                    " WHERE n.nspname = current_schema() AND c.relname = %s"
+                    " AND c.relkind = 'r' AND EXISTS (SELECT 1 FROM pg_attribute a"
+                    "   WHERE a.attrelid = c.oid AND a.attname LIKE '%\\_tsv'"
+                    "     AND a.attnum > 0 AND NOT a.attisdropped) LIMIT 1"
+                )
+                # Facade: sqlite FTS5 table_info lists exactly the indexed
+                # column(s). Our facade indexes the content table's tsvector
+                # source column; its name is the tsv column minus the _tsv
+                # suffix (content_tsv -> content). Synthesize that row.
+                try:
+                    with self._conn.cursor() as _c:
+                        _c.execute(
+                            "SELECT replace(a.attname, '_tsv', '')"
+                            " FROM pg_class c"
+                            " JOIN pg_namespace n ON n.oid = c.relnamespace"
+                            " JOIN pg_attribute a ON a.attrelid = c.oid"
+                            " WHERE n.nspname = current_schema() AND c.relname = %s"
+                            "   AND a.attname LIKE %s AND a.attnum > 0 AND NOT a.attisdropped"
+                            " ORDER BY a.attnum LIMIT 1",
+                            (_base, "%\\_tsv"),
+                        )
+                        _col = _c.fetchone()
+                    if _col:
+                        return ("__rows__", [(0, _col[0], "TEXT", 0, None, 0)])
+                except Exception:
+                    pass
+                # content table missing: fall through with the original name
             return _table_info_sql(value, self)
         if name == "user_version":
             return ("SELECT 1", ())
@@ -1853,7 +2030,7 @@ class PgConnection:
 
     # -- sqlite3.Connection parity ------------------------------------------
     def _raw_cursor(self):
-        return self._conn.cursor(row_factory=dict_row)
+        return self._conn.cursor(row_factory=_hybrid_row)
 
     def cursor(self):
         # Borrow on demand (the single funnel for every execute/executemany/

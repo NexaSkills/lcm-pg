@@ -2869,6 +2869,20 @@ def quote_sql_identifier(identifier: str) -> str:
 
 
 def _fts_needs_rebuild_structural(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> bool:
+    if _pg_fts_native(conn):
+        # Postgres FTS is trigger-maintained tsvector (backends/fts_pg); there
+        # are no FTS5 shadow tables and the facade's sqlite_master sql text
+        # omits "USING fts5", so the SQLite structural probes below would
+        # always report repair-needed. Ask the real question instead: is the
+        # tsvector infrastructure present, and if not, can ensure_fts build it?
+        try:
+            from .backends import fts_pg  # type: ignore
+            if fts_pg.has_fts(conn, spec.content_table, spec.indexed_column):
+                return False
+            fts_pg.ensure_fts(conn, spec.content_table, spec.indexed_column)
+            return not fts_pg.has_fts(conn, spec.content_table, spec.indexed_column)
+        except Exception:
+            return False  # probe failed; never trigger a destructive rebuild on PG
     shadow_tables = get_fts_shadow_table_names(spec.table_name)
     existing_tables = get_existing_table_names(conn, [spec.table_name, *shadow_tables])
     if spec.table_name not in existing_tables:
@@ -3417,6 +3431,17 @@ def _fts_missing_triggers(conn: sqlite3.Connection, spec: ExternalContentFtsSpec
 
 
 def external_content_fts_needs_repair(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> bool:
+    if _pg_fts_native(conn):
+        # On Postgres, FTS is the trigger-maintained tsvector trio from
+        # backends/fts_pg (names follow (table, column), not the facade name),
+        # so the SQLite trigger-name probe below always reports missing and
+        # the startup repair would degrade the index to LIKE search. Ask the
+        # provisioner directly instead.
+        try:
+            from .backends import fts_pg  # type: ignore
+            return not fts_pg.has_fts(conn, spec.content_table, spec.indexed_column)
+        except Exception:
+            return False
     return _fts_needs_rebuild_structural(conn, spec) or _fts_missing_triggers(conn, spec)
 
 

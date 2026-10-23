@@ -338,7 +338,40 @@ $cf$""",
 )
 
 VIEW = """CREATE OR REPLACE VIEW "{schema}".sqlite_master AS
-WITH objs AS (
+-- Registry of every FTS facade ever provisioned in this schema via
+-- fts_pg.ensure_fts. Provisioning with a facade name that is NOT
+-- content||'_fts' (e.g. nodes_fts over summary_nodes.summary, which reuses
+-- summary_nodes' shared tsv/docsize objects) is otherwise INVISIBLE to the PG
+-- catalog, so the installer leaves a permanent marker table
+-- "_lcm_facade_<name>" recording (facade, content, column). The view combines
+-- the catalog-derived facades (content||'_fts', always correct) with these
+-- markers (the lossless superset; UNION dedupes the overlap).
+WITH catalog_facades AS (
+    SELECT c.relname || '_fts' AS name, c.relname AS content
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = '{schema}' AND c.relkind = 'r'
+       AND EXISTS (SELECT 1 FROM pg_attribute a
+                    WHERE a.attrelid = c.oid AND a.attname LIKE '%_tsv'
+                      AND a.attnum > 0 AND NOT a.attisdropped)
+),
+registry AS (
+    -- Facade names that are aliases (facade <> content||'_fts') are supplied
+    -- at view-INSTALL time by the process's _FTS_SPECS registry
+    -- (backends/factory.py) via {registry_rows}. A process whose specs failed
+    -- to provision (fresh schema, tables not yet created) renders the no-op
+    -- row below, and the view rebuilds with real rows on a later install once
+    -- provisioning succeeds.
+    SELECT m.facade AS name, m.content AS content
+      FROM (VALUES {registry_rows}) m(facade, content)
+     WHERE m.facade <> m.content || '_fts'
+),
+facades_x AS (
+    SELECT name, content FROM catalog_facades
+    UNION
+    SELECT name, content FROM registry
+),
+objs AS (
     SELECT CASE
                WHEN c.relkind IN ('r','p') THEN 'table'
                WHEN c.relkind = 'v' AND c.relname = 'sqlite_master' THEN NULL
@@ -366,24 +399,43 @@ WITH objs AS (
       JOIN pg_namespace n ON n.oid = tc.relnamespace
      WHERE n.nspname = '{schema}' AND NOT t.tgisinternal
        AND t.tgname NOT LIKE '\\_trg\\_%' ESCAPE '\\'
+    UNION ALL
+    SELECT 'trigger', f.name || '_' || k.kind, f.content,
+           'CREATE TRIGGER ' || f.name || '_' || k.kind
+      FROM facades_x f
+      CROSS JOIN (VALUES ('insert'), ('update'), ('delete')) AS k(kind)
+     WHERE EXISTS (SELECT 1 FROM pg_trigger t
+                     WHERE t.tgrelid = (SELECT c.oid FROM pg_class c
+                                         JOIN pg_namespace nn ON nn.oid = c.relnamespace
+                                        WHERE c.relname = f.content
+                                          AND nn.nspname = '{schema}')
+                       AND t.tgname LIKE '%\\_' || k.kind ESCAPE '\\')
 ),
 facades AS (
-    SELECT c.relname || '_fts' AS name, c.relname AS content
-      FROM pg_class c
-      JOIN pg_namespace n ON n.oid = c.relnamespace
-     WHERE n.nspname = '{schema}' AND c.relkind = 'r'
-       AND EXISTS (SELECT 1 FROM pg_attribute a
-                    WHERE a.attrelid = c.oid AND a.attname LIKE '%_tsv'
-                      AND a.attnum > 0 AND NOT a.attisdropped)
+    SELECT name, content FROM facades_x
+    WHERE name <> '_none_'   -- the VALUES no-op placeholder row is never a facade
 )
-SELECT 'virtual' AS type, f.name AS name, f.name AS tbl_name,
+SELECT 'table' AS type, f.name AS name, f.name AS tbl_name,
        'CREATE VIRTUAL TABLE "' || f.name || '" USING fts5('
          || 'content, content_rowid=store_id)' AS sql
+  FROM facades f
+UNION ALL
+SELECT 'table', f.name || '_data', f.name || '_data',
+       'CREATE TABLE "' || f.name || '_data"(dummy)'
+  FROM facades f
+UNION ALL
+SELECT 'table', f.name || '_idx', f.name || '_idx',
+       'CREATE TABLE "' || f.name || '_idx"(dummy)'
+  FROM facades f
+UNION ALL
+SELECT 'table', f.name || '_config', f.name || '_config',
+       'CREATE TABLE "' || f.name || '_config"(dummy)'
   FROM facades f
 UNION ALL
 SELECT 'table', f.name || '_docsize', f.name || '_docsize',
        'CREATE TABLE "' || f.name || '_docsize"(docid INTEGER PRIMARY KEY, size)'
   FROM facades f
+  WHERE NOT EXISTS (SELECT 1 FROM objs o WHERE o.name = f.name || '_docsize')
 UNION ALL
 SELECT type, name, tbl_name, sql FROM objs WHERE type IS NOT NULL"""
 
@@ -475,6 +527,24 @@ END $o$"""
 BIGINT_TEXT_FN = r"""CREATE OR REPLACE FUNCTION public._bigint_text_eq(a bigint, b text)
   RETURNS bool LANGUAGE sql IMMUTABLE AS $$ SELECT a::text OPERATOR(pg_catalog.=) b $$"""
 
+def _registry_rows() -> str:
+    """VALUES rows for alias facades (facade name != content||'_fts').
+
+    Derived from factory._FTS_SPECS — the process's authoritative spec list.
+    The no-op row makes the VALUES list valid SQL when there are no aliases;
+    the WHERE clause filters it out (and it is harmless even if it survives:
+    a nonexistent content table matches no trigger lookup row)."""
+    try:
+        from . import factory
+        specs = getattr(factory, "_FTS_SPECS", ())
+    except Exception:
+        specs = ()
+    rows = ["('_none_', '_none_')"]
+    rows += [f"('{t}', '{c}')" for (t, c, _col) in specs
+             if t != c + "_fts"]
+    return ", ".join(rows)
+
+
 def install(cur, schema: str) -> None:
     if not _SCHEMA_RE.match(schema):
         raise ValueError(schema)
@@ -490,7 +560,7 @@ def install(cur, schema: str) -> None:
     cur.execute(BIGINT_TEXT_EQ)
     for stmt in DDL_STATEMENTS:
         cur.execute(stmt.format(schema=schema))
-    cur.execute(VIEW.format(schema=schema))
+    cur.execute(VIEW.format(schema=schema, registry_rows=_registry_rows()))
 
 
 class _ConnShim:
