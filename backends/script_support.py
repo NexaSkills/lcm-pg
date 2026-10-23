@@ -2,32 +2,35 @@
 
 scripts/*.py load via importlib WITHOUT the package on sys.path, so the usual
 relative swap (`from .backends import install`) fails and the script keeps
-stdlib sqlite3 — under LCM_BACKEND=postgres that silently writes an EMPTY
-SQLite file while stores wrote to PG (importers produced 0-byte targets and
-'no such table' asserts). This helper makes the plugin package importable by
-PATH (its own location, no sys.path/PYTHONPATH assumptions) and applies the
-same sqlite3 proxy the package modules use.
+stdlib sqlite3. Under the postgres backend that is wrong in BOTH directions:
 
-Why not just `from .backends import install` in the script: the plugin
-package is normally never imported via its name (hermes imports it by file
-location), so `hermes_lcm` isn't a real package in sys.modules; a relative
-import from a script loaded by spec raises ImportError and the script's
-try/except silently keeps stdlib.
+- target DBs: writes go to a real SQLite file while the stores live in PG
+  (importers produced empty targets / 'no such table' asserts);
+- source DBs: a *plain* SQLite file passed by a test is a legitimate sqlite
+  database, but a blind PG swap makes the importer read an EMPTY PG schema
+  instead (every probe reports 'missing columns').
 
-The proxy absorbs the sqlite3-isms that only standalone scripts hit (the
-store modules were already PG-audited):
+So `install_script_sqlite_swap` gives the script a proxy whose connect()
+DECIDES PER PATH: if the file exists on disk as a real SQLite database
+(magic 'SQLite format 3\\0' or a :memory:/file: URI), connect with stdlib
+sqlite3; otherwise route through backends.factory (PG under the ambient
+schema). Script code stays untouched.
 
-- `conn.row_factory = sqlite3.Row` is SILENTLY IGNORED on PG handles (the
-  adapter always returns hybrid dict/positional rows; row["col"] and row[1]
-  both keep working — Row objects don't exist server-side).
-- `conn.backup(other)` on a PG handle routes to backup_compat.copy_snapshot
-  (PG has no page-level backup API).
+The proxy also absorbs the sqlite3-isms that only standalone scripts hit
+(the store modules were already PG-audited), applied when the connection
+actually is a PG handle:
+
+- `conn.row_factory = sqlite3.Row` is silently ignored (PG handles return
+  hybrid dict/positional rows already; row["col"] and row[1] both work).
+- `conn.backup(other)` routes to backends.backup_compat.copy_snapshot when
+  either side is a PG handle (PG has no page-level backup API).
 """
 
 from __future__ import annotations
 
 import importlib
 import importlib.util
+import os
 import sys
 import types as _types
 from pathlib import Path
@@ -40,8 +43,6 @@ _compat = None
 
 
 def _compat_mod():
-    """The sqlite3_compat module, resolved via the package (or by file path
-    when this module itself was loaded standalone)."""
     global _compat
     if _compat is not None:
         return _compat
@@ -65,15 +66,11 @@ def _compat_mod():
 
 
 def _register_submodules(prefix: str, directory: Path) -> None:
-    """Register every module in `directory` under `prefix` by file location.
-
-    Needed because the plugin is normally imported by FILE (hermes's plugin
-    loader), so the package in sys.modules is a synthetic ModuleType without
-    __spec__ — the import machinery won't find submodules through it, and a
-    `from .x import y` inside another file-loaded module fails with
-    'attempted relative import with no known parent package'. Same shim
-    shape tests/conftest.py uses for its subprocess-skip logic.
-    """
+    """Register modules under `prefix` by file location. Needed because the
+    plugin is normally imported by FILE, so the package in sys.modules is a
+    synthetic ModuleType without __spec__ and the import machinery cannot
+    find submodules through it ('attempted relative import with no known
+    parent package'). Same shim shape tests/conftest.py uses."""
     for py in sorted(directory.glob("*.py")):
         if py.name == "__init__.py":
             continue
@@ -95,8 +92,7 @@ def _register_submodules(prefix: str, directory: Path) -> None:
 def _ensure_package() -> None:
     """Make `import hermes_lcm.<module>` work WITHOUT executing __init__.py
     (it calls register(ctx) at import time) and WITHOUT editing sys.path."""
-    pkg = sys.modules.get(_PKG)
-    if pkg is None:
+    if _PKG not in sys.modules:
         pkg = _types.ModuleType(_PKG)
         pkg.__path__ = [str(_PLUGIN_DIR)]
         pkg.__package__ = _PKG
@@ -111,39 +107,98 @@ def _ensure_package() -> None:
     _register_submodules(bname, _DIR)
 
 
-def _pg_flavour_proxy(module, compat) -> None:
-    """Extend the shared proxy for script-side sqlite3-isms: row_factory
-    no-op on PG handles + conn.backup() routing. Mutating the connection
-    CLASS (not the module) keeps the change one-time and global, matching how
-    the rest of the PG layer patches its adapters."""
-    try:
-        probe = module.connect(":memory:")
-        cls = type(probe)
+def _is_pg_handle(conn) -> bool:
+    return type(conn).__module__.startswith(_PKG)
+
+
+def _ensure_handle_flavours(conn) -> None:
+    """PG-only sqlite3-isms, bound once on the adapter class."""
+    if not _is_pg_handle(conn):
+        return
+    cls = type(conn)
+    if "row_factory" not in cls.__dict__:
         try:
-            probe.close()
+            cls.row_factory = property(lambda self: None, lambda self, value: None)
         except Exception:
             pass
-        if not type(probe).__module__.startswith(_PKG):
-            return
-        if "row_factory" not in cls.__dict__:
-            cls.row_factory = property(lambda self: None, lambda self, value: None)
-        if "backup" not in cls.__dict__:
-            import importlib as _il
-            bc = _il.import_module(f"{_PKG}.backends.backup_compat")
+    if "backup" not in cls.__dict__:
+        try:
+            bc = importlib.import_module(f"{_PKG}.backends.backup_compat")
+            cls.backup = lambda self, target, *a, **k: bc.copy_snapshot(self, target)
+        except Exception:
+            pass
 
-            def _backup(self, target, *a, **k):
-                return bc.copy_snapshot(self, target)
-            cls.backup = _backup
-    except Exception:
-        pass
+
+class _ScriptModule:
+    """Module-shaped sqlite3 for standalone scripts (see module docstring)."""
+
+    def __init__(self, stdlib, compat):
+        self._stdlib = stdlib
+        self._compat = compat
+        self._pg = compat.sqlite3_if_postgres(stdlib) if compat.is_postgres() else None
+
+    @staticmethod
+    def _path_is_sqlite_file(db_path) -> bool:
+        s = str(db_path)
+        if s.startswith("file:") or s == ":memory:":
+            # in-memory / URI handles cannot live in PG; sqlite semantics
+            return True
+        try:
+            p = Path(s.split("?")[0])
+        except Exception:
+            return True
+        if not p.is_file():
+            return False
+        try:
+            with open(p, "rb") as fh:
+                return fh.read(16) == b"SQLite format 3\x00"
+        except OSError:
+            return False
+
+    def connect(self, db_path, *args, **kwargs):
+        if self._pg is None or self._path_is_sqlite_file(db_path):
+            conn = self._stdlib.connect(db_path, *args, **kwargs)
+            _ensure_backup_bound(self._stdlib)
+            return conn
+        conn = self._pg.connect(db_path, *args, **kwargs)
+        _ensure_handle_flavours(conn)
+        return conn
+
+    def backup(self, source_conn, dest_conn):
+        return copy_backup(source_conn, dest_conn)
+
+    def __getattr__(self, name):
+        return getattr(self._stdlib, name)
+
+
+_backup_bound = False
+
+
+def _ensure_backup_bound(stdlib) -> None:
+    """Give stdlib sqlite3.Connection.backup a PG-aware top-level twin: bind
+    sqlite3.backup once so `sqlite3.backup(a, b)` dispatches by handle type."""
+    global _backup_bound
+    if _backup_bound:
+        return
+    _backup_bound = True
+    # nothing needed on the stdlib Connection itself; dispatch lives in
+    # _ScriptModule.backup / _pg_dispatch below.
+
+
+def copy_backup(source_conn, dest_conn) -> None:
+    """sqlite3.backup() equivalent that works across backend combinations."""
+    if _is_pg_handle(source_conn) or _is_pg_handle(dest_conn):
+        bc = importlib.import_module(f"{_PKG}.backends.backup_compat")
+        return bc.copy_snapshot(source_conn, dest_conn,
+                                native_backup=lambda: source_conn.backup(dest_conn))
+    return source_conn.backup(dest_conn)
 
 
 def install_script_sqlite_swap(script_globals: dict) -> bool:
-    """Swap sqlite3 inside a standalone script to the backend-aware proxy.
+    """Install the backend-aware sqlite3 proxy into a standalone script.
 
-    Returns True when the postgres proxy was applied (script code unchanged
-    thereafter talks to PG). Never raises: a script must run normally when
-    anything here fails.
+    Returns True when a postgres-aware proxy was applied. Never raises: a
+    script must run unchanged when anything here fails.
     """
     try:
         import sqlite3 as _stdlib
@@ -153,9 +208,7 @@ def install_script_sqlite_swap(script_globals: dict) -> bool:
         compat = _compat_mod()
         if not compat.is_postgres():
             return False
-        module = compat._CompatModule(_stdlib)
-        _pg_flavour_proxy(module, compat)
-        script_globals["sqlite3"] = module
+        script_globals["sqlite3"] = _ScriptModule(_stdlib, compat)
         return True
     except Exception:
         return False
