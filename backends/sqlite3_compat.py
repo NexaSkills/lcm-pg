@@ -19,6 +19,11 @@ Swap-in (per-module, import-time, race-free — no global monkeypatch):
         sqlite3 = install.sqlite3_if_postgres(sqlite3)
     except Exception:
         pass  # standalone/script import: keep stdlib
+
+Standalone scripts (importlib-loaded, outside the package) cannot use the
+relative-import form above; they call backends.script_support.
+install_script_sqlite_swap(globals()) instead — it imports the plugin package
+by PATH (from __file__), so it works with zero sys.path/PYTHONPATH assumptions.
 """
 
 from __future__ import annotations

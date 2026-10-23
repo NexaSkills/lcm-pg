@@ -60,7 +60,12 @@ if pkg_name not in sys.modules:
 import os as _os
 import hashlib as _hashlib
 
-if _os.environ.get("LCM_BACKEND", "sqlite").strip().lower() == "postgres":
+# The plugin's default backend is postgres (factory.backend_for). Mirror that
+# default here so test processes get PG isolation schemas even when the runner
+# forgot to export LCM_BACKEND — without this, a DSN present in ~/.hermes/.env
+# silently gave stores PG writes under an UNisolated schema (cross-run
+# contamination: idempotency tables persist, later imports fail or double-import).
+if _os.environ.setdefault("LCM_BACKEND", "postgres").strip().lower() == "postgres":
     import pytest as _pytest
 
     @_pytest.fixture(autouse=True)

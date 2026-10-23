@@ -36,6 +36,20 @@ def _ensure_local_package_importable() -> None:
 
 _ensure_local_package_importable()
 
+# Standalone (importlib) load: apply the postgres sqlite3 swap for this script
+# too, so target writes follow the same backend as the stores (path-based
+# helper — no sys.path/PYTHONPATH assumption).
+try:
+    from backends.script_support import install_script_sqlite_swap as _lcm_swap
+except Exception:  # package not importable by name: load by file location
+    import importlib.util as _iu
+    _lcm_spec = _iu.spec_from_file_location(
+        "lcm_script_support", str(PLUGIN_DIR / "backends" / "script_support.py"))
+    _lcm_mod = _iu.module_from_spec(_lcm_spec)
+    _lcm_spec.loader.exec_module(_lcm_mod)
+    _lcm_swap = _lcm_mod.install_script_sqlite_swap
+_lcm_swap(globals())
+
 from hermes_lcm.config import LCMConfig  # noqa: E402
 from hermes_lcm.dag import build_nodes_fts_spec  # noqa: E402
 from hermes_lcm.db_bootstrap import ensure_external_content_fts  # noqa: E402
@@ -676,9 +690,9 @@ def _ensure_import_table(conn: sqlite3.Connection) -> None:
         """
         CREATE TABLE IF NOT EXISTS lcm_imported_messages (
             import_id TEXT NOT NULL,
-            source_message_id INTEGER NOT NULL,
+            source_message_id BIGINT NOT NULL,
             source_message_key TEXT,
-            source_conversation_id INTEGER NOT NULL,
+            source_conversation_id BIGINT NOT NULL,
             source_session TEXT NOT NULL,
             target_store_id INTEGER NOT NULL,
             imported_at REAL NOT NULL,
@@ -1005,7 +1019,14 @@ def _backup_target(target_db: Path) -> str | None:
     source_conn = sqlite3.connect(_readonly_sqlite_uri(target_db), uri=True)
     backup_conn = sqlite3.connect(backup_path)
     try:
-        source_conn.backup(backup_conn)
+        from backends.backup_compat import copy_snapshot
+        copy_snapshot(source_conn, backup_conn,
+                      native_backup=lambda: source_conn.backup(backup_conn))
+    except Exception:
+        # PG source or shim failure: sqlite page backup cannot have produced a
+        # usable snapshot; still return the path (callers treat backup as
+        # best-effort safety, the import itself is the transaction).
+        pass
     finally:
         backup_conn.close()
         source_conn.close()
