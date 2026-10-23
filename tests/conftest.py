@@ -12,6 +12,14 @@ repo_root = str(Path(__file__).resolve().parent.parent.parent.parent)
 if repo_root not in sys.path:
     sys.path.insert(0, repo_root)
 
+# The fork dir's parent has no `agent` package; this checkout's live Hermes
+# install does (upstream checkouts live under an install root that carries
+# it). Add it so `from agent.context_engine import ContextEngine` resolves
+# exactly as it does on a live plugin load.
+_hermes_agent = Path.home() / ".hermes" / "hermes-agent"
+if _hermes_agent.is_dir() and str(_hermes_agent) not in sys.path:
+    sys.path.append(str(_hermes_agent))
+
 # Register the plugin directory as a proper package
 plugin_dir = Path(__file__).resolve().parent.parent
 pkg_name = "hermes_lcm"
