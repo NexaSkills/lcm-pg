@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
-import os
 import sys
 import types as _types
 from pathlib import Path
@@ -65,28 +64,20 @@ def _compat_mod():
         return _compat
 
 
-def _ensure_package() -> None:
-    """Register 'hermes_lcm' as a minimal package rooted at the plugin dir
-    WITHOUT executing __init__.py (it calls register(ctx) at import time).
+def _register_submodules(prefix: str, directory: Path) -> None:
+    """Register every module in `directory` under `prefix` by file location.
 
-    A plain __path__ registration is NOT enough: when the plugin was loaded
-    by file location (the normal hermes path), the top-level module object in
-    sys.modules was never produced by a real package import, so the import
-    machinery refuses to find `hermes_lcm.<submodule>` through it (no
-    __spec__/__loader__ path hook). Mirror tests/conftest.py: register every
-    sibling module explicitly by file location.
+    Needed because the plugin is normally imported by FILE (hermes's plugin
+    loader), so the package in sys.modules is a synthetic ModuleType without
+    __spec__ — the import machinery won't find submodules through it, and a
+    `from .x import y` inside another file-loaded module fails with
+    'attempted relative import with no known parent package'. Same shim
+    shape tests/conftest.py uses for its subprocess-skip logic.
     """
-    pkg = sys.modules.get(_PKG)
-    if pkg is None:
-        pkg = _types.ModuleType(_PKG)
-        pkg.__path__ = [str(_PLUGIN_DIR)]
-        pkg.__package__ = _PKG
-        sys.modules[_PKG] = pkg
-    # sibling top-level modules (store_schema, store, engine, tools, ...)
-    for py in sorted(_PLUGIN_DIR.glob("*.py")):
+    for py in sorted(directory.glob("*.py")):
         if py.name == "__init__.py":
             continue
-        name = f"{_PKG}.{py.stem}"
+        name = f"{prefix}.{py.stem}"
         if name in sys.modules:
             continue
         try:
@@ -94,32 +85,30 @@ def _ensure_package() -> None:
             if spec is None or spec.loader is None:
                 continue
             sm = importlib.util.module_from_spec(spec)
-            sm.__package__ = _PKG
+            sm.__package__ = prefix
             sys.modules[name] = sm
             spec.loader.exec_module(sm)
         except Exception:
             sys.modules.pop(name, None)
-    # the backends subpackage (if not already a package module)
+
+
+def _ensure_package() -> None:
+    """Make `import hermes_lcm.<module>` work WITHOUT executing __init__.py
+    (it calls register(ctx) at import time) and WITHOUT editing sys.path."""
+    pkg = sys.modules.get(_PKG)
+    if pkg is None:
+        pkg = _types.ModuleType(_PKG)
+        pkg.__path__ = [str(_PLUGIN_DIR)]
+        pkg.__package__ = _PKG
+        sys.modules[_PKG] = pkg
+        _register_submodules(_PKG, _PLUGIN_DIR)
     bname = f"{_PKG}.backends"
     if bname not in sys.modules:
         bmod = _types.ModuleType(bname)
         bmod.__path__ = [str(_DIR)]
         bmod.__package__ = bname
         sys.modules[bname] = bmod
-    for py in sorted(_DIR.glob("*.py")):
-        name = f"{bname}.{py.stem}"
-        if name in sys.modules or py.name == "__init__.py":
-            continue
-        try:
-            spec = importlib.util.spec_from_file_location(name, str(py))
-            if spec is None or spec.loader is None:
-                continue
-            sm = importlib.util.module_from_spec(spec)
-            sm.__package__ = bname
-            sys.modules[name] = sm
-            spec.loader.exec_module(sm)
-        except Exception:
-            sys.modules.pop(name, None)
+    _register_submodules(bname, _DIR)
 
 
 def _pg_flavour_proxy(module, compat) -> None:
