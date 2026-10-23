@@ -424,7 +424,7 @@ def _rewrite_sqlite_master(sql: str):
     m = re.match(
         r"(?is)^\s*SELECT\s+1\s+FROM\s+sqlite_master\s+WHERE\s+"
         r"(?:type\s+(?:=\s*'(?:table|view)'|IN\s*\(\s*'table'\s*,\s*'virtual\s+table'\s*\))\s+AND\s+)?"
-        r"name\s*=\s*\?\s*$",
+        r"name\s*=\s*[?%]\w*\s*$",
         sql.strip(),
     )
     if not m:
