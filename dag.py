@@ -863,6 +863,19 @@ class SummaryDAG:
     # -- Helpers ------------------------------------------------------------
 
     def _row_to_node(self, row) -> SummaryNode:
+        # PG FTS-search rows carry the content table's tsvector column plus
+        # the injected search_rank alias, which shifts search_rank past
+        # positional index 12 (the FTS rewriter collapses
+        # `FROM nodes_fts fts JOIN summary_nodes n` to `FROM summary_nodes
+        # fts` and rewrites `n.*` -> `fts.*` = summary_nodes.* incl.
+        # summary_tsv, so the SELECT-list ts_rank lands at 13, not 12).
+        # Resolve by column name when the row is mapping-like (the postgres
+        # shim's rows are dict+tuple hybrids); row[12] stays correct for
+        # sqlite rows and PG rows without the extra column.
+        if isinstance(row, dict) and "search_rank" in row:
+            _sr = row["search_rank"]
+        else:
+            _sr = row[12] if len(row) > 12 else None
         return SummaryNode(
             node_id=row[0],
             session_id=row[1],
@@ -876,7 +889,7 @@ class SummaryDAG:
             earliest_at=row[9],
             latest_at=row[10],
             expand_hint=row[11] or "",
-            search_rank=row[12] if len(row) > 12 else None,
+            search_rank=_sr,
         )
 
     def close(self) -> None:

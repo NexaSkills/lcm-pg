@@ -589,8 +589,113 @@ def _drop_trigger_pg(m: re.Match) -> str:
         " END $$;")
 
 
+_MINMAX_OPEN_RE = re.compile(r"(?i)\b(min|max)\s*\(")
+
+
+def _split_top_level(argstr: str) -> list:
+    """Split a call's argument list on depth-0 commas (quote-aware)."""
+    parts, depth, quote, buf, i = [], 0, None, [], 0
+    while i < len(argstr):
+        ch = argstr[i]
+        if quote is not None:
+            buf.append(ch)
+            if ch == quote:
+                if i + 1 < len(argstr) and argstr[i + 1] == quote:
+                    buf.append(argstr[i + 1])
+                    i += 2
+                    continue
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+        elif ch == "(":
+            depth += 1
+            buf.append(ch)
+        elif ch == ")":
+            depth -= 1
+            buf.append(ch)
+        elif ch == "," and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    parts.append("".join(buf))
+    return parts
+
+
+def _rewrite_scalar_minmax(s: str) -> str:
+    """Rewrite sqlite 2-arg scalar min(a,b)/max(a,b) -> least/greatest(a,b).
+
+    Quote-aware paren-balancing scanner, TOP-LEVEL-DOWN. SQLite's 2-arg
+    max()/min() are scalars; PG has only the 1-arg aggregate (verified live:
+    SELECT max(1,2) -> 'function max(integer, integer) does not exist',
+    SELECT max(42) works), so every 2-top-level-arg call must become
+    least()/greatest() and every 1-arg call is a real aggregate to keep.
+
+    Top-level-first ordering is what makes expressions like
+    `MIN( MAX(rep_a - rep_b, 0), 6 )` work: the OUTER scalar is rewritten
+    FIRST (a 2-arg call), which frees the inner aggregate's own text from
+    the outer call's comma; the loop then re-runs and descends. Rewriting
+    innermost-first instead would leave an illegal 2-arg aggregate call
+    (the old regex bug: `max(` grabbed the enclosing call's comma because
+    its character classes cannot see nested parens).
+
+    1-arg calls: recurse into the argument span (a scalar can hide inside
+    an aggregate's argument), keep the call itself. Text is re-scanned
+    until a fixed point so nested scalars all resolve.
+    """
+    if "min" not in s.lower() and "max" not in s.lower():
+        return s
+    pos = 0
+    while True:
+        m = _MINMAX_OPEN_RE.search(s, pos)
+        if m is None:
+            return s
+        i = m.end()
+        depth = 1
+        quote = None
+        closed = False
+        while i < len(s):
+            ch = s[i]
+            if quote is not None:
+                if ch == quote:
+                    if i + 1 < len(s) and s[i + 1] == quote:
+                        i += 2
+                        continue
+                    quote = None
+                i += 1
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    closed = True
+                    break
+            i += 1
+        if not closed:
+            return s
+        args = _split_top_level(s[m.end():i])
+        if len(args) == 2:
+            fn = "least" if m.group(1).lower() == "min" else "greatest"
+            s = s[: m.start()] + fn + "(" + args[0] + "," + args[1] + ")" + s[i + 1:]
+            pos = m.start() + 1  # rescan from the rewritten span (descend)
+            continue
+        # 1-arg aggregate: scan inside its argument, keep the call
+        inner = _rewrite_scalar_minmax(s[m.end():i])
+        if inner != s[m.end():i]:
+            s = s[: m.end()] + inner + s[i:]
+        # continue scanning siblings/tail from after this call
+        pos = i + 1
+
+
 def _rewrite_text(sql: str) -> str:
-    s = sql
+    s = _rewrite_scalar_minmax(sql)
 
     # datetime('now', mods...) -> now() ± n * interval '1 unit' [+ at time zone 'utc']
     def _mods_seconds(mods: str) -> float:
@@ -721,20 +826,6 @@ def _rewrite_text(sql: str) -> str:
 
     # x'hex' blob literals -> decode(hex)
     s = re.sub(r"\bx'([0-9a-fA-F]+)'", r"decode(hex('\1'))", s)
-
-    # SQLite 2-arg scalar min()/max() -> PG least()/greatest() (aggregate
-    # min(double, double) does not exist in PG).
-    s = re.sub(r"\bmin\s*\(\s*([^,(()]*(?:\([^()]*\))?[^,(()]*)\s*,\s*([^,(()]*(?:\([^()]*\))?[^,(()]*)\s*\)",
-               r"least(\1, \2)", s, flags=re.I)
-    s = re.sub(r"\bmax\s*\(\s*([^,(()]*(?:\([^()]*\))?[^,(()]*)\s*,\s*([^,(()]*(?:\([^()]*\))?[^,(()]*)\s*\)",
-               r"greatest(\1, \2)", s, flags=re.I)
-
-    # SQLite 2-arg scalar min()/max() -> PG least()/greatest() (aggregate
-    # min(double, double) does not exist in PG). Statement-scoped input.
-    s = re.sub(r"\bmin\s*\(\s*([^,(()]*(?:\([^()]*\))?[^,(()]*)\s*,\s*([^,(()]*(?:\([^()]*\))?[^,(()]*)\s*\)",
-               r"least(\1, \2)", s, flags=re.I)
-    s = re.sub(r"\bmax\s*\(\s*([^,(()]*(?:\([^()]*\))?[^,(()]*)\s*,\s*([^,(()]*(?:\([^()]*\))?[^,(()]*)\s*\)",
-               r"greatest(\1, \2)", s, flags=re.I)
 
     # random() -> random() works on PG; json_extract(col,'$.key') -> (col)::jsonb ->> 'key'
     s = re.sub(
@@ -1107,6 +1198,18 @@ class _Cursor:
 
     # sqlite3 parity surface
     def execute(self, sql: str, parameters: Sequence | dict | None = None):
+        _tc = getattr(self._adapter, '_trace_cb', None)
+        if _tc is not None:
+            if getattr(self, '_trace_once_skip', False):
+                self._trace_once_skip = False
+            else:
+                try:
+                    from . import trace_parity as _tp
+                    _txt = _tp.render(sql, parameters) if isinstance(sql, str) else None
+                    if _txt:
+                        _tc(_txt)
+                except Exception:
+                    pass
         # One retry for the whole dispatch: a dead physical conn (operator
         # pg_terminate_backend / server restart) is rebound by _self_heal,
         # then the statement is replayed (autocommit makes replay safe).
@@ -1969,8 +2072,11 @@ class PgConnection:
     def set_authorizer(self, *a, **k):
         pass
 
-    def set_trace_callback(self, *a, **k):
-        pass
+    def set_trace_callback(self, cb):
+        # sqlite3 parity: _Cursor.execute reports each statement
+        # (caller SQL, bound params rendered) to cb. Non-callable
+        # clears.
+        self._trace_cb = cb if callable(cb) else None
 
     def set_commit_hook(self, *a, **k):
         pass

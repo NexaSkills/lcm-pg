@@ -784,6 +784,20 @@ class _FtsCursor:
         return True
 
     def execute(self, sql, parameters=()):
+        # sqlite trace parity: report the CALLER's statement (bound params
+        # rendered) BEFORE the ts rewrite; the inner _Cursor.execute is
+        # suppressed for the dispatch below via the _tp.SUPPRESS token.
+        _disp = parameters
+        try:
+            from . import trace_parity as _tp
+            _cb = getattr(getattr(self._cur, '_adapter', None), '_trace_cb', None)
+            if _cb is not None and isinstance(sql, str):
+                _txt = _tp.render(sql, parameters)
+                if _txt:
+                    _cb(_txt)
+                    self._cur._trace_once_skip = True
+        except Exception:
+            _disp = parameters
         sql = _lcm_pg_temp_rewrite(sql)
         if self._intercept_maintenance(sql):
             self._rowcount = 0
