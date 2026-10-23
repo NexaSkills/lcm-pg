@@ -804,7 +804,8 @@ def _imported_summary_map_from_conn(conn: sqlite3.Connection, import_id: str) ->
 def _target_imported_message_map(target_db: Path, import_id: str) -> dict[int, int]:
     if not target_db.exists():
         return {}
-    conn = sqlite3.connect(_readonly_sqlite_uri(target_db), uri=True)
+    conn = _factory_ro_connect(target_db) if _pg_backend_active() \
+        else sqlite3.connect(_readonly_sqlite_uri(target_db), uri=True)
     try:
         return _imported_message_map_from_conn(conn, import_id)
     finally:
@@ -814,7 +815,8 @@ def _target_imported_message_map(target_db: Path, import_id: str) -> dict[int, i
 def _target_imported_summary_map(target_db: Path, import_id: str) -> dict[str, int]:
     if not target_db.exists():
         return {}
-    conn = sqlite3.connect(_readonly_sqlite_uri(target_db), uri=True)
+    conn = _factory_ro_connect(target_db) if _pg_backend_active() \
+        else sqlite3.connect(_readonly_sqlite_uri(target_db), uri=True)
     try:
         return _imported_summary_map_from_conn(conn, import_id)
     finally:
@@ -1006,6 +1008,25 @@ def _candidate_matches_existing_source_key(candidate: ImportCandidate, existing_
     )
 
 
+def _pg_backend_active() -> bool:
+    import os as _os
+    return _os.environ.get("LCM_BACKEND", "").strip().lower() == "postgres"
+
+
+def _factory_ro_connect(db_path):
+    """Backend read-only handle for a store path (PG or sqlite fallback)."""
+    try:
+        from hermes_lcm.backends.factory import connect as _c
+    except Exception:
+        import importlib.util as _iu
+        spec = _iu.spec_from_file_location(
+            "lcm_factory", str(PLUGIN_DIR / "backends" / "factory.py"))
+        mod = _iu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _c = mod.connect
+    return _c(db_path, mode="ro")
+
+
 def _backup_target(target_db: Path) -> str | None:
     if not target_db.exists():
         return None
@@ -1016,8 +1037,22 @@ def _backup_target(target_db: Path) -> str | None:
         backup_path = target_db.with_name(f"{target_db.name}.backup-{stamp}-{suffix}")
         suffix += 1
 
-    source_conn = sqlite3.connect(_readonly_sqlite_uri(target_db), uri=True)
-    backup_conn = sqlite3.connect(backup_path)
+    if _pg_backend_active():
+        # PG store: the file is a placeholder; the rows live in the profile
+        # schema. Read the snapshot through the backend (logical copy into
+        # the fresh sqlite destination below keeps the backup a real file).
+        source_conn = _factory_ro_connect(target_db)
+    else:
+        source_conn = sqlite3.connect(_readonly_sqlite_uri(target_db), uri=True)
+    if _pg_backend_active():
+        # the script-level swap would route a plain path to PG too; the
+        # backup destination must be a REAL sqlite file, so bypass the swap
+        # with an explicit file: URI (script_support keeps real URIs on
+        # stdlib sqlite).
+        import sqlite3 as _stdlib_sqlite3
+        backup_conn = _stdlib_sqlite3.connect(f"file:{backup_path}?mode=rwc", uri=True)
+    else:
+        backup_conn = sqlite3.connect(backup_path)
     try:
         from backends.backup_compat import copy_snapshot
         copy_snapshot(source_conn, backup_conn,

@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,22 @@ _SKIP_TABLES = {"messages_fts_docsize", "summary_nodes_fts_docsize",
 
 
 def _is_pg(conn) -> bool:
-    return type(conn).__module__.startswith("hermes_lcm")
+    # Module-name prefix alone is not reliable: under standalone/script
+    # loading the class's __module__ may be 'postgres' / 'backends.postgres'
+    # (file-path loader), not 'hermes_lcm.backends.postgres'.
+    t = type(conn)
+    mod = t.__module__ or ""
+    if mod.startswith("hermes_lcm") or mod.endswith("backends.postgres") \
+            or mod.endswith("backends.fts_conn") or mod in ("postgres", "fts_conn"):
+        return True
+    # explicit marker attributes set by the PG shim itself
+    if hasattr(conn, "_lcm_pg_handle") or hasattr(t, "_lcm_pg_handle"):
+        return True
+    # FtsConnection over PG exposes _base -> PgConnection
+    base = getattr(conn, "_base", None)
+    if base is not None and base is not conn:
+        return _is_pg(base)
+    return False
 
 
 def _unwrap(conn):
@@ -59,6 +75,80 @@ def _target_tables(conn) -> set[str]:
     return {(list(r.values())[0] if isinstance(r, dict) else r[0]) for r in cur}
 
 
+def _is_sqlite(conn) -> bool:
+    """Genuine stdlib sqlite handle (the backup destination case)."""
+    return type(conn).__module__ == "sqlite3" and type(conn).__name__ == "Connection"
+
+
+def _pg_table_ddl(conn, table: str) -> str | None:
+    """Reconstruct a CREATE TABLE for `table` from the PG catalog, in
+    sqlite-accepted form (identity PK -> INTEGER PRIMARY KEY, text/int/
+    bool/timestamp types mapped loosely — a snapshot backup needs the
+    columns, not exact PG types)."""
+    cur = conn.execute(
+        """SELECT a.attname,
+                  format_type(a.atttypid, a.atttypmod) AS t,
+                  a.attnotnull,
+                  pg_get_expr(d.adbin, d.adrelid) AS def,
+                  (a.attidentity <> '') AS ident
+           FROM pg_attribute a
+           LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+           WHERE a.attrelid = (%s || '.' || %s)::regclass
+             AND a.attnum > 0 AND NOT a.attisdropped
+           ORDER BY a.attnum""",
+        (conn_info_schema(conn), table))
+    rows = cur.fetchall()
+    cols = []
+    for r in rows:
+        d = dict(r) if not isinstance(r, dict) else r
+        name, t, notnull, defx, ident = (d["attname"], d["t"], d["attnotnull"],
+                                         d.get("def"), d.get("ident"))
+        if ident:
+            cols.append(f'"{name}" INTEGER PRIMARY KEY')
+            continue
+        base = t.split("(")[0].strip().lower()
+        if base in ("text", "character varying", "character", "citext", "uuid",
+                    "timestamp", "timestamptz", "date", "json", "jsonb", "bytea"):
+            sqlt = "TEXT"
+        elif base in ("integer", "bigint", "smallint", "numeric", "real",
+                      "double precision", "int8", "int4", "serial", "bigserial"):
+            sqlt = "INTEGER" if "double" not in base and "real" not in base and "numeric" not in base else "REAL"
+        elif base == "boolean":
+            sqlt = "INTEGER"
+        else:
+            sqlt = "TEXT"
+        piece = f'"{name}" {sqlt}'
+        if ident is False and defx and "nextval" not in defx:
+            # sqlite parses DEFAULT only for literals: strip PG type casts
+            # (''::text), keep plain literals (0, CURRENT_TIMESTAMP...).
+            lit = defx
+            if "::" in lit:
+                lit = lit[:lit.index("::")]
+            if re.match(r"^(NULL|CURRENT_TIMESTAMP|CURRENT_DATE|-?\d+(\.\d+)?)$",
+                        lit.strip(), re.I):
+                piece += f" DEFAULT {lit.strip()}"
+        if notnull and ident is not True:
+            piece += " NOT NULL"
+        cols.append(piece)
+    if not cols:
+        return None
+    return f'CREATE TABLE IF NOT EXISTS "{table}" ({", ".join(cols)})'
+
+
+def conn_info_schema(conn) -> str:
+    cur = conn.execute("SELECT current_schema()")
+    r = cur.fetchone()
+    return (list(dict(r).values())[0] if isinstance(r, dict) else r[0])
+
+
+def _replicate_sqlite_schema(src, dst) -> None:
+    """Create dst (fresh sqlite file) tables from src's PG catalog."""
+    for table in _table_names(src):
+        ddl = _pg_table_ddl(src, table)
+        if ddl:
+            dst.execute(ddl)
+
+
 def copy_snapshot(src, dst, *, native_backup=None) -> None:
     """Copy src into dst. Tries native sqlite backup first (if provided and
     applicable), falls back to a logical row copy. Raises only if everything
@@ -66,13 +156,26 @@ def copy_snapshot(src, dst, *, native_backup=None) -> None:
     if native_backup is not None and not _is_pg(src) and not _is_pg(dst):
         native_backup()
         return
-    errors = []
-    if native_backup is not None and not _is_pg(src):
+    if native_backup is not None and not _is_pg(src) and _is_sqlite(dst):
+        # both plain sqlite: native page backup
         try:
             native_backup()
             return
         except Exception as exc:
-            errors.append(f"native backup: {exc}")
+            errors_init = [f"native backup: {exc}"]
+        else:
+            return
+    else:
+        errors_init = []
+    errors = list(errors_init)
+    if _is_sqlite(dst):
+        # destination is a fresh sqlite FILE: materialise the schema from
+        # the source (CREATE copies keep the backup a self-contained real
+        # sqlite database; row INSERTs below fill it).
+        try:
+            _replicate_sqlite_schema(src, dst)
+        except Exception as exc:
+            errors.append(f"schema replicate: {exc}")
     try:
         dst_tables = _target_tables(dst)
     except Exception as exc:
