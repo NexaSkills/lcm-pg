@@ -66,7 +66,10 @@ if _os.environ.get("LCM_BACKEND", "sqlite").strip().lower() == "postgres":
     @_pytest.fixture(autouse=True)
     def _lcm_pg_test_isolation(tmp_path, monkeypatch):
         tag = _hashlib.sha1(str(tmp_path).encode()).hexdigest()[:10]
-        name = f"lcm_t_{tag}"
+        # under pytest-xdist each worker's tmp_path base differs, but make the
+        # schema per-process-unique anyway (pid) so parallel workers can never
+        # collide even with custom basetemp setups.
+        name = f"lcm_t_{tag}_{_os.getpid() % 100000}"
         monkeypatch.setenv("LCM_PG_SCHEMA", name)
         yield
         # drop the test schema (idempotent GC; connection is lazy so this is
