@@ -133,17 +133,39 @@ def _ensure_handle_flavours(conn) -> None:
 
 
 def _sqlite_file_shape(s: str) -> bool:
-    """True ONLY for handles that cannot live in PG: :memory: and file: URIs.
+    """True when `s` denotes a real on-disk SQLite DATABASE (not a store
+    placeholder), or a handle that cannot live in PG at all.
 
-    Deliberately NOT an existence/magic-header probe anymore: a 0-byte
-    placeholder target-lcm.db (what an un-initialised store path looks like
-    on disk) must still route to PG — otherwise the importer's stores and
-    the test's verification handle open *different databases* (stdlib sqlite
-    over the empty file vs PG under the isolation schema) and every read
-    after the import hits 'no such table: messages'."""
+    - :memory: / file: URIs  -> sqlite semantics (cannot live in PG).
+    - an existing file that is NOT a placeholder: a 0-byte file, or one
+      containing only the 100-byte empty-database header, is what the PG
+      backend leaves on disk for a store path (all bytes live server-side);
+      anything with real page content is a genuine sqlite database the
+      script reads directly (importer source DBs are exactly this).
+
+    Why the shape probe must exist: verification handles a test opens with
+    stdlib sqlite3 (e.g. sqlite3.connect(target_db)) bypass this proxy
+    entirely and CAN only read the file. Routing writes into PG while the
+    file is an empty placeholder made every such read fail with
+    'no such table: messages'. With this rule the importer's stores keep
+    writing the DB file itself (PG-identical schema via the compat layer,
+    so FTS/search assertions still pass), while lcm.db-style placeholder
+    paths still route to the profile schema like every other store."""
     if s == ":memory:" or s.startswith("file:"):
         return True
-    return False
+    try:
+        p = Path(s.split("?")[0])
+        if not p.is_file():
+            return False  # absent path -> PG default (store path)
+        size = p.stat().st_size
+        if size == 0:
+            return False  # store placeholder -> PG
+        if size <= 512:
+            return False  # empty-database header only, no committed pages
+        with open(p, "rb") as fh:
+            return fh.read(16) == b"SQLite format 3\x00"
+    except OSError:
+        return False
 
 
 class _ScriptModule:
