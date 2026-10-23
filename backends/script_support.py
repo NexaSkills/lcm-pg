@@ -133,20 +133,17 @@ def _ensure_handle_flavours(conn) -> None:
 
 
 def _sqlite_file_shape(s: str) -> bool:
-    """True when `s` cannot be a store path: :memory:, file: URIs, or an
-    existing on-disk file with the SQLite magic header. The importer's
-    fixture/source DBs are exactly this shape; store DBs are lcm*.db paths
-    whose content lives in PG (the file is a 0-byte placeholder)."""
+    """True ONLY for handles that cannot live in PG: :memory: and file: URIs.
+
+    Deliberately NOT an existence/magic-header probe anymore: a 0-byte
+    placeholder target-lcm.db (what an un-initialised store path looks like
+    on disk) must still route to PG — otherwise the importer's stores and
+    the test's verification handle open *different databases* (stdlib sqlite
+    over the empty file vs PG under the isolation schema) and every read
+    after the import hits 'no such table: messages'."""
     if s == ":memory:" or s.startswith("file:"):
         return True
-    try:
-        p = Path(s.split("?")[0])
-        if not p.is_file():
-            return False
-        with open(p, "rb") as fh:
-            return fh.read(16) == b"SQLite format 3\x00"
-    except OSError:
-        return False
+    return False
 
 
 class _ScriptModule:
