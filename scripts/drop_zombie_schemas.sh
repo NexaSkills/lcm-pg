@@ -67,7 +67,8 @@ declare r record; n bigint;
 begin
   n := 0;
   for r in select tablename from pg_tables where schemaname='$s'
-             and tablename not in ('metadata','lcm_migration_state','lcm_deploy_migrations') loop
+             and tablename not in ('metadata','lcm_migration_state','lcm_deploy_migrations',
+                                   'lcm_lifecycle_state') loop
     execute format('select count(*) from %I.%I', '$s', r.tablename) into n;
     if n > 0 then
       raise notice 'DATAROWS %', n;
