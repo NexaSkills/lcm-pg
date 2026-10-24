@@ -96,6 +96,22 @@ def _migrate_config(path: Path, plugin_live: bool, dry: bool) -> None:
     if isinstance(disabled, list) and "lcm-pg" in disabled:
         plugins["disabled"] = [x for x in disabled if x != "lcm-pg"]
         actions.append("disabled -= lcm-pg (would defeat deploy)")
+    # context.engine: the profile MUST opt into the lcm engine. Consumption
+    # (agent/agent_init.py _select_context_engine): missing context (or
+    # missing engine) falls back to "compressor" = built-in lossy
+    # summarization — the lcm-pg engine never runs and the profile's context
+    # is NOT lossless. fleet default policy: a profile with NO context block
+    # inherits the fleet default (root config sets engine: lcm everywhere),
+    # so leave it unset; an EXPLICIT different engine (e.g. engine: default)
+    # defeats lcm-pg for that profile and is flipped to lcm.
+    ctx = data.get("context")
+    if isinstance(ctx, dict):
+        eng = ctx.get("engine")
+        if eng is not None and eng != "lcm":
+            ctx["engine"] = "lcm"
+            actions.append(f"context.engine {eng!r} -> lcm (else built-in compressor runs; not lossless)")
+    elif ctx is not None and not isinstance(ctx, dict):
+        _fail(f"{path}: context is not a mapping")
     if not actions:
         return
     if dry:
@@ -103,6 +119,45 @@ def _migrate_config(path: Path, plugin_live: bool, dry: bool) -> None:
         return
     if _backup_write(path, yaml.safe_dump(data, sort_keys=False)):
         print(f"{'; '.join(actions)} -> {path.name} ({path.parent})")
+
+
+def _env_schema_stripping(dry: bool) -> None:
+    """Remove stray LCM_PG_SCHEMA pins from root + profile .env files.
+    The fork's factory honours LCM_PG_SCHEMA ABOVE the per-profile derivation
+    (backends/factory.py: schema = LCM_PG_SCHEMA or schema_for_profile(home)).
+    Since the host-wide LCM_DATABASE_PATH boundary pin already forces the
+    dbpath-parent derivation, ANY LCM_PG_SCHEMA pin (e.g. the manual
+    LCM_PG_SCHEMA=lcm_mike applied on trade) freezes that surface onto ONE
+    schema for every profile — breaking per-profile isolation across webui,
+    cli, telegram and dashboard. Derivation from HERMES_HOME is the correct
+    mechanism; strip the override so it works again. Backed up first."""
+    envs = [HERMES / ".env"]
+    if (HERMES / "profiles").is_dir():
+        envs += sorted((HERMES / "profiles").glob("*/.env"))
+    for ef in envs:
+        if not ef.is_file():
+            continue
+        # root .env IS the daemon env (EnvironmentFile in the units): pinning
+        # LCM_PG_SCHEMA there would freeze EVERY profile onto one schema.
+        # Profile .env files apply only to profile-scoped daemons. Strip any
+        # pin — the derivation below (HERMES_HOME/dbpath) is the mechanism.
+        try:
+            lines = ef.read_text().splitlines(keepends=True)
+        except Exception as e:
+            _fail(f"read {ef}: {e}")
+            continue
+        hit = [i for i, l in enumerate(lines) if l.lstrip().startswith("LCM_PG_SCHEMA=")]
+        if not hit:
+            continue
+        if dry:
+            print(f"dry: strip LCM_PG_SCHEMA -> {ef}")
+            continue
+        try:
+            shutil.copy2(ef, f"{ef}.pre-lcm-pg-migration.{TS}")
+            ef.write_text("".join(l for i, l in enumerate(lines) if i not in hit))
+            print(f"env: stripped LCM_PG_SCHEMA -> {ef.name} ({ef.parent}) (per-profile derivation restored)")
+        except Exception as e:
+            _fail(f"rewrite {ef}: {e}")
 
 
 def _overlay_dirs(dry: bool) -> None:
@@ -157,6 +212,7 @@ def main() -> int:
         return 0
     for cfg in _configs():
         _migrate_config(cfg, plugin_live, args.dry_run)
+    _env_schema_stripping(args.dry_run)
     _overlay_dirs(args.dry_run)
     print(f"migrate-config: {'dry' if args.dry_run else 'done'}; errors={_St.errors}")
     return 1 if _St.errors else 0

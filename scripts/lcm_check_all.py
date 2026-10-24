@@ -334,11 +334,36 @@ def s_params(schemas):
     dbp = keys.get("LCM_DATABASE_PATH", "MISSING")
     add("PARAMS", "boundary-pin:env", "PASS" if dbp == pinned else "FAIL",
         f"LCM_DATABASE_PATH={dbp} (expected {pinned}; pin via lcm_update.sh)")
+    # context.engine per profile: 'lcm' (or inherited via absent block) is
+    # required; anything else (compressor/default) means that profile runs
+    # the BUILT-IN lossy compressor and lcm-pg capture/rollup never runs.
+    # Root value recorded once for context.
+    try:
+        import yaml
+        try:
+            rd = yaml.safe_load((HERMES_HOME / "config.yaml").read_text()) or {}
+        except Exception:
+            rd = {}
+        rctx = (rd.get("context") or {}) if isinstance(rd.get("context"), dict) else {}
+        add("PARAMS", "context-engine:root", "PASS" if rctx.get("engine") == "lcm" else "WARN",
+            f"engine={rctx.get('engine', '<unset -> built-in compressor>')}")
+    except Exception:
+        rctx = {}
     for f in sorted((HERMES_HOME / "profiles").glob("*/config.yaml")) if (HERMES_HOME / "profiles").is_dir() else []:
         p = f.parent.name
         try:
             import yaml
             d = yaml.safe_load(f.read_text()) or {}
+            ctx = d.get("context") if isinstance(d.get("context"), dict) else {}
+            eng = ctx.get("engine")
+            if eng == "lcm":
+                add("PARAMS", f"context-engine:{p}", "PASS", "engine=lcm")
+            elif eng is None:
+                add("PARAMS", f"context-engine:{p}", "PASS" if rctx.get("engine") == "lcm" else "WARN",
+                    f"unset (inherits root engine={rctx.get('engine', '<unset>')})")
+            else:
+                add("PARAMS", f"context-engine:{p}", "FAIL",
+                    f"engine={eng!r} defeats lcm-pg for this profile (run lcm_update.sh / migrate_hermes_lcm_config.py)")
             comp = (d.get("compression") or {})
             aux = (d.get("auxiliary") or {}).get("compression") or {}
             md = (d.get("model") or {}).get("default")
