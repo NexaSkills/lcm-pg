@@ -477,6 +477,11 @@ def s_residue():
 def main():
     s_version()
     s_cluster()
+    # RESIDUE first: it converges droppable non-profile schemas (recreates an
+    # empty canonical shell). If it ran after the STRUCTURE verifiers, those
+    # verifiers would FAIL a half-built schema the residue pass was about to
+    # heal — same-run verdicts must reflect the repaired inventory.
+    s_residue()
     schemas = s_schemas()
     s_structure(schemas)
     s_verifier(schemas)
@@ -484,7 +489,6 @@ def main():
     s_recall(schemas)
     s_timers()
     s_params(schemas)
-    s_residue()
     fails = [r for r in ROWS if r["status"] == "FAIL"]
     warns = [r for r in ROWS if r["status"] in ("WARN", "VERIFIER-BUG")]
     host = os.uname().nodename
