@@ -1882,6 +1882,15 @@ class PgConnection:
                 # COMMIT ran mid-scope), skip the statement — sqlite would have
                 # no tx either and its RELEASE would error, but a skipped
                 # no-op keeps the parity layer from crashing the whole write.
+                # ROLLBACK TO also decrements the depth: when it closed the
+                # outermost synthetic savepoint, _guarded_one already committed
+                # and ended the tx (depth==0, _synthetic_tx cleared, tx closed)
+                # — a passthrough RELEASE would then raise NoActiveSqlTransaction.
+                # sqlite's outermost ROLLBACK TO already discarded the savepoint,
+                # so its matching RELEASE is a no-op anyway: skip it.
+                if getattr(self, "_savepoint_depth", 0) <= 0 and not self._tx_open:
+                    self._synthetic_tx = False
+                    return ("SELECT 1", ())
                 return (stripped, ())
         if isinstance(params, dict):
             return _rewrite_text(stripped), params
