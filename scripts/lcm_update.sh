@@ -135,6 +135,47 @@ BOUNDARY_DB="$HOME_DIR/lcm-pg/data/lcm.db"
 mkdir -p "$HOME_DIR/lcm-pg/data"
 env_files=("$HOME_DIR/.hermes/.env")
 [[ -d "$HOME_DIR/.hermes/profiles" ]] && env_files+=("$HOME_DIR"/.hermes/profiles/*/.env)
+
+# ---- 3c. plugin overlay for EVERY profile (incl. profiles created after the
+# install). Discovery only finds hermes-lcm through a per-profile symlink;
+# a profile dir without one silently loads NO lcm plugin (tools missing from
+# its catalog) and falls back to a zero-byte per-profile lcm.db. Do it even
+# when the profile has no .env yet.
+if [[ -d "$HOME_DIR/.hermes/profiles" && ( -e "$HOME_DIR/.hermes/plugins/lcm-pg" || -L "$HOME_DIR/.hermes/plugins/lcm-pg" ) ]]; then
+  for pd in "$HOME_DIR"/.hermes/profiles/*/; do
+    prof="$pd/plugins"
+    lp="$prof/hermes-lcm"
+    mkdir -p "$prof"
+    if [[ -L "$lp" ]]; then
+      tgt=$(readlink "$lp")
+      [[ "$tgt" == "$HOME_DIR/.hermes/plugins/lcm-pg" ]] || {
+        log "overlay: relink $lp (was -> $tgt)"
+        rm -f "$lp"; ln -s "$HOME_DIR/.hermes/plugins/lcm-pg" "$lp"; }
+    elif [[ -e "$lp" ]]; then
+      log "overlay: $lp is a real dir/copy (version drift); moving aside"
+      mv "$lp" "$lp.retired.$(date +%Y%m%d%H%M%S)"
+      ln -s "$HOME_DIR/.hermes/plugins/lcm-pg" "$lp"
+    else
+      ln -s "$HOME_DIR/.hermes/plugins/lcm-pg" "$lp"
+      log "overlay: created $lp -> root plugin"
+    fi
+    # a routed profile's .env must carry the backend+DSN the daemons get from
+    # the root .env, else a profile-local session can write a per-profile
+    # lcm.db instead of the shared cluster (pluginless fallback).
+    src_env="$HOME_DIR/.hermes/.env"
+    penv="$pd.env"
+    if [[ -f "$src_env" ]]; then
+      for k in LCM_BACKEND LCM_PG_DSN LCM_DATABASE_PATH; do
+        val=$(grep -m1 "^${k}=" "$src_env" | cut -d= -f2-) || true
+        [[ -n "$val" ]] || continue
+        if [[ ! -f "$penv" ]] || ! grep -q "^${k}=" "$penv"; then
+          printf '%s=%s\n' "$k" "$val" >> "$penv"
+          log "overlay-env: $k -> $penv"
+        fi
+      done
+    fi
+  done
+fi
 for ef in "${env_files[@]}"; do
   [[ -f "$ef" ]] || continue
   if grep -q '^LCM_DATABASE_PATH=' "$ef"; then
@@ -146,6 +187,17 @@ for ef in "${env_files[@]}"; do
     log "boundary-pin: LCM_DATABASE_PATH=$BOUNDARY_DB -> $ef"
   fi
 done
+
+# ---- 3d. plugin migration hermes-lcm -> lcm-pg (assumed on every host) ------
+# The deploy ASSUMES the host is migrating FROM the upstream hermes-lcm plugin
+# TO lcm-pg: code migration happened in step 1 (materialize) and overlays in
+# 3c; this converges plugins.enabled in root + every profile config.yaml
+# (enabled += lcm-pg, - hermes-lcm once the lcm-pg plugin dir is live;
+# disabled -= lcm-pg). Idempotent; backs up each touched file.
+if [[ -z "$DRY" ]]; then
+  _py="$HOME/lcm-pg/venv/bin/python"; [[ -x "$_py" ]] || _py=python3
+  log "plugin-migration: $($_py "$PLUGIN_DIR/scripts/migrate_hermes_lcm_config.py" 2>&1 | tail -4)"
+fi
 
 # ---- 4. restart hermes surfaces (discovered; profile units skipped) --------
 if [[ $DO_RESTART -eq 1 && -z "$DRY" ]]; then

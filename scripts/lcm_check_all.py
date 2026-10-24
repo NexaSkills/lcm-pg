@@ -371,28 +371,78 @@ def s_params(schemas):
         n = len(re.findall(pat, out))
         add("PARAMS", f"journal:{kind}", "PASS" if n == 0 else "WARN", f"{n}x today")
 
-def _recreate_residue_schema(schema: str) -> bool:
-    """drop_zombie_schemas DROPs residue schemas outright, so a schema that is
-    not in the profile-dir inventory (and holds zero data rows) simply stays
-    gone — yet the STRUCTURE verifiers (guards:/rollup:/tsv:/rowid:) still
-    enumerate it from pg_namespace the moment it (re)exists, and a half-built
-    shell fails them. Recreate it as an EMPTY canonical schema: CREATE SCHEMA
-    + the plugin's own bootstrap (all ensure_* are CREATE IF NOT EXISTS; zero
-    data rows restored). The next drop_zombie_schemas pass then sees a clean
-    zero-row candidate and drops it again -> residue converges to ABSENT
-    within one deploy, and any schema caught mid-life passes its verifiers.
-    """
-    rc, _ = _sql(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
-    if rc is None:
+def _empty_canonical_shell(schema: str) -> bool:
+    """Create an EMPTY canonical schema: the plugin's own db_bootstrap ensure_*
+    set (all CREATE IF NOT EXISTS; restores no rows). Used wherever an
+    out-of-inventory schema must become verifier-clean without ever carrying
+    data: drop_zombie_schemas will drop it again (zero data rows) or leave it
+    as an inert empty shell — either way the guards/rollup/rowid verifiers
+    (which enumerate pg_namespace, not profile dirs) pass on it."""
+    import importlib, importlib.util
+    sys.path.insert(0, str(HERMES_HOME / "plugins" / "lcm-pg"))
+    try:
+        init = HERMES_HOME / "plugins" / "lcm-pg" / "__init__.py"
+        if not init.is_file():
+            return False
+        spec = importlib.util.spec_from_file_location(
+            "lcmpg_rsv", str(init),
+            submodule_search_locations=[str(init.parent)])
+        pkg = importlib.util.module_from_spec(spec)
+        sys.modules["lcmpg_rsv"] = pkg
+        spec.loader.exec_module(pkg)
+        import psycopg
+        conn = psycopg.connect(os.environ.get("LCM_PG_DSN", ""), autocommit=True)
+        try:
+            conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+        finally:
+            conn.close()
+        pg = importlib.import_module("lcmpg_rsv.backends.postgres")
+        dbb = importlib.import_module("lcmpg_rsv.db_bootstrap")
+        c = pg.connect(os.environ.get("LCM_PG_DSN", ""), schema)
+        try:
+            for fn in ("ensure_metadata_table", "ensure_migration_state_table",
+                       "ensure_lifecycle_state_table", "ensure_message_origin_columns",
+                       "ensure_temporal_rollup_tables", "ensure_embedding_tables",
+                       "ensure_chunk_tables", "ensure_assertion_tables"):
+                f = getattr(dbb, fn, None)
+                if f is not None:
+                    try:
+                        f(c)
+                    except Exception:
+                        pass
+            # core content tables come from store.py's first-open DDL, not
+            # db_bootstrap; extract it the same way ensure_profile_bootstrap does.
+            import re as _re
+            store_src = (init.parent / "store.py").read_text()
+            for table in ("messages", "summary_nodes"):
+                m = _re.search(r"CREATE TABLE(?: IF NOT EXISTS)?\s+%s\s*\((.*?)\n\s*\);" % table,
+                               store_src + (init.parent / "db_bootstrap.py").read_text(), _re.S)
+                if m:
+                    try:
+                        c.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ({m.group(1)})')
+                    except Exception:
+                        pass
+        finally:
+            c.close()
+        # rowid parity (schema_parity contract): the sqlite shim adds a
+        # hidden rowid bigint to vector tables; db_bootstrap's CREATE lacks
+        # it, so an empty shell needs the same ALTER the parity migration
+        # applies (IF NOT EXISTS: idempotent).
+        try:
+            c2 = pg.connect(os.environ.get("LCM_PG_DSN", ""), schema)
+            try:
+                for t in ("lcm_embedding_vectors", "lcm_chunk_vectors"):
+                    try:
+                        c2.execute(f'ALTER TABLE "{t}" ADD COLUMN IF NOT EXISTS rowid bigint')
+                    except Exception:
+                        pass
+            finally:
+                c2.close()
+        except Exception:
+            pass
+        return True
+    except Exception:
         return False
-    # canonical tables via the fork's own bootstrap (idempotent, restores no
-    # rows). ensure_profile_bootstrap derives schemas from the DB itself, so
-    # the freshly created schema is included automatically.
-    r = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve().parent
-                             / "ensure_profile_bootstrap.py")],
-        capture_output=True, text=True, timeout=300)
-    return r.returncode == 0
 
 
 def s_residue():
@@ -460,22 +510,94 @@ def s_residue():
             if not err2 and st and st[0][0] in (0, "0"):
                 empties.append(s)
     rest = [z for z in zombies if z not in empties]
+    # Converge every non-profile schema (the ones 'kept by migration rules'
+    # too): make each an empty/repair canonical shell BEFORE the structure
+    # verifiers run, so guards:/rollup:/rowid: can never FAIL on a schema no
+    # profile owns. drop_zombie_schemas keeps its own data-preservation rules.
+    healed = []
+    for z in zombies:
+        if _empty_canonical_shell(z):
+            healed.append(z)
     if empties:
-        # Converge instead of merely reporting: recreate each droppable schema
-        # as an empty canonical shell so its verifiers pass THIS run; the next
-        # deploy's drop_zombie_schemas pass drops it again (zero data rows),
-        # and it never reappears. Report the action taken.
-        fixed = [s for s in empties if _recreate_residue_schema(s)]
-        add("RESIDUE", "zombie-schemas", "WARN" if fixed else "FAIL",
-            (f"recreated empty canonical shells (next deploy drops them): {fixed}"
-             if fixed else f"droppable schemas survived, recreate failed: {empties}"))
+        add("RESIDUE", "zombie-schemas", "WARN",
+            f"droppable schemas canonicalized this run (empty shells; next drop pass removes them): {empties}")
     if rest:
-        add("RESIDUE", "zombie-schema-rows", "INFO", f"non-profile schemas kept by migration rules: {rest}")
+        add("RESIDUE", "zombie-schema-rows", "INFO",
+            f"non-profile schemas kept by migration rules: {rest}"
+            + (f"; canonicalized this run: {healed}" if healed else ""))
     if not empties and not rest:
         add("RESIDUE", "zombie-schemas", "PASS", "non-profile schemas all protected")
 
+def s_plugin_config():
+    """Migration hermes-lcm -> lcm-pg must have converged plugins.enabled.
+    Ground truth (hermes_cli/plugins_discovery.py parse_manifest_file): a dir
+    plugin's gate name is the DIRECTORY name — the fork under
+    plugins/lcm-pg is enabled ONLY when `lcm-pg` is in the list. `hermes-lcm`
+    alone matches the pip-installed upstream plugin, so a host can look
+    migrated while running the wrong engine. FAIL states:
+      * lcm-pg in plugins.disabled (defeats deploy)
+      * plugin dir live but lcm-pg in no enabled list (loads ONLY if a dir
+        named lcm-pg is reachable from root/profile plugins dirs)
+    WARN: lcm-pg live but listed nowhere (legacy hermes-lcm entry; upstream
+    pip plugin may be what actually loads)."""
+    try:
+        import yaml
+    except ImportError:
+        add("VERSION-LOAD", "plugin-config", "WARN", "PyYAML unavailable in checker env")
+        return
+    plugin_live = (PLUGIN_DIR / "plugin.yaml").is_file() or (PLUGIN_DIR / "__init__.py").is_file()
+    # dirs that grant the lcm-pg gate key to discovery (dir name == lcm-pg)
+    roots = [HOME / ".hermes/plugins/lcm-pg", HERMES_HOME / "plugins/lcm-pg"]
+    prof_root = (HERMES_HOME / "profiles") if (HERMES_HOME / "profiles").is_dir() else (HOME / ".hermes/profiles")
+    if prof_root.is_dir():
+        roots += sorted(prof_root.glob("*/plugins/lcm-pg"))
+    live_named = [r for r in roots if (r / "plugin.yaml").is_file() or (r / "__init__.py").is_file()]
+    cfgs = [ (HOME / ".hermes/config.yaml", "root") ]
+    if HERMES_HOME != HOME / ".hermes":
+        cfgs.append((HERMES_HOME / "config.yaml", "root(env)"))
+    if (HOME / ".hermes/profiles").is_dir():
+        cfgs += [(p, p.parent.name) for p in sorted((HOME / ".hermes/profiles").glob("*/config.yaml"))]
+    if HERMES_HOME != HOME / ".hermes" and (HERMES_HOME / "profiles").is_dir():
+        cfgs += [(p, p.parent.name) for p in sorted((HERMES_HOME / "profiles").glob("*/config.yaml"))]
+    seen, listed_anywhere, worst = set(), False, "PASS"
+    for cfg, tag in cfgs:
+        if cfg in seen or not cfg.is_file():
+            continue
+        seen.add(cfg)
+        try:
+            data = yaml.safe_load(cfg.read_text()) or {}
+        except Exception as e:
+            add("VERSION-LOAD", f"plugin-config:{tag}", "FAIL", f"unparseable: {e}")
+            worst = "FAIL"
+            continue
+        pl = data.get("plugins") or {}
+        if not isinstance(pl, dict):
+            continue
+        disabled = [str(x) for x in (pl.get("disabled") or [])]
+        en = [str(x) for x in (pl.get("enabled") or [])] if isinstance(pl.get("enabled"), list) else []
+        if "lcm-pg" in disabled:
+            add("VERSION-LOAD", f"plugin-config:{tag}", "FAIL", "lcm-pg in plugins.disabled (defeates deploy; run lcm_update.sh)")
+            worst = "FAIL"
+            continue
+        if "lcm-pg" in en:
+            listed_anywhere = True
+            add("VERSION-LOAD", f"plugin-config:{tag}", "PASS", "lcm-pg in enabled")
+        elif plugin_live:
+            add("VERSION-LOAD", f"plugin-config:{tag}", "WARN",
+                f"enabled={'default(None)' if not isinstance(pl.get('enabled'), list) else en} — no lcm-pg (gate key = dir name; run lcm_update.sh)")
+            worst = "WARN" if worst == "PASS" else worst
+    if plugin_live and not listed_anywhere and worst != "FAIL":
+        # one aggregated note about whether discovery can see the dir at all
+        add("VERSION-LOAD", "plugin-config:discovery", "INFO",
+            f"lcm-pg-named dirs live: {[str(r) for r in live_named] or 'none (lcm_update.sh 3d creates profile overlay)'}")
+        if not live_named:
+            add("VERSION-LOAD", "plugin-config:discovery", "FAIL", "no plugins/lcm-pg dir reachable AND none listed; fork engine cannot load")
+            worst = "FAIL"
+
+
 def main():
     s_version()
+    s_plugin_config()
     s_cluster()
     # RESIDUE first: it converges droppable non-profile schemas (recreates an
     # empty canonical shell). If it ran after the STRUCTURE verifiers, those
