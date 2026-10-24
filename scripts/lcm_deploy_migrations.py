@@ -29,6 +29,7 @@ MIGRATIONS = [
     ("fix_guard_triggers",  "py", "scripts/fix_guard_triggers.py"),
     ("fix_rollup_shape",    "sh", "scripts/fix_rollup_shape.sh"),
     ("fix_sequences",       "sql", "scripts/fix_sequences.sql"),
+    ("drop_zombie_schemas", "sh", "scripts/drop_zombie_schemas.sh"),
 ]
 
 def _dsn():
@@ -121,7 +122,15 @@ def main():
             if have == str(a.ref) and not a.force:
                 print(f"SKIP {schema} {mid} (stamped @{have})")
                 continue
-            ok, detail = _run(mid, schema, a.dry_run)
+            if mid == "drop_zombie_schemas":
+                # whole-database scope: the script itself enumerates every
+                # schema and never drops the one it is stamped into. Run it
+                # once, stamped into lcm_default only.
+                if schema != "lcm_default":
+                    continue
+                ok, detail = _run(mid, schema, a.dry_run)
+            else:
+                ok, detail = _run(mid, schema, a.dry_run)
             if ok:
                 if not a.dry_run:
                     _ensure_marker(conn, schema)

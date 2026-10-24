@@ -387,6 +387,30 @@ def s_residue():
     rows, _ = _sql("select nspname from pg_namespace where nspname ~ 'lcm_(probe|tmp)[^_]*'")
     for (s,) in rows or []:
         add("RESIDUE", f"probe:{s}", "INFO", "leftover probe schema (remove via migration on dev host)")
+    # zombie schemas: lcm_* with zero data rows and no backing profile dir
+    # (legacy sqlite auto-creep). drop_zombie_schemas migration removes them
+    # at deploy; any survivor is a FAIL row until it does.
+    profs = sorted(p.name for p in (HERMES_HOME / "profiles").glob("*/")) if (HERMES_HOME / "profiles").is_dir() else []
+    live = {"lcm_default", "lcm__deleted"} | {f"lcm_{p}" for p in profs if p != ".deleted"}
+    zrows, _ = _sql("select nspname from pg_namespace where nspname like 'lcm\\_%' "
+                    "and nspname not like 'lcm\\_test%' and nspname <> 'lcm_public'")
+    zombies = [r[0] for r in (zrows or []) if r[0] not in live]
+    if zombies:
+        # confirm they are really empty before flagging FAIL vs INFO
+        empties = []
+        for s in zombies:
+            n, err = _sql(f"select coalesce(sum(n_live_tup),0) from pg_stat_user_tables "
+                          f"where schemaname='{s}' and relname in ('messages','summary_nodes')")
+            if not err and (n or [[None]])[0][0] in (0, "0", None):
+                empties.append(s)
+        rest = [z for z in zombies if z not in empties]
+        if empties:
+            add("RESIDUE", "zombie-schemas", "FAIL",
+                f"empty non-profile schemas present (drop_zombie_schemas not applied?): {empties}")
+        if rest:
+            add("RESIDUE", "zombie-schema-rows", "WARN", f"non-profile schemas WITH rows (hand-check): {rest}")
+    else:
+        add("RESIDUE", "zombie-schemas", "PASS", "no empty non-profile lcm_* schemas")
 
 def main():
     s_version()
