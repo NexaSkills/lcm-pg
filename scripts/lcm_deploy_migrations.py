@@ -161,6 +161,14 @@ def main():
                 fails += 1
                 print(f"FAIL {schema} {mid} | {detail[:300]}")
     conn.close()
+    # FINAL self-heal: some stamped migrations (fix_guard_triggers rebuild
+    # path, drop_zombie_schemas cascade) can leave a schema's 6-name
+    # assertion-guard set incomplete. The IF-NOT-EXISTS ensure pass restores
+    # it last, so every deploy ends guard-converged regardless of what the
+    # stamped loop did in between.
+    okg3, detailg3 = _run("ensure_assertion_guards", "__all__", a.dry_run)
+    print(("OK   " if okg3 else "FAIL ") + "final ensure_assertion_guards | " + detailg3[-200:])
+    fails = fails + (0 if okg3 else 1)
     print(f"migrations: {len(schemas)} schemas x {len(MIGRATIONS)} migrations, failures={fails}")
     return 1 if fails else 0
 
