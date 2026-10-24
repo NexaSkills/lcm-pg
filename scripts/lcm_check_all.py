@@ -162,7 +162,10 @@ def s_schemas():
     if phantoms:
         add("SCHEMAS", "phantom", "WARN", f"double-prefixed schemas (ensure_schemas bug): {phantoms}")
     profs = sorted(p.name for p in (HERMES_HOME / "profiles").glob("*/")) if (HERMES_HOME / "profiles").is_dir() else []
-    expect = {"lcm_default"} | {f"lcm_{p}" for p in profs}
+    # profiles.glob("*/") matches ".deleted/" itself -> would demand an
+    # "lcm_.deleted" schema that must never exist (deletion graveyard schema
+    # is lcm__deleted, created ad hoc by the delete flow, not per-profile).
+    expect = {"lcm_default"} | {f"lcm_{p}" for p in profs if p != ".deleted"}
     missing = sorted(expect - set(schemas))
     residue = sorted(s for s in schemas if re.search(r"(probe|tmp)\d*$", s) or s.endswith("_legacy"))
     add("SCHEMAS", "inventory", "PASS" if not missing else "FAIL",
