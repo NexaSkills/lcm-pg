@@ -372,6 +372,12 @@ def s_params(schemas):
         add("PARAMS", f"journal:{kind}", "PASS" if n == 0 else "WARN", f"{n}x today")
 
 def s_residue():
+    # profile-dir inventory is needed for both the zombie check and telemetry
+    global _PROFILE_SCHEMAS
+    _PROFILE_SCHEMAS = {"lcm_default", "lcm__deleted"}
+    if (HERMES_HOME / "profiles").is_dir():
+        _PROFILE_SCHEMAS |= {f"lcm_{p.name}" for p in (HERMES_HOME / "profiles").glob("*/")
+                             if p.name != ".deleted"}
     rc, out = sh(["journalctl", "--user", "--since", "-24h", "--no-pager"])
     n = out.count("relation \"lcm_")
     add("RESIDUE", "missing-relation-noise", "PASS" if n < 10 else "WARN", f"{n}x 'relation lcm_* does not exist' 24h")
@@ -387,30 +393,56 @@ def s_residue():
     rows, _ = _sql("select nspname from pg_namespace where nspname ~ 'lcm_(probe|tmp)[^_]*'")
     for (s,) in rows or []:
         add("RESIDUE", f"probe:{s}", "INFO", "leftover probe schema (remove via migration on dev host)")
-    # zombie schemas: lcm_* with zero data rows and no backing profile dir
-    # (legacy sqlite auto-creep). drop_zombie_schemas migration removes them
-    # at deploy; any survivor is a FAIL row until it does.
+    # zombie schemas: lcm_* the drop_zombie_schemas migration would have
+    # dropped but that STILL EXIST — i.e. the migration never ran. A schema is
+    # never flagged when: the migration is stamped (its own keep/drop verdicts
+    # are authoritative; empty idle-profile schemas are legitimate), the
+    # schema maps to a live profile dir, OR it carries any data rows.
+    stamped, serr = _sql("select 1 from lcm_default.lcm_deploy_migrations "
+                         "where migration='drop_zombie_schemas'")
+    if serr or not stamped:
+        add("RESIDUE", "zombie-schemas", "WARN",
+            "drop_zombie_schemas migration not stamped in lcm_default (run lcm_update/lcm_deploy_migrations)")
+        return
     profs = sorted(p.name for p in (HERMES_HOME / "profiles").glob("*/")) if (HERMES_HOME / "profiles").is_dir() else []
     live = {"lcm_default", "lcm__deleted"} | {f"lcm_{p}" for p in profs if p != ".deleted"}
     zrows, _ = _sql("select nspname from pg_namespace where nspname like 'lcm\\_%' "
-                    "and nspname not like 'lcm\\_test%' and nspname <> 'lcm_public'")
+                    "and nspname not like 'lcm\\_test%'")
     zombies = [r[0] for r in (zrows or []) if r[0] not in live]
-    if zombies:
-        # confirm they are really empty before flagging FAIL vs INFO
-        empties = []
-        for s in zombies:
-            n, err = _sql(f"select coalesce(sum(n_live_tup),0) from pg_stat_user_tables "
-                          f"where schemaname='{s}' and relname in ('messages','summary_nodes')")
-            if not err and (n or [[None]])[0][0] in (0, "0", None):
+    if not zombies:
+        add("RESIDUE", "zombie-schemas", "PASS", "no non-profile lcm_* schemas")
+        return
+    # migration stamped and something still outside the profile inventory
+    # exists -> it either got dropped-and-resurrected or is protected by the
+    # keep rules. Re-check with the SAME census the migration uses.
+    empties = []
+    for s in zombies:
+        # same rule as the migration: data rows in ANY non-ledger table
+        n, err = _sql(f"select count(*) from pg_tables t where t.schemaname='{s}'"
+                      " and t.tablename not in ('metadata','lcm_migration_state',"
+                      "'lcm_deploy_migrations','lcm_lifecycle_state')")
+        if err or not n:
+            continue
+        if n[0][0] == 0:
+            empties.append(s)
+        else:
+            # census says non-ledger tables exist; only if ALL are zero-row is
+            # it droppable — approximate with live tuples (stats) and treat
+            # nonzero as protected (migration would keep it too).
+            st, err2 = _sql(f"select coalesce(sum(n_live_tup),0) from pg_stat_user_tables"
+                            f" where schemaname='{s}' and tablename not in"
+                            " ('metadata','lcm_migration_state','lcm_deploy_migrations',"
+                            "'lcm_lifecycle_state')")
+            if not err2 and st and st[0][0] in (0, "0"):
                 empties.append(s)
-        rest = [z for z in zombies if z not in empties]
-        if empties:
-            add("RESIDUE", "zombie-schemas", "FAIL",
-                f"empty non-profile schemas present (drop_zombie_schemas not applied?): {empties}")
-        if rest:
-            add("RESIDUE", "zombie-schema-rows", "WARN", f"non-profile schemas WITH rows (hand-check): {rest}")
-    else:
-        add("RESIDUE", "zombie-schemas", "PASS", "no empty non-profile lcm_* schemas")
+    rest = [z for z in zombies if z not in empties]
+    if empties:
+        add("RESIDUE", "zombie-schemas", "FAIL",
+            f"droppable schemas survived the migration (resurrected after deploy?): {empties}")
+    if rest:
+        add("RESIDUE", "zombie-schema-rows", "INFO", f"non-profile schemas kept by migration rules: {rest}")
+    if not empties and not rest:
+        add("RESIDUE", "zombie-schemas", "PASS", "non-profile schemas all protected")
 
 def main():
     s_version()
