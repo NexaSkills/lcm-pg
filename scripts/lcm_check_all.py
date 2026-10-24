@@ -462,8 +462,18 @@ def s_residue():
     if db.exists():
         import time
         age_d = (time.time() - db.stat().st_mtime) / 86400
-        add("RESIDUE", "legacy-lcm-db", "PASS" if age_d > 7 else "WARN",
-            f"exists, mtime {age_d:.0f}d old (resurrection = recent mtime)")
+        sz = db.stat().st_size
+        # 0-byte + schema-less = the SQLite shim's harmless fallback touch
+        # (hermes-agent built-in integration opening a throwaway handle; the
+        # postgres backend writes nothing there). Only NON-EMPTY fresh files
+        # can mean a real sqlite fallback write / resurrection.
+        if sz == 0 and age_d <= 7:
+            add("RESIDUE", "legacy-lcm-db", "INFO",
+                f"0B schema-less touch (shim fallback, no data; mtime {age_d:.0f}d). "
+                "rm it + pin LCM_DATABASE_PATH via lcm_fleet_housekeeping.sh")
+        else:
+            add("RESIDUE", "legacy-lcm-db", "PASS" if age_d > 7 else "WARN",
+                f"{sz}B, mtime {age_d:.0f}d old (resurrection = recent mtime)")
     rows, _ = _sql("select nspname from pg_namespace where nspname ~ 'lcm_(probe|tmp)[^_]*'")
     for (s,) in rows or []:
         add("RESIDUE", f"probe:{s}", "INFO", "leftover probe schema (remove via migration on dev host)")
