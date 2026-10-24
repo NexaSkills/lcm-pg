@@ -479,6 +479,12 @@ def s_residue():
             "drop_zombie_schemas migration not stamped in lcm_default (run lcm_update/lcm_deploy_migrations)")
         return
     profs = sorted(p.name for p in (HERMES_HOME / "profiles").glob("*/")) if (HERMES_HOME / "profiles").is_dir() else []
+    # HERMES_HOME may be a profile scratch home (telegram/cron); the real
+    # profile dirs live under the main ~/.hermes — union both, same as the
+    # drop_zombie_schemas.sh keep rule.
+    _std = HOME / ".hermes"
+    if _std != HERMES_HOME and (_std / "profiles").is_dir():
+        profs = sorted(set(profs) | {p.name for p in (_std / "profiles").glob("*/")})
     live = {"lcm_default", "lcm__deleted"} | {f"lcm_{p}" for p in profs if p != ".deleted"}
     zrows, _ = _sql("select nspname from pg_namespace where nspname like 'lcm\\_%' "
                     "and nspname not like 'lcm\\_test%'")
@@ -491,36 +497,72 @@ def s_residue():
     # keep rules. Re-check with the SAME census the migration uses.
     empties = []
     for s in zombies:
-        # same rule as the migration: data rows in ANY non-ledger table
-        n, err = _sql(f"select count(*) from pg_tables t where t.schemaname='{s}'"
-                      " and t.tablename not in ('metadata','lcm_migration_state',"
-                      "'lcm_deploy_migrations','lcm_lifecycle_state')")
-        if err or not n:
+        # same rule as the migration: data rows in ANY non-ledger table.
+        # n_live_tup is STALE on idle schemas (never ANALYZEd) — count
+        # rows live, table by table, exactly like drop_zombie_schemas.sh.
+        tables, err = _sql(
+            "select tablename from pg_tables where schemaname="
+            f"'{s}' and tablename not in ('metadata','lcm_migration_state',"
+            "'lcm_deploy_migrations','lcm_lifecycle_state') order by 1")
+        if err:
             continue
-        if n[0][0] == 0:
+        has_rows = False
+        for (t,) in tables or []:
+            if not re.fullmatch(r"[a-z0-9_]+", t):
+                continue
+            c, cerr = _sql(f'select count(*) from "{s}"."{t}"')
+            if cerr:
+                continue  # per-object guard: unreadable table never triggers a drop
+            if c and int(c[0][0]) > 0:
+                has_rows = True
+                break
+        if not has_rows:
             empties.append(s)
-        else:
-            # census says non-ledger tables exist; only if ALL are zero-row is
-            # it droppable — approximate with live tuples (stats) and treat
-            # nonzero as protected (migration would keep it too).
-            st, err2 = _sql(f"select coalesce(sum(n_live_tup),0) from pg_stat_user_tables"
-                            f" where schemaname='{s}' and tablename not in"
-                            " ('metadata','lcm_migration_state','lcm_deploy_migrations',"
-                            "'lcm_lifecycle_state')")
-            if not err2 and st and st[0][0] in (0, "0"):
-                empties.append(s)
     rest = [z for z in zombies if z not in empties]
     # Converge every non-profile schema (the ones 'kept by migration rules'
     # too): make each an empty/repair canonical shell BEFORE the structure
     # verifiers run, so guards:/rollup:/rowid: can never FAIL on a schema no
     # profile owns. drop_zombie_schemas keeps its own data-preservation rules.
     healed = []
+    # DROP authority = the stamped migration's census. A schema the SAME
+    # census calls empty is droppable right now (and next deploy would drop
+    # it anyway); healing it in-run would leave a 0/6-guards shell the
+    # verifiers FAIL on until the next run. Everything else (census uncertain
+    # or migration unstamped) gets the canonical-shell heal as before.
+    prof_live = {f"lcm_{d.name}" for d in (HERMES_HOME / "profiles").glob("*/")} \
+                if (HERMES_HOME / "profiles").is_dir() else set()
+    if _std != HERMES_HOME and (_std / "profiles").is_dir():
+        prof_live |= {f"lcm_{d.name}" for d in (_std / "profiles").glob("*/")}
+    prof_live |= {"lcm_default"}
+    dropped_here = []
+    _py = HOME / "lcm-pg/venv/bin/python"
+    if not _py.exists():
+        _py = Path(sys.executable)
+    _dsn_code = (
+        "import os,psycopg\n"
+        "c=psycopg.connect(os.environ.get('LCM_PG_DSN',%r),autocommit=True)\n"
+        "c.execute('drop schema if exists \"' + __import__('sys').argv[1] + '\" cascade')\n"
+        "print('dropped')\n" % DSN)
+    for z in empties:
+        if z not in zombies or z in prof_live or z == "lcm_default":
+            continue   # belt-and-braces: own inventory + profile keep rule
+        rc, out = sh([str(_py), "-c", _dsn_code, z], timeout=60)
+        if rc == 0:
+            dropped_here.append(z)
+        else:
+            if _empty_canonical_shell(z):
+                healed.append(z)
     for z in zombies:
+        if z in dropped_here:
+            continue
         if _empty_canonical_shell(z):
             healed.append(z)
-    if empties:
+    if dropped_here:
         add("RESIDUE", "zombie-schemas", "WARN",
-            f"droppable schemas canonicalized this run (empty shells; next drop pass removes them): {empties}")
+            f"census-empty schemas dropped this run (same rules as drop_zombie_schemas): {dropped_here}")
+    elif empties:
+        add("RESIDUE", "zombie-schemas", "WARN",
+            f"census-empty but DROP failed; canonicalized instead: {empties}")
     if rest:
         add("RESIDUE", "zombie-schema-rows", "INFO",
             f"non-profile schemas kept by migration rules: {rest}"
@@ -596,6 +638,17 @@ def s_plugin_config():
 
 
 def main():
+    # the checker's own converge/drop decisions read profile dirs + .env;
+    # make sure the root env the deploy pins is visible (exported env wins,
+    # and LCM_PG_DSN keeps its host.conf/default resolution above).
+    for ef in ([HERMES_HOME / ".env"] +
+               (sorted((HERMES_HOME / "profiles").glob("*/.env"))
+                if (HERMES_HOME / "profiles").is_dir() else [])):
+        if ef.is_file():
+            for ln in ef.read_text(errors="ignore").splitlines():
+                if ln.startswith("LCM_") and "=" in ln:
+                    k, _, v = ln.partition("=")
+                    os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
     s_version()
     s_plugin_config()
     s_cluster()
