@@ -27,6 +27,7 @@ import argparse
 import importlib
 import importlib.util
 import os
+import re
 import sys
 import types
 from pathlib import Path
@@ -120,6 +121,39 @@ ENSURE_FNS = (
 # them lazily only when its engine is constructed with an active profile).
 ENSURE_MODULES = {}  # reserved; command-module ensures listed below
 
+# Core content tables: messages/summary_nodes DDL lives OUTSIDE db_bootstrap's
+# ensure_* set (messages is created by store.py at first open). A schema that
+# never ran the plugin (legacy residue like lcm_data) therefore has no
+# messages, and ensure_assertion_tables then aborts on its
+# "...AFTER UPDATE ON messages" triggers — the whole assertion family (6
+# guards) silently goes missing. Create the two content tables from canonical
+# DDL before the ensure loop (CREATE IF NOT EXISTS: no-op on live schemas).
+_CORE_DDL_SOURCES = ("store.py", "db_bootstrap.py")
+
+
+def _ensure_core_content_tables(conn, repo: Path) -> None:
+    srcs = []
+    for name in _CORE_DDL_SOURCES:
+        p = repo / name
+        if p.is_file():
+            srcs.append(p.read_text())
+    for table in ("messages", "summary_nodes"):
+        body = None
+        for src in srcs:
+            m = re.search(
+                r"CREATE TABLE(?: IF NOT EXISTS)?\s+%s\s*\((.*?)\n\s*\);" % table,
+                src, re.S)
+            if m:
+                body = m.group(1)
+                break
+        if body is None:
+            print(f"[{table}] core DDL not found in {_CORE_DDL_SOURCES}")
+            continue
+        try:
+            conn.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ({body})')
+        except Exception as exc:
+            print(f"core-{table}: {str(exc)[:120]}")
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -170,6 +204,10 @@ def main() -> int:
         except Exception as exc:
             print(f"[{schema}] SKIP (connect): {exc}")
             continue
+        # legacy-residue schemas have no messages/summary_nodes (those are
+        # created at first-open by store.py, not by db_bootstrap's ensure_*
+        # set) — assertion ensures then abort and the 6 guards never appear.
+        _ensure_core_content_tables(conn, FORK)
         for fn in ENSURE_FNS:
             f = getattr(dbb, fn, None)
             if f is None:
