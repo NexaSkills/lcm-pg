@@ -102,6 +102,8 @@ def _run(mig, schema, dry):
     return ok, (p.stdout.strip()[-300:] + "\n" + p.stderr.strip()[-300:]).strip()
 
 MIGRATIONS_DICT = {mid: (k, s) for mid, k, s in MIGRATIONS}
+# whole-DB helper invoked as a pre-pass (not stamped; idempotent by design)
+MIGRATIONS_DICT["ensure_bootstrap"] = ("py", "scripts/ensure_profile_bootstrap.py")
 
 def main():
     ap = argparse.ArgumentParser()
@@ -116,7 +118,14 @@ def main():
         return 0
     conn = _connect()
     schemas = _schemas(conn)
-    fails = 0
+    # safety-net pre-pass: run the whole-DB bootstrap over EVERY existing
+    # lcm_% schema (idempotent; the same script fix_rollup_shape invokes).
+    # A schema that never had a profile dir (retired/renamed profile) can
+    # lack rollup/assertion tables entirely — later per-schema migrations
+    # then churn or no-op against tables that don't exist.
+    okb, detailb = _run("ensure_bootstrap", "__all__", a.dry_run)
+    print(("OK   " if okb else "FAIL ") + "pre-pass ensure_bootstrap | " + detailb[-200:])
+    fails = 0 if okb else 1
     for schema in schemas:
         for mid, _k, _s in MIGRATIONS:
             have = _applied(conn, schema, mid)
