@@ -67,20 +67,26 @@ def fix_one(conn):
         "select 1 from pg_proc p join pg_namespace n on n.oid=p.pronamespace "
         "where p.proname = %s and n.nspname = current_schema()", (TRG_FN,)).fetchone()
     if fn is None:
-        # no shadow fn -> must rebuild via ensure (may still over-drop; flag it)
-        conn.execute("DROP TABLE IF EXISTS lcm_assertion_relations CASCADE")
-        conn.execute("DROP TABLE IF EXISTS lcm_assertion_sources CASCADE")
-        conn.execute("DROP TABLE IF EXISTS lcm_assertions CASCADE")
+        # no shadow fn -> must rebuild via ensure. The three DROP TABLE
+        # ... CASCADE statements the ensure path starts with are UNqualified,
+        # and the shim resolves each name against current_schema() FIRST;
+        # when current_schema() holds no such table, some resolvers fall
+        # back to ANY-visible same-named relations — i.e. ANOTHER schema's
+        # assertion family (observed: lcm_data's 6 guards wiped while
+        # fixing an unrelated schema). Guard the drops by scope:
+        # only drop when THIS schema actually owns the table.
+        for t in ("lcm_assertion_relations", "lcm_assertion_sources", "lcm_assertions"):
+            owns = conn.execute(
+                "select 1 from pg_class c join pg_namespace n on n.oid=c.relnamespace"
+                " where n.nspname = current_schema() and c.relname = %s", (t,)).fetchone()
+            if owns:
+                conn.execute('DROP TABLE IF EXISTS "%s" CASCADE' % t)
         conn.commit()
         import db_bootstrap  # noqa
         db_bootstrap.ensure_assertion_tables(conn)
         conn.commit()
         return "rebuilt via ensure (no fn): now %d/6" % len(_assert_triggers(conn))
     conn.execute('DROP TRIGGER IF EXISTS "%s" ON "%s"' % (GUARD, SRC))
-    # The connection's search_path is "<schema>, public" (pool-pinned per
-    # schema in postgres.connect), so the bare EXECUTE FUNCTION name
-    # resolves into the bound schema exactly — no current_schema() call
-    # (which is invalid in a function name-qualifier position on PG).
     conn.execute('CREATE TRIGGER "%s" BEFORE INSERT ON "%s" '
                  'FOR EACH ROW EXECUTE FUNCTION "%s"()'
                  % (GUARD, SRC, TRG_FN))
