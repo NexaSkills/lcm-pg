@@ -102,8 +102,9 @@ def _run(mig, schema, dry):
     return ok, (p.stdout.strip()[-300:] + "\n" + p.stderr.strip()[-300:]).strip()
 
 MIGRATIONS_DICT = {mid: (k, s) for mid, k, s in MIGRATIONS}
-# whole-DB helper invoked as a pre-pass (not stamped; idempotent by design)
+# whole-DB helpers invoked as pre-passes (not stamped; idempotent by design)
 MIGRATIONS_DICT["ensure_bootstrap"] = ("py", "scripts/ensure_profile_bootstrap.py")
+MIGRATIONS_DICT["ensure_assertion_guards"] = ("py", "scripts/ensure_assertion_guards.py")
 
 def main():
     ap = argparse.ArgumentParser()
@@ -126,6 +127,14 @@ def main():
     okb, detailb = _run("ensure_bootstrap", "__all__", a.dry_run)
     print(("OK   " if okb else "FAIL ") + "pre-pass ensure_bootstrap | " + detailb[-200:])
     fails = 0 if okb else 1
+    # idempotent self-heal pre-pass: db_bootstrap's assertion-trigger DDL is
+    # all CREATE TRIGGER IF NOT EXISTS (6-name contract per schema), so a
+    # direct ensure_assertion_tables pass repairs a partial guard set (e.g.
+    # 4/6 after a rebuild wiped some) WITHOUT the over-drop risk the
+    # full-bootstrap rerun carries. fix_guard_triggers stays stamped as-is.
+    okg, detailg = _run("ensure_assertion_guards", "__all__", a.dry_run)
+    print(("OK   " if okg else "FAIL ") + "pre-pass ensure_assertion_guards | " + detailg[-200:])
+    fails = fails + (0 if okg else 1)
     for schema in schemas:
         for mid, _k, _s in MIGRATIONS:
             have = _applied(conn, schema, mid)
