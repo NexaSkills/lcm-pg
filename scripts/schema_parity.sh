@@ -23,20 +23,34 @@ begin
   for s in select nspname from pg_namespace where nspname ~ '^lcm_' and nspname not in
            ('lcm_lcm','lcm_probe','lcm_probe_guard') loop
     begin
-      if not exists (select 1 from pg_attribute a join pg_class c on c.oid=a.attrelid
+      -- per-object guards: a legacy schema may simply LACK one of these
+      -- tables (lcm_data has no lcm_chunk_vectors); each block catches its
+      -- own absence so the rest of the schema still converges.
+      -- (a) rowid on lcm_embedding_vectors
+      if exists (select 1 from pg_class c join pg_namespace n on n.oid=c.relnamespace
+                 where n.nspname=s and c.relname='lcm_embedding_vectors' and c.relkind='r')
+         and not exists (select 1 from pg_attribute a join pg_class c on c.oid=a.attrelid
                      join pg_namespace n on n.oid=c.relnamespace
                      where n.nspname=s and c.relname='lcm_embedding_vectors'
                        and a.attname='rowid' and a.attnum>0) then
         execute format('alter table %I.lcm_embedding_vectors add column rowid bigint '
                        'generated always as (abs(public.has_object_identity(embedded_id::public.blob))) stored', s);
       end if;
-      if not exists (select 1 from pg_attribute a join pg_class c on c.oid=a.attrelid
-                     join pg_namespace n on n.oid=c.relnamespace
-                     where n.nspname=s and c.relname='lcm_chunk_vectors'
-                       and a.attname='rowid' and a.attnum>0) then
-        execute format('alter table %I.lcm_chunk_vectors add column rowid bigint '
-                       'generated always as (abs(public.has_object_identity(chunk_id::public.blob))) stored', s);
-      end if;
+      -- (b) rowid on lcm_chunk_vectors (table may not exist at all)
+      begin
+        if exists (select 1 from pg_class c join pg_namespace n on n.oid=c.relnamespace
+                   where n.nspname=s and c.relname='lcm_chunk_vectors' and c.relkind='r')
+           and not exists (select 1 from pg_attribute a join pg_class c on c.oid=a.attrelid
+                       join pg_namespace n on n.oid=c.relnamespace
+                       where n.nspname=s and c.relname='lcm_chunk_vectors'
+                         and a.attname='rowid' and a.attnum>0) then
+          execute format('alter table %I.lcm_chunk_vectors add column rowid bigint '
+                         'generated always as (abs(public.has_object_identity(chunk_id::public.blob))) stored', s);
+        end if;
+      exception when others then
+        raise notice 'skip chunk_vectors %: %', s, sqlerrm;
+      end;
+      -- (c) rowid on lcm_embedding_backfill_inflight
       if exists (select 1 from pg_class c join pg_namespace n on n.oid=c.relnamespace
                  where n.nspname=s and c.relname='lcm_embedding_backfill_inflight'
                    and c.relkind='r')
