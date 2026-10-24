@@ -140,8 +140,28 @@ def main() -> int:
     os.environ.pop("LCM_PG_SCHEMA", None)  # let schema_for_profile derive per home
     seen: set[str] = set()
     total = 0
-    for home in _profiles():
-        schema = pg.schema_for_profile(home)
+    homes = _profiles()
+    # DB-discovered schemas: retired/renamed profiles leave lcm_* schemas with
+    # data but no profile dir; check_all's rollup/guard verifiers demand the
+    # canonical tables there too, so ensure EVERY existing lcm_% schema, not
+    # just directory-derived homes.
+    try:
+        import psycopg as _pg  # noqa
+        _c = _pg.connect(a.dsn, autocommit=True)
+        _extra = [r[0] for r in _c.execute(
+            "select nspname from pg_namespace where nspname like 'lcm\\_%' "
+            "and nspname not like 'lcm\\_test%' and nspname <> 'lcm_public' "
+            "and nspname <> 'lcm_lcm' order by 1").fetchall()]
+        _c.close()
+        for s in _extra:
+            homes.append(f"__db__/{s}")
+    except Exception as exc:
+        print(f"db-schema discovery failed: {str(exc)[:120]}")
+    for home in homes:
+        if home.startswith("__db__/"):
+            schema = home.split("/", 1)[1]
+        else:
+            schema = pg.schema_for_profile(home)
         if schema in seen:
             continue
         seen.add(schema)
