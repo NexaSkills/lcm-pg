@@ -125,6 +125,28 @@ if [[ -n "$PARAM_FILES" && -z "$DRY" ]]; then
   done
 fi
 
+# ---- 3b. data-boundary pin (repo scripts only; NEVER hand-edit hosts) --------
+# Mandate: all LCM data lives under ~/lcm-pg only. engine._resolve_db_path
+# falls back to HERMES_HOME/lcm.db when LCM_DATABASE_PATH is unset, so an
+# exported sqlite-only env could silently write outside the boundary. Pin the
+# fallback path (PG intercepts it anyway) into every hermes .env — main and
+# per-profile — idempotently.
+BOUNDARY_DB="$HOME_DIR/lcm-pg/data/lcm.db"
+mkdir -p "$HOME_DIR/lcm-pg/data"
+env_files=("$HOME_DIR/.hermes/.env")
+[[ -d "$HOME_DIR/.hermes/profiles" ]] && env_files+=("$HOME_DIR"/.hermes/profiles/*/.env)
+for ef in "${env_files[@]}"; do
+  [[ -f "$ef" ]] || continue
+  if grep -q '^LCM_DATABASE_PATH=' "$ef"; then
+    cur=$(grep -m1 '^LCM_DATABASE_PATH=' "$ef" | cut -d= -f2-)
+    [[ "$cur" == "$BOUNDARY_DB" ]] || log "WARN: $ef pins LCM_DATABASE_PATH=$cur (expected $BOUNDARY_DB)"
+  else
+    cp -a "$ef" "$ef.pre-boundary.$(date +%Y%m%d%H%M%S)"
+    printf 'LCM_DATABASE_PATH=%s\n' "$BOUNDARY_DB" >> "$ef"
+    log "boundary-pin: LCM_DATABASE_PATH=$BOUNDARY_DB -> $ef"
+  fi
+done
+
 # ---- 4. restart hermes surfaces (discovered; profile units skipped) --------
 if [[ $DO_RESTART -eq 1 && -z "$DRY" ]]; then
   units=$(systemctl --user list-units --type=service --state=loaded --no-legend 2>/dev/null \

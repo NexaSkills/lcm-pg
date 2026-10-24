@@ -327,6 +327,13 @@ def s_params(schemas):
         keys = dict(l.split("=", 1) for l in env_f.read_text().splitlines() if l.startswith("LCM_") and "=" in l)
     add("PARAMS", "env", "PASS" if keys.get("LCM_BACKEND") == "postgres" else "FAIL",
         f"{len(keys)} LCM_* keys in .env; LCM_BACKEND={keys.get('LCM_BACKEND','MISSING')}")
+    # Data-boundary mandate: LCM_DATABASE_PATH must be pinned (inside ~/lcm-pg)
+    # in .env AND live in the running daemons' environ, so a default-path
+    # fallback can never resolve to HERMES_HOME/lcm.db outside the boundary.
+    pinned = str(HOME / "lcm-pg" / "data" / "lcm.db")
+    dbp = keys.get("LCM_DATABASE_PATH", "MISSING")
+    add("PARAMS", "boundary-pin:env", "PASS" if dbp == pinned else "FAIL",
+        f"LCM_DATABASE_PATH={dbp} (expected {pinned}; pin via lcm_update.sh)")
     for f in sorted((HERMES_HOME / "profiles").glob("*/config.yaml")) if (HERMES_HOME / "profiles").is_dir() else []:
         p = f.parent.name
         try:
@@ -352,6 +359,8 @@ def s_params(schemas):
             env = dict(l.split("=", 1) for l in Path(f"/proc/{pid}/environ").read_text().split("\0") if "=" in l)
             add("PARAMS", f"daemon-env:{u}", "PASS" if env.get("LCM_BACKEND") == "postgres" else "FAIL",
                 f"LCM_BACKEND={env.get('LCM_BACKEND','-')}")
+            add("PARAMS", f"daemon-boundary:{u}", "PASS" if env.get("LCM_DATABASE_PATH") == pinned else "FAIL",
+                f"LCM_DATABASE_PATH={env.get('LCM_DATABASE_PATH','-')}")
         except Exception as e:
             add("PARAMS", f"daemon-env:{u}", "INFO", str(e)[:120])
     rc, out = sh(["journalctl", "--user", "--since", "today", "--no-pager"])
