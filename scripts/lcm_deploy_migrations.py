@@ -30,6 +30,7 @@ MIGRATIONS = [
     ("fix_rollup_shape",    "sh", "scripts/fix_rollup_shape.sh"),
     ("fix_sequences",       "sql", "scripts/fix_sequences.sql"),
     ("drop_zombie_schemas", "sh", "scripts/drop_zombie_schemas.sh"),
+    ("drop_zombie_rows",    "sh", "scripts/drop_zombie_rows.sh"),
 ]
 
 def _dsn():

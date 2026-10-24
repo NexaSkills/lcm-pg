@@ -17,7 +17,7 @@ if [[ -z "$SCHEMAS" ]]; then
 fi
 total=0
 for s in $SCHEMAS; do
-  ok=$($P "select count(*) from pg_class c join pg_namespace n on n.oid=c.relnamespace
+  ok=$($P "select count(distinct c.relname) from pg_class c join pg_namespace n on n.oid=c.relnamespace
            where n.nspname='$s' and c.relname in ('lcm_rollups','messages')" 2>/dev/null)
   [[ "${ok:-0}" -lt 2 ]] && { echo "skip (tables missing): $s"; continue; }
   n=$($P <<SQL 2>/dev/null
