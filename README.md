@@ -11,6 +11,13 @@
 
 > Bounded context, unbounded memory. Nothing is ever lost.
 
+> **NexaSkills fork:** this repo runs the **native PostgreSQL backend**
+> (`LCM_BACKEND=postgres`) in production across the NexaSkills fleet — deploy
+> pipeline, connection-hygiene policy, and ops runbooks live in
+> **[docs/FORK-NATIVE-PG.md](docs/FORK-NATIVE-PG.md)**. As of **2026-10-25** the
+> backend is real-world validated end-to-end (live compression ran clean on a
+> production host after the sqlite→PG conversion).
+
 `hermes-lcm` replaces one-shot active-context compression with a SQLite-backed,
 DAG-based context engine. It keeps the live prompt bounded, preserves raw
 messages, and gives the agent tools to recover exact detail after compaction.
@@ -802,6 +809,9 @@ exposes retrieval tools that can drill back into exact stored sources.
 
 ## Documentation
 
+- [NexaSkills fork — native PG & fleet ops](docs/FORK-NATIVE-PG.md) — what the
+  fork adds, connection-hygiene policy, deploy pipeline, and the lessons
+  learned hardening it
 - [Feature overview](docs/features-overview.md) — every feature family, what
   it does, why it exists, and the switch that enables it
 - [Agent configuration profiles](docs/agent-config-profiles.md) — copy-paste
