@@ -133,6 +133,44 @@ fi
 # per-profile — idempotently.
 BOUNDARY_DB="$HOME_DIR/lcm-pg/data/lcm.db"
 mkdir -p "$HOME_DIR/lcm-pg/data"
+
+# ---- 3b2. cluster max_connections policy (fleet = 100) ----------------------
+# Pool arithmetic: every surface process runs its own psycopg pool per schema
+# (LCM_PG_POOL_MAX default 8). 3 surfaces x 8 is already 24; long compaction
+# checkouts make the server cap relevant. The cluster must therefore sit at 100
+# (Jan fleet policy). Idempotent edit of the FIRST assignment (never append:
+# the instance postgres.conf's LAST assignment wins, per the duplicate-
+# assignment pitfall). A restart is required for it to take effect; a CLUSTER
+# restart never SIGTERMs hermes surfaces (they reconnect), unlike restarting
+# the surface hosting this session.
+CLUSTER_CONF="$HOME_DIR/lcm-pg/instance/postgresql.conf"
+PGCTL="$HOME_DIR/lcm-pg/pg/bin/pg_ctl"
+if [[ -z "$DRY" && -f "$CLUSTER_CONF" ]]; then
+  "$PGCTL" -D "$HOME_DIR/lcm-pg/instance" start >/dev/null 2>&1 || true
+  cur_max=$(PGHOST="$HOME_DIR/lcm-pg/run" PGPORT=54329 PGUSER=lcm01 psql -d lcm \
+            -Atc "show max_connections" 2>/dev/null) || cur_max=""
+  if [[ "$cur_max" == "100" ]]; then
+    log "cluster-policy: max_connections=100 (OK)"
+  elif [[ -n "$cur_max" ]]; then
+    log "cluster-policy: max_connections=$cur_max -> 100"
+    cp -a "$CLUSTER_CONF" "$CLUSTER_CONF.pre-policy.$(date +%Y%m%d%H%M%S)"
+    if grep -qE '^[[:space:]]*max_connections[[:space:]]*=' "$CLUSTER_CONF"; then
+      sed -i '0,/^[[:space:]]*max_connections[[:space:]]*=/ s/^[[:space:]]*max_connections[[:space:]]*=.*/max_connections = 100/' "$CLUSTER_CONF"
+    else
+      printf '\nmax_connections = 100\n' >> "$CLUSTER_CONF"
+    fi
+    if [[ -x "$PGCTL" ]]; then
+      "$PGCTL" -D "$HOME_DIR/lcm-pg/instance" restart -W 30 >/dev/null 2>&1 \
+        && log "cluster-policy: restarted; now $(PGHOST="$HOME_DIR/lcm-pg/run" PGPORT=54329 PGUSER=lcm01 psql -d lcm -Atc 'show max_connections' 2>/dev/null)" \
+        || log "WARN: cluster-policy: pg_ctl restart failed (edit applied; verify + restart manually)"
+    else
+      log "WARN: cluster-policy: pg_ctl not found; conf edited but cluster NOT restarted"
+    fi
+  else
+    log "WARN: cluster-policy: cluster not queryable (offline?); max_connections NOT verified"
+  fi
+fi
+
 env_files=("$HOME_DIR/.hermes/.env")
 [[ -d "$HOME_DIR/.hermes/profiles" ]] && env_files+=("$HOME_DIR"/.hermes/profiles/*/.env)
 
@@ -173,6 +211,7 @@ if [[ -d "$HOME_DIR/.hermes/profiles" && ( -e "$HOME_DIR/.hermes/plugins/lcm-pg"
     penv="$pd.env"
     if [[ -f "$src_env" ]]; then
       for k in LCM_BACKEND LCM_PG_DSN LCM_DATABASE_PATH \
+               LCM_PG_POOL_MIN LCM_PG_POOL_MAX \
                LCM_ENABLE_SLASH_COMMAND LCM_EMBEDDINGS_ENABLED \
                LCM_EMBEDDING_PROVIDER LCM_EMBEDDING_MODEL LCM_EMBEDDING_QUERY_TIMEOUT_S \
                LCM_FASTEMBED_CACHE_DIR; do
@@ -188,6 +227,17 @@ if [[ -d "$HOME_DIR/.hermes/profiles" && ( -e "$HOME_DIR/.hermes/plugins/lcm-pg"
 fi
 for ef in "${env_files[@]}"; do
   [[ -f "$ef" ]] || continue
+  # Pool pin (fleet policy): the fork defaults LCM_PG_POOL_MAX=8 and a
+  # compaction-heavy profile saturates its own 8-slot pool (PoolTimeout
+  # 'couldn't get a connection after 10.00 sec' killed pip's compression on
+  # trade, 2026-10-25). 16 slots over a max_connections=100 cluster (enforced
+  # in 3b2) fits 3 surfaces + headroom. Append-only; never rewrites a custom
+  # per-host value (check_all reports a non-16 pin).
+  if ! grep -q '^LCM_PG_POOL_MAX=' "$ef"; then
+    cp -a "$ef" "$ef.pre-pool.$(date +%Y%m%d%H%M%S)"
+    printf 'LCM_PG_POOL_MIN=1\nLCM_PG_POOL_MAX=16\n' >> "$ef"
+    log "pool-pin: LCM_PG_POOL_MIN=1 LCM_PG_POOL_MAX=16 -> $ef"
+  fi
   if grep -q '^LCM_DATABASE_PATH=' "$ef"; then
     cur=$(grep -m1 '^LCM_DATABASE_PATH=' "$ef" | cut -d= -f2-)
     [[ "$cur" == "$BOUNDARY_DB" ]] || log "WARN: $ef pins LCM_DATABASE_PATH=$cur (expected $BOUNDARY_DB)"

@@ -149,8 +149,9 @@ def s_cluster():
         return
     v, maxc, conns, rec = rows[0]
     add("CLUSTER", "connect", "PASS", f"PG {v}, {conns} sessions, recovery={rec}")
-    add("CLUSTER", "max_connections", "PASS" if int(maxc) >= 80 else "INFO",
-        f"{maxc} (fleet policy 80)" + ("  <-- below policy" if int(maxc) < 80 else ""))
+    add("CLUSTER", "max_connections", "PASS" if int(maxc) >= 100 else "FAIL",
+        f"{maxc} (fleet policy 100; lcm_update.sh 3b2 enforces)"
+        + ("" if int(maxc) >= 100 else "  <-- below policy"))
     rows2, _ = _sql("select coalesce(state,'?'), count(*) from pg_stat_activity group by 1")
     add("CLUSTER", "activity", "PASS", ", ".join(f"{a}:{b}" for a, b in sorted(rows2 or [])))
 
@@ -334,6 +335,34 @@ def s_params(schemas):
     dbp = keys.get("LCM_DATABASE_PATH", "MISSING")
     add("PARAMS", "boundary-pin:env", "PASS" if dbp == pinned else "FAIL",
         f"LCM_DATABASE_PATH={dbp} (expected {pinned}; pin via lcm_update.sh)")
+    # Pool pin (fleet policy): the fork default LCM_PG_POOL_MAX=8 is too small
+    # for a compaction-heavy profile (trade pip PoolTimeout, 2026-10-25: 55s
+    # leaf-compaction checkouts saturated the 8-slot pool -> compression died).
+    # lcm_update.sh appends MIN=1/MAX=16 where absent. A per-profile value that
+    # differs from root is a WARN (deliberate pin), a missing one FAILs.
+    pmax, pmin = keys.get("LCM_PG_POOL_MAX"), keys.get("LCM_PG_POOL_MIN")
+    add("PARAMS", "pool-pin:env", "PASS" if pmax == "16" else ("WARN" if pmax else "FAIL"),
+        f"root LCM_PG_POOL_MAX={pmax or 'UNSET (fork default 8!)'} "
+        f"MIN={pmin or 'UNSET (1)'} (policy 16/1)")
+    _ppool = HERMES_HOME / "profiles"
+    for _pf in sorted(_ppool.glob("*/.env")) if _ppool.is_dir() else []:
+        _pk = {}
+        try:
+            _pk = dict(l.split("=", 1) for l in _pf.read_text().splitlines()
+                       if l.startswith("LCM_") and "=" in l)
+        except Exception:
+            continue
+        _pname = _pf.parent.name
+        if not _pk.get("LCM_PG_POOL_MAX"):
+            add("PARAMS", f"pool-pin:{_pname}", "FAIL",
+                "LCM_PG_POOL_MAX unset (process runs the 8-slot default; "
+                "lcm_update.sh 3c syncs from root .env)")
+        elif _pk["LCM_PG_POOL_MAX"] != (pmax or "16"):
+            add("PARAMS", f"pool-pin:{_pname}", "WARN",
+                f"LCM_PG_POOL_MAX={_pk['LCM_PG_POOL_MAX']} != root {pmax}")
+        else:
+            add("PARAMS", f"pool-pin:{_pname}", "PASS",
+                f"LCM_PG_POOL_MAX={_pk['LCM_PG_POOL_MAX']}")
     # Operator-surface params the fork reads from os.environ ONLY (slash gate
     # + embeddings). Root .env carries them for systemd surfaces; profile-run
     # sessions resolve the PROFILE .env, so each profile .env must carry the
