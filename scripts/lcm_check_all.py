@@ -334,6 +334,34 @@ def s_params(schemas):
     dbp = keys.get("LCM_DATABASE_PATH", "MISSING")
     add("PARAMS", "boundary-pin:env", "PASS" if dbp == pinned else "FAIL",
         f"LCM_DATABASE_PATH={dbp} (expected {pinned}; pin via lcm_update.sh)")
+    # Operator-surface params the fork reads from os.environ ONLY (slash gate
+    # + embeddings). Root .env carries them for systemd surfaces; profile-run
+    # sessions resolve the PROFILE .env, so each profile .env must carry the
+    # same value the root has (lcm_update.sh step 3c syncs them). A profile
+    # missing LCM_ENABLE_SLASH_COMMAND silently has no /lcm; missing
+    # LCM_EMBEDDINGS_ENABLED reports "embeddings are disabled" on warmup
+    # (fleet incident 2026-10-25).
+    _surf_keys = ("LCM_ENABLE_SLASH_COMMAND", "LCM_EMBEDDINGS_ENABLED",
+                  "LCM_EMBEDDING_PROVIDER", "LCM_EMBEDDING_MODEL")
+    _pdir = HERMES_HOME / "profiles"
+    for _pf in sorted(_pdir.glob("*/.env")) if _pdir.is_dir() else []:
+        _pname = _pf.parent.name
+        try:
+            _pk = dict(l.split("=", 1) for l in _pf.read_text().splitlines()
+                       if l.startswith("LCM_") and "=" in l)
+        except Exception:
+            continue
+        _miss = [k for k in _surf_keys if not _pk.get(k)]
+        _diff = [k for k in _surf_keys if _pk.get(k) and keys.get(k) and _pk[k] != keys[k]]
+        if _miss:
+            add("PARAMS", f"profile-env:{_pname}", "FAIL",
+                f"missing {' '.join(_miss)} (lcm_update.sh 3c syncs from root .env)")
+        elif _diff:
+            add("PARAMS", f"profile-env:{_pname}", "WARN",
+                f"differ from root: {' '.join(_diff)}")
+        else:
+            add("PARAMS", f"profile-env:{_pname}", "PASS",
+                f"slash={_pk['LCM_ENABLE_SLASH_COMMAND']} embed={_pk['LCM_EMBEDDINGS_ENABLED']}")
     # context.engine per profile: 'lcm' (or inherited via absent block) is
     # required; anything else (compressor/default) means that profile runs
     # the BUILT-IN lossy compressor and lcm-pg capture/rollup never runs.

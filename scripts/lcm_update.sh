@@ -161,11 +161,21 @@ if [[ -d "$HOME_DIR/.hermes/profiles" && ( -e "$HOME_DIR/.hermes/plugins/lcm-pg"
     fi
     # a routed profile's .env must carry the backend+DSN the daemons get from
     # the root .env, else a profile-local session can write a per-profile
-    # lcm.db instead of the shared cluster (pluginless fallback).
+    # lcm.db instead of the shared cluster (pluginless fallback). The other
+    # keys are operator-surface params the fork reads from os.environ ONLY:
+    # LCM_ENABLE_SLASH_COMMAND gates the /lcm command registration (default
+    # OFF), LCM_EMBEDDINGS_ENABLED + LCM_EMBEDDING_* gate embedding warmup /
+    # semantic recall (default OFF). systemd surfaces inherit the root .env
+    # (20-active-profile-env.conf), but CLI/launcher-run profile sessions
+    # resolve the PROFILE .env — a profile missing these silently loses /lcm
+    # and reports 'embeddings are disabled' (fleet incident 2026-10-25).
     src_env="$HOME_DIR/.hermes/.env"
     penv="$pd.env"
     if [[ -f "$src_env" ]]; then
-      for k in LCM_BACKEND LCM_PG_DSN LCM_DATABASE_PATH; do
+      for k in LCM_BACKEND LCM_PG_DSN LCM_DATABASE_PATH \
+               LCM_ENABLE_SLASH_COMMAND LCM_EMBEDDINGS_ENABLED \
+               LCM_EMBEDDING_PROVIDER LCM_EMBEDDING_MODEL LCM_EMBEDDING_QUERY_TIMEOUT_S \
+               LCM_FASTEMBED_CACHE_DIR; do
         val=$(grep -m1 "^${k}=" "$src_env" | cut -d= -f2-) || true
         [[ -n "$val" ]] || continue
         if [[ ! -f "$penv" ]] || ! grep -q "^${k}=" "$penv"; then
