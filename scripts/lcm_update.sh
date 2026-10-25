@@ -289,7 +289,16 @@ for ef in "${env_files[@]}"; do
   # trade, 2026-10-25). 16 slots over a max_connections=100 cluster (enforced
   # in 3b2) fits 3 surfaces + headroom. Append-only; never rewrites a custom
   # per-host value (check_all reports a non-16 pin).
-  if ! grep -q '^LCM_PG_POOL_MAX=' "$ef"; then
+  if grep -q '^LCM_PG_POOL_MAX=' "$ef"; then
+    # Idempotent enforcement (not create-only): a host whose launcher predated
+    # the create path may still hold a wrong value; never deploy below 16.
+    cur_max=$(sed -n 's/^LCM_PG_POOL_MAX=//p' "$ef" | tail -1)
+    if [ "${cur_max:-0}" -lt 16 ] 2>/dev/null; then
+      sed -i "s/^LCM_PG_POOL_MAX=.*/LCM_PG_POOL_MAX=16/" "$ef"
+      grep -q '^LCM_PG_POOL_MIN=' "$ef" || echo 'LCM_PG_POOL_MIN=1' >> "$ef"
+      log "pool-pin: LCM_PG_POOL_MAX=$cur_max -> 16 -> $ef"
+    fi
+  else
     cp -a "$ef" "$ef.pre-pool.$(date +%Y%m%d%H%M%S)"
     printf 'LCM_PG_POOL_MIN=1\nLCM_PG_POOL_MAX=16\n' >> "$ef"
     log "pool-pin: LCM_PG_POOL_MIN=1 LCM_PG_POOL_MAX=16 -> $ef"

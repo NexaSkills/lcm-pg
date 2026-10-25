@@ -2343,6 +2343,15 @@ def connect(dsn: str, schema: str, *,
                 check=ConnectionPool.check_connection,
                 name=f"lcm-pg-{schema}",
                 timeout=10,
+                # Idle pool members hold a server backend each. Without max_idle
+                # the reaper never runs and every established connection lives
+                # for the process lifetime — the "idle >3h" backends in
+                # pg_stat_activity. The reaper then closes any returned idle
+                # member older than max_idle (and keeps >= min_size), so
+                # quiet surfaces genuinely release backends. max_lifetime caps
+                # a member's age so stale/torn connections recycle.
+                max_idle=float(os.environ.get("LCM_PG_POOL_MAX_IDLE", "60")),
+                max_lifetime=float(os.environ.get("LCM_PG_POOL_MAX_LIFETIME", "3600")),
                 # psycopg >=3.2: conn.close() on a pooled handle RETURNS it to
                 # the pool instead of killing the backend, so sqlite-parity
                 # code that closes-then-lazily-reopens a handle never drains
