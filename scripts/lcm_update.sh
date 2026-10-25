@@ -184,6 +184,49 @@ if [[ -z "$DRY" && -f "$CLUSTER_CONF" ]]; then
   fi
 fi
 
+# ---- 3b3. stale idle-backend sweep (connection hygiene) --------------------
+# The plugin borrows per statement and returns promptly (verified probe: an
+# idle PgConnection holds 0 backends; with-conn scopes release at __exit__).
+# Idle-in-pool backends ARE idle-in-server: psycopg_pool's reaper is off
+# (no max_idle/max_lifetime), so slots from dead processes linger for hours
+# (warren held one 7h52m) and idle-in-transaction holders starve pools.
+# A LOCAL backend's pid IS the client's OS process (postmaster forks the
+# listener), so /proc/$pid gone = definite orphan. (client_pid exists only
+# when client_backends_info is loaded -- not installed here, don't depend on
+# it.) Sweep: (a) idle local backends (ANY age) whose holder PROCESS IS GONE
+# (dead-holder sockets are pure slots; churn via lifecycle tmp-schemas makes
+# these by the minute), (b) idle-in-transaction older than 10 min (held
+# slots starve pools; aborted idle-in-tx blocks vacuum too), (c) idle with a
+# LIVE holder older than 12h (pool member reaping nothing all day). NEVER
+# touches active queryers or young live-holder pool members. Once per deploy
+# run via stamp file; delete the stamp to re-force.
+SWEEP_STAMP="$HOME_DIR/lcm-pg/.stale-swept"
+if [[ -z "$DRY" && ! -e "$SWEEP_STAMP" ]]; then
+  "$PGCTL" -D "$HOME_DIR/lcm-pg/instance" start >/dev/null 2>&1 || true
+  _sweep=$(PGHOST="$HOME_DIR/lcm-pg/run" PGPORT=54329 PGUSER=lcm01 psql -d lcm -Atc \
+    "select pid, coalesce(state,'?'), extract(epoch from now()-state_change)::int, coalesce(backend_type,'') from pg_stat_activity where usename=current_user and pid<>pg_backend_pid() and state is not null" 2>/dev/null \
+    | while IFS='|' read -r pid state age btype; do
+        why=""
+        if [[ "$btype" == "client backend" && ! -d "/proc/$pid" ]]; then
+          why="orphan"
+        else
+          [[ "$state" == "idle in transaction" && "$age" -gt 600 ]] && why="stale-tx"
+          [[ "$state" == "idle" && "$age" -gt 43200 ]] && why="stale-idle"
+        fi
+        [[ -n "$why" ]] && echo "$pid|$state|$age|$btype|$why"
+      done)
+  if [[ -n "$_sweep" ]]; then
+    while IFS='|' read -r pid state age btype why; do
+      log "stale-backends: terminate pid=$pid state=$state age=${age}s type=${btype:-?} ($why)"
+      PGHOST="$HOME_DIR/lcm-pg/run" PGPORT=54329 PGUSER=lcm01 psql -d lcm -qc \
+        "select pg_terminate_backend($pid)" >/dev/null 2>&1 || true
+    done <<< "$_sweep"
+  else
+    log "stale-backends: none"
+  fi
+  touch "$SWEEP_STAMP"
+fi
+
 env_files=("$HOME_DIR/.hermes/.env")
 [[ -d "$HOME_DIR/.hermes/profiles" ]] && env_files+=("$HOME_DIR"/.hermes/profiles/*/.env)
 
