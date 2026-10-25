@@ -820,6 +820,7 @@ exposes retrieval tools that can drill back into exact stored sources.
   configuration reference, diagnostics
 - [Retrieval tools reference](docs/retrieval-tools.md) — exact tool contracts
 - [Profile integration guide](docs/PROFILE-INTEGRATION.md) — making any Hermes agent profile work end-to-end with the native PG backend
+- [Repo skill: lcm-pg-new-profile-setup](skills/lcm-pg-new-profile-setup/SKILL.md) — drop-in agent skill for onboarding new profiles (install into `~/.hermes/skills/`)
 - [Embeddings setup](docs/embeddings-setup.md) — free-tier and local embedding
   providers, warmup, backfill
 - [LCM paper](https://papers.voltropy.com/LCM)
