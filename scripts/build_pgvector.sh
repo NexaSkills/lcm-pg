@@ -3,7 +3,7 @@
 # PG18 made vacuum_delay_point take an is_analyze arg; pgvector 0.8.x still calls it with 0 args.
 set -eu
 BASE="${LCM_PG_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-[ -d "$BASE/src/pgvector" ] || BASE="/home/mybuddy/lcm-pg"   # invoked from git fork
+[ -d "$BASE/src/pgvector" ] || BASE="$HOME/lcm-pg"   # invoked from git fork
 cd "$BASE/src/pgvector"
 PGC="$BASE/pg/bin/pg_config"
 grep -n "vacuum_delay_point(bool" "$BASE/pg/include/postgresql/server/commands/vacuum.h"

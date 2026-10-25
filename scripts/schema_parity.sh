@@ -7,7 +7,7 @@
 #      Shim skips STORED generated cols in DDL replay -> verifiers stay OK.)
 #  3) lcm_rollup_invalidations.created_at NOT NULL (bootstrap contract)
 set -euo pipefail
-PSQL="${PSQL:-/home/mybuddy/lcm-pg/pg/bin/psql}"
+PSQL="${PSQL:-$HOME/lcm-pg/pg/bin/psql}"
 PGHOST_DIR="${PGHOST_DIR:-$HOME/lcm-pg/run}"
 PGPORT="${PGPORT:-54329}"
 PGUSER="${PGUSER:-lcm01}"

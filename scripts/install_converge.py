@@ -7,7 +7,7 @@ for fresh hosts):
 
   1. rsync the fork working tree into place (git tree on remote -> symlink
      target; falls back to the live plugin dir if it's a real dir)
-  2. land-verify HEAD == beez HEAD
+  2. land-verify HEAD == coordination-host HEAD
   3. schema_parity.sh (rowid/CHECK shims for schemas created pre-parity)
   4. embed_auto_backfill.py --limit N (first fill; non-fatal)
   5. embed timer install (hourly drift self-heal afterwards)

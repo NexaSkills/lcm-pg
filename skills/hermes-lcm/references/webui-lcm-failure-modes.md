@@ -10,7 +10,7 @@ Root cause (hermes-webui @ ~/hermes-webui, fixed 2026-10-02 on this host):
 
 Fix applied (re-apply after hermes-webui updates!):
 1. ~/.config/systemd/user/hermes-webui.service.d/env.conf:
-   [Service] + EnvironmentFile=-/home/mybuddy/.hermes/.env
+   [Service] + EnvironmentFile=-$HOME/.hermes/.env
 2. server.py boot patch, inserted right after the api.plugins.load_plugins try-block:
 
     try:

@@ -10,7 +10,7 @@
 # install time; without the timer, drift since install is never embedded.
 set -euo pipefail
 B="${LCM_PG_HOME:-$HOME/lcm-pg}"
-FORK="$HOME/.hermes/forks/lcm-pg"
+FORK="${HOME}/.hermes/forks/lcm-pg"
 [ -x "$B/venv/bin/python" ] || { echo "missing $B/venv (run install_lcm_pg.py first)" >&2; exit 1; }
 [ -f "$FORK/scripts/embed_auto_backfill.py" ] || { echo "missing fork embed_auto_backfill.py" >&2; exit 1; }
 DSN="postgresql:///lcm?host=$B/run&port=54329&user=lcm01"

@@ -871,7 +871,7 @@ outgrows that bound (see the `coverage` contract in the
 That path is unchanged from pre-v3 installs. At real-archive scale — tens of
 thousands of vectors and up — a full brute-force scan gets slow and
 memory-heavy, and the recency-bounded fallback stops reaching the whole corpus.
-Four v3 environment variables, all opt-in, additive, and default-off, trade
+Four v3 environment variables, all opt-in, additive, and default-off, fleet-host
 some exactness for full-corpus reach at much lower query cost:
 
 - `LCM_EMBEDDING_STORAGE_DTYPE` (default `float32`) selects the vector storage
@@ -917,7 +917,7 @@ existing exact bounded/full scan and reports honest `bounded`/`full` coverage
 instead of silently dropping rows the sign-bit table doesn't cover while still
 claiming `coverage='full'`.
 
-**Measured trade-offs (C1 bench, 92,997-vector real chunk archive, Voyage
+**Measured fleet-host-offs (C1 bench, 92,997-vector real chunk archive, Voyage
 `voyage-context-3`, dim 1024):**
 
 | Path | Coverage | Query latency (warm) | Peak RSS | recall@10 vs. exact |

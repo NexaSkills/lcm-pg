@@ -16,6 +16,17 @@ Canonical implementation doc: **docs/PROFILE-INTEGRATION.md** in this repo —
 the full contract (end-state, schema derivation, deploy pipeline, failure
 signatures). This skill is the operational short form.
 
+**Only lcm-pg code runs.** `lcm-pg` is the single LCM plugin; a real
+`hermes-lcm` plugin directory must never exist anywhere. Hermes discovery
+loads a plugin under EVERY name that resolves to a directory (root
+`~/.hermes/plugins/<name>` first, profile overlay second) — a legacy
+`hermes-lcm` directory alongside lcm-pg means the old sqlite code loads too
+(that was the structural cause of the fleet-wide "Failed to load plugin
+hermes-lcm" errors). Hosts whose `plugins.enabled` still carries the legacy
+`hermes-lcm` key are covered by a compatibility ALIAS symlink
+`plugins/hermes-lcm -> plugins/lcm-pg`, so that name resolves to this same PG
+code. The alias is a naming shim, not a second plugin.
+
 ## When to Use
 
 A new Hermes agent profile was just created (or an existing one is being
@@ -41,7 +52,7 @@ lowercased, non-`[a-z0-9_]` → `_` (e.g. profiles/pip → lcm_pip).
 context:
   engine: lcm        # #1 silent failure: unset (+ root unset) = built-in LOSSY compression
 plugins:
-  enabled: [hermes-lcm, lcm-pg, mnemosyne]
+  enabled: [lcm-pg, mnemosyne]   # canonical; a legacy 'hermes-lcm' entry only where root still uses it (alias covers it)
 memory:
   provider: mnemosyne
   mnemosyne:
@@ -50,13 +61,15 @@ memory:
 `auxiliary.compression.*` = the profile's OWN model/provider/base_url (never
 assume a global alias; params sync sets it from the profile default).
 
-Plugin overlay (gate key = DIRECTORY name, both links required):
+Plugin overlay (gate key = DIRECTORY name):
 ```
-~/.hermes/profiles/<p>/plugins/hermes-lcm -> ~/.hermes/plugins/lcm-pg
-~/.hermes/profiles/<p>/plugins/lcm-pg     -> ~/.hermes/plugins/lcm-pg
+~/.hermes/profiles/<p>/plugins/lcm-pg     -> ~/.hermes/plugins/lcm-pg   # required
+~/.hermes/profiles/<p>/plugins/hermes-lcm -> ~/.hermes/plugins/lcm-pg   # alias ONLY if legacy key enabled
 ```
-Deploy step 3d (migrate_hermes_lcm_config.py) creates these; hand-create only
-if no deploy ran since the profile was made.
+Both resolve to the one materialised plugin install; never a real
+`hermes-lcm` directory, never a second plugin copy. Deploy step 3d
+(migrate_hermes_lcm_config.py) ensures this; hand-create only if no deploy
+ran since the profile was made.
 
 ## Recipe
 
@@ -82,6 +95,10 @@ Pass: no PoolTimeout / too-many-clients; new rows in lcm_<p>.summary_nodes.
 
 ## Gotchas
 
+- A real (non-symlink) `plugins/hermes-lcm` directory anywhere = TWO LCM
+  plugins loading (discovery loads every name that resolves) = load errors /
+  sqlite fallback. Delete it; keep only the alias symlink where the legacy
+  enabled-key is present.
 - Profile created AFTER the last deploy = no params sync = built-in
   compression + pool default 8. Re-run the deploy.
 - PoolTimeout: the constraint is the per-process pool (pins), not the server.

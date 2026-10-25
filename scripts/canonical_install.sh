@@ -12,7 +12,7 @@
 #    broken editable install can itself fail).
 # 3) report what the gateway will load (root lcm-pg only).
 set -uo pipefail
-HOME_DIR="${HOME:-/home/mybuddy}"
+HOME_DIR="${HOME:-$HOME}"
 BAK="$HOME_DIR/.hermes/backups/lcm-canonical-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$BAK"
 

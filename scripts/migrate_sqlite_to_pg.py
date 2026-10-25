@@ -15,7 +15,7 @@ the store itself writes into sqlite TEXT columns.
 """
 import json, os, re, sqlite3, sys
 
-FORK = os.environ.get("LCM_PG_FORK", "/home/mybuddy/.hermes/forks/lcm-pg")
+FORK = os.environ.get("LCM_PG_FORK", os.path.expanduser("~/.hermes/forks/lcm-pg"))
 TABLES = (
     "messages", "metadata", "summary_nodes",
     "lcm_rollups", "lcm_rollup_sources", "lcm_rollup_state",
@@ -122,7 +122,7 @@ def main() -> int:
     s0 = sqlite3.connect(src_path)
     s1 = sqlite3.connect(tmp)
     # Salvage class: legacy corrupt lcm.db files can hold invalid-UTF-8 TEXT
-    # (seen in tool_calls JSON on warren debbie). Strict decode aborts the
+    # (seen in tool_calls JSON on fleet-host debbie). Strict decode aborts the
     # whole table read; lossy decode keeps every row, U+FFFD where bytes died.
     for _c in (s0, s1):
         try:

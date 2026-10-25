@@ -336,7 +336,7 @@ def s_params(schemas):
     add("PARAMS", "boundary-pin:env", "PASS" if dbp == pinned else "FAIL",
         f"LCM_DATABASE_PATH={dbp} (expected {pinned}; pin via lcm_update.sh)")
     # Pool pin (fleet policy): the fork default LCM_PG_POOL_MAX=8 is too small
-    # for a compaction-heavy profile (trade pip PoolTimeout, 2026-10-25: 55s
+    # for a compaction-heavy profile (fleet-host pip PoolTimeout, 2026-10-25: 55s
     # leaf-compaction checkouts saturated the 8-slot pool -> compression died).
     # lcm_update.sh appends MIN=1/MAX=16 where absent. A per-profile value that
     # differs from root is a WARN (deliberate pin), a missing one FAILs.

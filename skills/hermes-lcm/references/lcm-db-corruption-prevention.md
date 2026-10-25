@@ -1,10 +1,10 @@
-# lcm.db corruption prevention (verified on beez, Oct 2026)
+# lcm.db corruption prevention (verified on coordination-host, Oct 2026)
 
 ## Signature taxonomy (read-only `PRAGMA integrity_check` on quarantined copies)
 - "wrong # of entries in index ..." + isolated "Rowid <huge> out of order" / "2nd reference to page": lost-flush / stale-write artifacts from the storage layer, not a plugin or SQLite-logic bug.
 - Widespread "btreeInitPage() error" across trees: deep torn-page damage.
 
-## Facts verified on beez
+## Facts verified on coordination-host
 - Plugin applies `journal_mode=WAL` + `synchronous=FULL` + `mmap_size=256MiB` + `busy_timeout` on EVERY store connection (`db_bootstrap.configure_connection`, used by all 9 store modules). Do not lower synchronous below FULL.
 - NOTE: `pragma synchronous` read back from a fresh sqlite3/CLI connection shows the CLI default (2), NOT what the gateway connections use — pragmas are per-connection. Verify in code, not via a probe connection.
 - Host is a KVM guest (QEMU HARDDISK, queue write_cache="write back"). The durability guarantee lives in the hypervisor's flush handling, not in SQLite/Postgres.
@@ -28,7 +28,7 @@
   during checksum/copy for writeback -> silent lost write / bad csum. Guest kernel
   7.2.5-3-omarchy predates the fix. Damage pattern matched mmap_size=0 LOCAL PATCH
   coverage EXACTLY (unpatched buttercup standalone plugin copy = only db corrupting live).
-- Permanent invariants on beez: (1) mmap_size=0 LOCAL PATCH in
+- Permanent invariants on coordination-host: (1) mmap_size=0 LOCAL PATCH in
   ~/.hermes/plugins/hermes-lcm/db_bootstrap.py; (2) profile plugin dirs must be
   SYMLINKS to the default plugin dir (buttercup stale copy fixed 10-16, kept as
   plugins/hermes-lcm.unpatched-20261016-093900); (3) lcm-local-patch-watchdog.sh

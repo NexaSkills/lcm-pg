@@ -10,7 +10,7 @@ export LCM_PG_DSN="${LCM_PG_DSN:-postgresql://lcm01@/lcm?host=$HOME/lcm-pg/run&p
 SCHEMA="${1:-lcm_data}"
 ~/lcm-pg/venv/bin/python - <<PY
 import sys, re
-REPO = "/home/mybuddy/.hermes/plugins/lcm-pg"
+REPO = os.path.expanduser("~/.hermes/plugins/lcm-pg")
 sys.path.insert(0, REPO)
 import importlib, importlib.util
 spec = importlib.util.spec_from_file_location("lcmpg", REPO + "/__init__.py",

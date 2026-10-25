@@ -2,7 +2,7 @@
 # Install the reentrancy guard into the fork's connect() and verify end-to-end
 # with pool 1/1 (the exact config that deadlocked embed_auto_backfill).
 set -euo pipefail
-FORK="$HOME/.hermes/forks/lcm-pg"
+FORK="${HOME}/.hermes/forks/lcm-pg"
 B="$HOME/lcm-pg"
 
 grep -q "_LCM_PG_REENTRANT_INSTALL_DONE" "$FORK/backends/postgres.py" || python3 - <<'PY'

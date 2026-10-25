@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Restore the canonical embedding shape for mis-created lcm_* schemas.
 
-Root cause (verified 2026-10-21 on beez): some schemas' embedding tables
+Root cause (verified 2026-10-21 on coordination-host): some schemas' embedding tables
 were created by the sqlite-DDL *translation* fallback during earlier repair
 work. The translator renders PRIMARY KEY members with explicit column-level
 NOT NULL, so PG ends up with standalone <t>_<col>_not_null pg_constraint

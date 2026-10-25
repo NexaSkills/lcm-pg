@@ -1,25 +1,25 @@
 ---
 name: lcm-pg-self-contained
-description: "Use when operating, migrating, or extending the self-contained lcm-pg bundle (private PG cluster under /home/mybuddy/lcm-pg). Covers how to use it and how to integrate it when new agent profiles are created."
+description: "Use when operating, migrating, or extending the self-contained lcm-pg bundle (private PG cluster under $HOME/lcm-pg). Covers how to use it and how to integrate it when new agent profiles are created."
 version: 1.0.0
 author: mike
 license: MIT
 metadata:
   hermes:
-    tags: [lcm, postgres, hermes-lcm, memory, mybuddy-beez]
+    tags: [lcm, postgres, hermes-lcm, memory, fleet-host]
     related_skills: [hermes-lcm, lcm-pg-post-migration-hygiene, lcm-diagnostics]
 ---
 
 # lcm-pg self-contained bundle
 
-Operation + integration guide for the Postgres-backed LCM on mybuddy-beez.
-Everything lives under `/home/mybuddy/lcm-pg/` — no system PostgreSQL, no
+Operation + integration guide for the Postgres-backed LCM on fleet-host.
+Everything lives under `$HOME/lcm-pg/` — no system PostgreSQL, no
 shared databases, own binaries, own venv, own embedding model cache.
 
 ## Layout (single source of truth)
 
 ```
-/home/mybuddy/lcm-pg/
+$HOME/lcm-pg/
   pg/            PostgreSQL 18.6 built from source (bin/, lib/, share/extension incl. pgvector)
   instance/      private cluster data dir (chmod 700)
   run/           unix socket dir (.s.PGSQL.54329) — local-only, no TCP listener
@@ -33,12 +33,12 @@ shared databases, own binaries, own venv, own embedding model cache.
     make_venv.sh build the self-contained venv
     ensure_schemas.py  backfill missing lcm_<profile> schemas (idempotent)
     migrate_sqlite_to_pg.py / migrate_from_shared_pg.py
-/home/mybuddy/.hermes/forks/lcm-pg/   git fork (source of the plugin)
-/home/mybuddy/.hermes/plugins/lcm-pg  -> symlink to the fork (ONE plugin, all profiles)
+$HOME/.hermes/forks/lcm-pg/   git fork (source of the plugin)
+$HOME/.hermes/plugins/lcm-pg  -> symlink to the fork (ONE plugin, all profiles)
 ```
 
 DSN (every profile, every daemon):
-`LCM_PG_DSN=postgresql:///lcm?host=/home/mybuddy/lcm-pg/run&port=54329&user=lcm01`
+`LCM_PG_DSN=postgresql:///lcm?host=$HOME/lcm-pg/run&port=54329&user=lcm01`
 plus `LCM_BACKEND=postgres`. Schema per profile is derived automatically:
 `lcm_<profile-id>` (default profile -> `lcm_default`).
 
@@ -54,11 +54,11 @@ plus `LCM_BACKEND=postgres`. Schema per profile is derived automatically:
     `lcm_embedding_vectors` / `lcm_chunk_vectors`; KNN is numpy-in-Python, not
     pgvector ops — pgvector exists as an optional accelerator only.
   - Embeddings: fastembed `BAAI/bge-small-en-v1.5`, cache in
-    `/home/mybuddy/lcm-pg/fastembed` (via `LCM_FASTEMBED_CACHE_DIR`). If
+    `$HOME/lcm-pg/fastembed` (via `LCM_FASTEMBED_CACHE_DIR`). If
     `/lcm embed` says "not cached", run `/lcm embed warmup` once (downloads
     ~130 MB to the bundle cache).
-- Introspection: `psql -h /home/mybuddy/lcm-pg/run -p 54329 -U lcm01 -d lcm`
-  (or `/home/mybuddy/lcm-pg/scripts/pg.sh psql ...`).
+- Introspection: `psql -h $HOME/lcm-pg/run -p 54329 -U lcm01 -d lcm`
+  (or `$HOME/lcm-pg/scripts/pg.sh psql ...`).
 
 ## Cluster lifecycle
 
@@ -112,7 +112,7 @@ unit is enabled. (Install script notes this; enabling it is an explicit step.)
 
 ## Migration notes (shared system PG -> private cluster)
 
-- Old DSN was `postgresql:///lcm?host=/run/postgresql&user=mybuddy` with
+- Old DSN was `postgresql:///lcm?host=/run/postgresql&user=<system-user>` with
   schemas `lcm_<profile>` — shared instance, to be retired.
 - Migrate with `scripts/migrate_from_shared_pg.py` (pg_dump each
   `lcm_<profile>` schema, restore into the private `lcm` db; sequences

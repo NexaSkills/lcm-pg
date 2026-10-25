@@ -10,22 +10,23 @@
 # embed_auto_backfill fails its after-ensure check.
 #
 # Usage: bash pragma_notnull_rollout.sh [host...]
-#   (default: 192.168.1.32 192.168.1.33 192.168.1.35)
+#   (default: pass hostnames as arguments)
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PATCH_PY="$SCRIPT_DIR/pragma_notnull_patch.py"
 [ -f "$PATCH_PY" ] || { echo "missing $PATCH_PY" >&2; exit 1; }
-HOSTS=("$@"); [ ${#HOSTS[@]} -gt 0 ] || HOSTS=(192.168.1.32 192.168.1.33 192.168.1.35)
+HOSTS=("$@")  # pass target hostnames as args, e.g. ./pragma_notnull_rollout.sh host1 host2
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=10"
+SSH_USER="${SSH_USER:-${USER}}"
 rc=0
 for h in "${HOSTS[@]}"; do
   echo "== $h"
   # runtime dir first (gateways + timer use it); fork copy second
-  for d in "$HOME/lcm-pg/plugins/lcm-pg" "$HOME/.hermes/forks/lcm-pg"; do
+  for d in "$HOME/lcm-pg/plugins/lcm-pg" "${HOME}/.hermes/forks/lcm-pg"; do
     # only patch dirs that actually contain the fork (verify marker)
-    has=$($SSH "mybuddy@$h" "test -f $d/scripts/pragma_notnull_patch.py && echo yes || echo no" 2>/dev/null || echo "ssh-fail")
+    has=$($SSH "$SSH_USER@$h" "test -f $d/scripts/pragma_notnull_patch.py && echo yes || echo no" 2>/dev/null || echo "ssh-fail")
     [ "$has" = "yes" ] || { echo "   $d: skip (no fork marker / no dir)"; continue; }
-    $SSH "mybuddy@$h" "bash -s" 2>/dev/null <<REMOTE
+    $SSH "$SSH_USER@$h" "bash -s" 2>/dev/null <<REMOTE
 cd $d 2>/dev/null || exit 0
 timeout 60 \$HOME/lcm-pg/venv/bin/python scripts/pragma_notnull_patch.py 2>&1 | tail -1
 # runtime import check (fresh interpreter, real plugin path)

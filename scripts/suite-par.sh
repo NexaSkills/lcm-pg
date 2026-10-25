@@ -6,8 +6,8 @@ set -u
 N=${1:-6}
 export LCM_BACKEND=postgres
 export LCM_PG_DSN="postgresql:///lcm?host=$HOME/lcm-pg/run&port=54329&user=lcm01"
-export PYTHONPATH="$HOME/.hermes/forks/lcm-pg:$HOME/.hermes/hermes-agent"
-cd "$HOME/.hermes/forks/lcm-pg" || exit 1
+export PYTHONPATH="${HOME}/.hermes/forks/lcm-pg:$HOME/.hermes/hermes-agent"
+cd "${HOME}/.hermes/forks/lcm-pg" || exit 1
 ~/lcm-pg/venv/bin/python -m pytest tests/ -q -p no:cacheprovider \
   -n "$N" --dist loadfile --timeout=60 --timeout-method=thread --tb=line -o addopts=
 RC=$?

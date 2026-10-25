@@ -3,7 +3,7 @@
 never collide with migrated ids. Run after migrate_sqlite_to_pg.py."""
 import os, psycopg, re
 
-DSN = os.environ.get("LCM_PG_DSN", "postgresql:///lcm?host=/run/postgresql&user=mybuddy")
+DSN = os.environ.get("LCM_PG_DSN") or f"postgresql:///lcm?host=/run/postgresql&user={os.environ.get('USER', 'postgres')}"
 pg = psycopg.connect(DSN, autocommit=True)
 schemas = [r[0] for r in pg.execute(
     "SELECT nspname FROM pg_namespace WHERE nspname LIKE 'lcm\\_%' AND nspname NOT LIKE '%e2e%' "

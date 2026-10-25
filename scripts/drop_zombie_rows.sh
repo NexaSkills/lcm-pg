@@ -5,7 +5,7 @@
 # Idempotent; stamped per-schema via lcm_deploy_migrations. Real scopes (with
 # message rows) are never touched.
 set -uo pipefail
-PSQL="${PSQL:-/home/mybuddy/lcm-pg/pg/bin/psql}"
+PSQL="${PSQL:-$HOME/lcm-pg/pg/bin/psql}"
 PGHOST_DIR="${PGHOST_DIR:-$HOME/lcm-pg/run}"
 PGPORT="${PGPORT:-54329}"
 PGUSER="${PGUSER:-lcm01}"

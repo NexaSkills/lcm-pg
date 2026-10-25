@@ -34,7 +34,7 @@ except ImportError:  # PyYAML ships with hermes envs; bundle venv may lack it
     print("migrate-config: PyYAML unavailable; skipping (configs unchanged)")
     sys.exit(0)
 
-HOME = Path(os.environ.get("HOME", "/home/mybuddy"))
+HOME = Path(os.environ.get("HOME", "$HOME"))
 HERMES = Path(os.environ.get("HERMES_HOME", str(HOME / ".hermes")))
 PLUGIN_DIR = Path(os.environ.get("PLUGIN_DIR", str(HERMES / "plugins" / "lcm-pg")))
 TS = time.strftime("%Y%m%d%H%M%S")
@@ -127,7 +127,7 @@ def _env_schema_stripping(dry: bool) -> None:
     (backends/factory.py: schema = LCM_PG_SCHEMA or schema_for_profile(home)).
     Since the host-wide LCM_DATABASE_PATH boundary pin already forces the
     dbpath-parent derivation, ANY LCM_PG_SCHEMA pin (e.g. the manual
-    LCM_PG_SCHEMA=lcm_mike applied on trade) freezes that surface onto ONE
+    LCM_PG_SCHEMA=lcm_mike applied on fleet-host) freezes that surface onto ONE
     schema for every profile — breaking per-profile isolation across webui,
     cli, telegram and dashboard. Derivation from HERMES_HOME is the correct
     mechanism; strip the override so it works again. Backed up first."""

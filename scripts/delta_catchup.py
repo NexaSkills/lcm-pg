@@ -5,8 +5,10 @@ Triggers disabled during COPY; FTS shadow tables regenerated after. Idempotent.
 Skip tables are: sqlite_sequence, _fix_*/probe leftovers, *_fts* (regenerated)."""
 import os, subprocess, sys
 
-SHARED = ["psql", "-h", "/run/postgresql", "-U", "mybuddy", "-d", "lcm"]
-PRIV = ["/home/mybuddy/lcm-pg/pg/bin/psql", "-h", "/home/mybuddy/lcm-pg/run",
+SHARED = ["psql", "-h", "/run/postgresql", "-U", os.environ.get("USER", "postgres"), "-d", "lcm"]
+import os as _os
+_H = _os.path.expanduser("~")
+PRIV = [f"{_H}/lcm-pg/pg/bin/psql", "-h", f"{_H}/lcm-pg/run",
         "-p", "54329", "-U", "lcm01", "-d", "lcm"]
 
 def priv_for(schema):

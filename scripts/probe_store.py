@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from backends import factory  # noqa: E402
 from backends import fts_pg  # noqa: E402
 
-DSN = os.environ.get("LCM_PG_DSN") or "postgresql:///lcm?host=/var/run/postgresql&user=mybuddy"
+DSN = os.environ.get("LCM_PG_DSN") or f"postgresql:///lcm?host=/var/run/postgresql&user={os.environ.get('USER', 'postgres')}"
 SCHEMA = os.environ.get("LCM_PG_SCHEMA", "lcm_probe")
 
 

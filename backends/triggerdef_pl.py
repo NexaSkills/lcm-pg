@@ -110,7 +110,7 @@ def install(c, schema):
 
 if __name__ == "__main__":
     import sys, re
-    c = psycopg.connect('postgresql:///lcm?host=/run/postgresql&user=mybuddy', autocommit=True)
+    c = psycopg.connect(os.environ.get('LCM_PG_DSN', os.popen('echo').read() and 'postgresql:///lcm?host=/run/postgresql&user=' + os.environ.get('USER','')), autocommit=True)
     install(c, 'lcm_e2e')
     c.execute("SET search_path TO lcm_e2e")
     expected = {

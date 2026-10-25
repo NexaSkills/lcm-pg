@@ -39,7 +39,7 @@ sys.path.insert(0, os.path.expanduser("~/.hermes/forks/lcm-pg"))
 os.environ.setdefault("LCM_BACKEND", "postgres")
 DSN = sys.argv[1] if len(sys.argv) > 1 else os.environ.get(
     "LCM_PG_DSN",
-    "postgresql:///lcm?host=/home/mybuddy/lcm-pg/run&port=54329&user=lcm01")
+    "postgresql:///lcm?host=" + __import__('os').path.expanduser("~") + "/lcm-pg/run&port=54329&user=lcm01")
 os.environ["LCM_PG_DSN"] = DSN
 
 from backends import postgres  # noqa: E402

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # lcm_update.sh — deploy/update the lcm-pg solution on THIS host (host-agnostic).
 #
-# The SAME script runs on beez and every fleet host. It never edits code and
+# The SAME script runs on coordination-host and every fleet host. It never edits code and
 # never hand-mutates databases: it fetches a pinned git ref into the PLUGIN
 # location, applies + stamps DB migrations via the repo's migration runner,
 # syncs the repo-declared config files (params), restarts hermes surfaces,
@@ -189,7 +189,7 @@ fi
 # idle PgConnection holds 0 backends; with-conn scopes release at __exit__).
 # Idle-in-pool backends ARE idle-in-server: psycopg_pool's reaper is off
 # (no max_idle/max_lifetime), so slots from dead processes linger for hours
-# (warren held one 7h52m) and idle-in-transaction holders starve pools.
+# (fleet-host held one 7h52m) and idle-in-transaction holders starve pools.
 # A LOCAL backend's pid IS the client's OS process (postmaster forks the
 # listener), so /proc/$pid gone = definite orphan. (client_pid exists only
 # when client_backends_info is loaded -- not installed here, don't depend on
@@ -294,7 +294,7 @@ for ef in "${env_files[@]}"; do
   # Pool pin (fleet policy): the fork defaults LCM_PG_POOL_MAX=8 and a
   # compaction-heavy profile saturates its own 8-slot pool (PoolTimeout
   # 'couldn't get a connection after 10.00 sec' killed pip's compression on
-  # trade, 2026-10-25). 16 slots over a max_connections=100 cluster (enforced
+  # fleet-host, 2026-10-25). 16 slots over a max_connections=100 cluster (enforced
   # in 3b2) fits 3 surfaces + headroom. Append-only; never rewrites a custom
   # per-host value (check_all reports a non-16 pin).
   if grep -q '^LCM_PG_POOL_MAX=' "$ef"; then

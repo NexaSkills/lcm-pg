@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Install/refresh the self-contained lcm-pg bundle.
 
-Layout (all under /home/mybuddy, self-contained):
-  /home/mybuddy/lcm-pg/
+Layout (all under $HOME, self-contained):
+  $HOME/lcm-pg/
     pg/          private PostgreSQL 18.6 build (binaries + libs)
     instance/    private cluster data dir (port 54329, socket lcm-pg/run/)
     venv/        own python env: psycopg3 + fastembed (+ model cache)
     run/         unix socket dir
-    fork ->      symlink to /home/mybuddy/.hermes/forks/lcm-pg (source of truth)
+    fork ->      symlink to $HOME/.hermes/forks/lcm-pg (source of truth)
 
 Plugin surface:
   ~/.hermes/plugins/lcm-pg   -> symlink to fork (one plugin for ALL profiles)
@@ -21,7 +21,7 @@ Usage: install_lcm_pg.py [--plan] [--skip-pg-build]
 """
 import argparse, json, os, shutil, subprocess, sys, time
 
-HOME = "/home/mybuddy"
+HOME = os.path.expanduser("~")
 BASE = f"{HOME}/lcm-pg"
 FORK = f"{HOME}/.hermes/forks/lcm-pg"
 PG = f"{BASE}/pg"

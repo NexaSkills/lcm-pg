@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Fleet rollout of the self-contained lcm-pg bundle: beez (source host) -> targets.
-# Proven on warren(.35)/clone(.32)/template(.33) 2026-10-19. Idempotent; safe to re-run.
+# Fleet rollout of the self-contained lcm-pg bundle: coordination-host (source host) -> targets.
+# Proven on fleet-host(.35)/clone(.32)/template(.33) 2026-10-19. Idempotent; safe to re-run.
 #
 # Usage (run FROM the source host):
 #   scripts/rollout_host.sh xfer   <ip>   # push golden bundle + fork (land-verifies)
@@ -18,10 +18,11 @@ SRC=$HOME/lcm-pg
 FORK=$HOME/.hermes/forks/lcm-pg
 SSH=(-o BatchMode=yes -o ConnectTimeout=15 -o ControlMaster=auto
      -o "ControlPath=$HOME/.ssh/cm/%r@%h:%p" -o ControlPersist=600)
-B=/home/mybuddy/lcm-pg
+B=$HOME/lcm-pg
 DSN="postgresql:///lcm?host=$B/run&port=54329&user=lcm01"
 
-rsh() { ssh "${SSH[@]}" mybuddy@$HOST 'bash -s'; }
+SSH_USER="${SSH_USER:-${USER}}"
+rsh() { ssh "${SSH[@]}" "$SSH_USER@$HOST" 'bash -s'; }
 
 do_xfer() {
   rsh <<'T'
@@ -29,11 +30,11 @@ mkdir -p ~/lcm-pg ~/.hermes/forks
 command -v rsync >/dev/null || { echo "RSYNC_MISSING on target"; exit 1; }
 T
   export RSYNC_RSH="ssh -o BatchMode=yes -o ControlPath=$HOME/.ssh/cm/%r@%h:%p"
-  rsync -a --info=stats1 "$SRC/" "mybuddy@$HOST:$B/" \
+  rsync -a --info=stats1 "$SRC/" "$SSH_USER@$HOST:$B/" \
     --exclude instance --exclude run --exclude venv --exclude logfile --exclude __pycache__
-  rsync -a "$SRC/src/pgvector" "mybuddy@$HOST:$B/src/"
-  rsync -a "$SRC/fastembed/" "mybuddy@$HOST:$B/fastembed/"
-  rsync -a "$FORK/" "mybuddy@$HOST:~/.hermes/forks/lcm-pg/"
+  rsync -a "$SRC/src/pgvector" "$SSH_USER@$HOST:$B/src/"
+  rsync -a "$SRC/fastembed/" "$SSH_USER@$HOST:$B/fastembed/"
+  rsync -a "$FORK/" "$SSH_USER@$HOST:~/.hermes/forks/lcm-pg/"
   echo "== land-verify =="
   rsh <<T
 test -f $B/pg/bin/postgres && echo bin-ok || echo bin-MISSING
