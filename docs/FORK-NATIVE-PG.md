@@ -9,10 +9,12 @@
 ## Status — real-world validated
 
 **2026-10-25:** first true end-to-end success on native PG since the sqlite
-conversion — a real-world LCM compression ran clean on the `mybuddy-trade`
-host for the `pip` profile (Jan's manual test; fleet-wide `check_all` 0 FAIL on
-all five hosts at `3a1e041`). The fleet now runs a single deploy branch
-(`main`) with every host on the same artifact.
+conversion — a real-world LCM compression ran clean on a production fleet
+host for a live agent profile (fleet-wide health checks 0 FAIL on all hosts at
+the same artifact). The fleet runs a single deploy branch (`main`) with every
+host on the same artifact. Integrating any Hermes agent profile with the
+native PG backend is fully specified in
+**[docs/PROFILE-INTEGRATION.md](docs/PROFILE-INTEGRATION.md)**.
 
 ## What the fork adds
 
@@ -27,7 +29,7 @@ all five hosts at `3a1e041`). The fleet now runs a single deploy branch
   host — git fetch ff-only → materialise into
   `~/.hermes/plugins/lcm-pg` → stamped per-schema migrations → params sync →
   restart all surfaces → verify. Hosts without GitHub access fetch their own
-  `~/lcm-pg-push.git` staging repo (beez fans out to it).
+  `~/lcm-pg-push.git` staging repo (the coordination host fans out to it).
 - **Fleet health checks** (`scripts/lcm_check_all.py`): per-host markdown
   report — migrations, guards, params, pools, residue — 0-FAIL contract before
   a deploy counts as done.
@@ -53,7 +55,7 @@ led to a full root-cause chain. Findings, all live-verified:
    now sweeps: idle backends whose holder process is gone (any age),
    `idle in transaction` older than 10 min, and live-holder idles older than
    the sweep threshold.
-4. **The pool pin must be enforced, not just created.** beez silently ran on
+4. **The pool pin must be enforced, not just created.** One host silently ran on
    the default 8 for days because the pin logic was create-only; it now
    enforces ≥ 16 on every pass.
 
@@ -73,10 +75,11 @@ ss -xup | grep lcm-pg/run/.s.PGSQL
 
 ## Fleet deploy workflow (pipeline v2)
 
-Code changes are authored **only on beez** in the fork → `git push origin main`
-→ beez fans the same ref out to each host's `~/lcm-pg-push.git` staging repo
-→ on each host: `bash ~/lcm_update.sh` (fetch → migrate → params → restart →
-verify) → `lcm_check_all.py` must report 0 FAIL.
+Code changes are authored **only on the coordination host** in the fork →
+`git push origin main` → the same ref is fanned out to each host's
+`~/lcm-pg-push.git` staging repo → on each host: `bash ~/lcm_update.sh`
+(fetch → migrate → params → restart → verify) → `lcm_check_all.py` must
+report 0 FAIL.
 
 **Critical gotcha (learned the hard way, 2026-10-25):** the deploy restarts
 every hermes surface, including the webui serving your own session. A

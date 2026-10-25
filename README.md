@@ -819,6 +819,7 @@ exposes retrieval tools that can drill back into exact stored sources.
 - [Operator guide](docs/operator-guide.md) — install, activation, full
   configuration reference, diagnostics
 - [Retrieval tools reference](docs/retrieval-tools.md) — exact tool contracts
+- [Profile integration guide](docs/PROFILE-INTEGRATION.md) — making any Hermes agent profile work end-to-end with the native PG backend
 - [Embeddings setup](docs/embeddings-setup.md) — free-tier and local embedding
   providers, warmup, backfill
 - [LCM paper](https://papers.voltropy.com/LCM)
