@@ -23,7 +23,7 @@ HOME_DIR="${HOME}"
 HERMES_HOME="${HERMES_HOME:-$HOME_DIR/.hermes}"
 PLUGIN_DIR="${PLUGIN_DIR:-$HERMES_HOME/plugins/lcm-pg}"
 PARAM_FILES="${LCM_PARAM_FILES:-}"
-REF="origin/HEAD"; LOCAL_REPO=""; DO_RESTART=1; DRY=""; MIGRATIONS_ONLY=""
+REF="origin/main"; LOCAL_REPO=""; DO_RESTART=1; DRY=""; MIGRATIONS_ONLY=""
 CMD=deploy
 
 while [[ $# -gt 0 ]]; do
@@ -78,12 +78,25 @@ fetch_ok=0
 # SUCCEED on its own — never fall back to the generic fetch.
 REFSPEC="$REF"
 [[ "$REFSPEC" == refs/* ]] || REFSPEC=refs/heads/${REF#origin/}
+# "HEAD" is a symbolic ref, never a branch: refs/heads/HEAD does not exist on
+# the remote (fetch fails, then the local-ref branch below writes FETCH_HEAD
+# via a redirect that explodes when .git is missing). Map it to the real
+# default-branch name first.
+if [[ "$REFSPEC" == */HEAD ]]; then
+  REF="$(git -C "$PLUGIN_DIR" symbolic-ref --short "$REF" 2>/dev/null \
+        || git -C "$PLUGIN_DIR" symbolic-ref --quiet "$REF" 2>/dev/null \
+        || echo origin/main)"
+  log "origin/HEAD resolved to default branch $REF"
+  REFSPEC="$REF"
+  [[ "$REFSPEC" == refs/* ]] || REFSPEC=refs/heads/${REF#origin/}
+fi
 git -C "$PLUGIN_DIR" fetch -q origin "$REFSPEC" 2>/dev/null && fetch_ok=1
 if [[ $fetch_ok -eq 0 ]] && git -C "$PLUGIN_DIR" rev-parse -q --verify "$REF^{commit}" >/dev/null 2>&1; then
   # ref already present locally (bare branch name / local object): FETCH_HEAD
   # format wants '<sha>\t<why>' — a bare sha line parses as a bad ref name.
+  gd="$(git -C "$PLUGIN_DIR" rev-parse --git-dir 2>/dev/null)" && [[ -d "$gd" ]] || { die "$PLUGIN_DIR has no .git dir (repo was stripped by an external sync?) — reinstall the plugin dir"; }
   printf '%s\t\tlocal ref\n' "$(git -C "$PLUGIN_DIR" rev-parse "$REF^{commit}")" \
-    > "$(git -C "$PLUGIN_DIR" rev-parse --git-dir)/FETCH_HEAD" && fetch_ok=1
+    > "$gd/FETCH_HEAD" && fetch_ok=1
 fi
 if [[ $fetch_ok -eq 0 && "$REF" == "origin/HEAD" ]]; then
   git -C "$PLUGIN_DIR" fetch -q origin 2>/dev/null && fetch_ok=1
