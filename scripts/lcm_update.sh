@@ -283,6 +283,14 @@ if [[ -d "$HOME_DIR/.hermes/profiles" && ( -e "$HOME_DIR/.hermes/plugins/lcm-pg"
 fi
 for ef in "${env_files[@]}"; do
   [[ -f "$ef" ]] || continue
+  # Idle-connection recycling (fleet policy): the fork arms psycopg's reaper
+  # with LCM_PG_POOL_MAX_IDLE (default 60s). It closes returned-idle members
+  # and recycles anything older than max_lifetime, so a live-but-quiet surface
+  # genuinely releases backends instead of parking 15 idle ones for hours.
+  if ! grep -q '^LCM_PG_POOL_MAX_IDLE=' "$ef"; then
+    echo 'LCM_PG_POOL_MAX_IDLE=60' >> "$ef"
+    log "pool-pin: LCM_PG_POOL_MAX_IDLE=60 -> $ef"
+  fi
   # Pool pin (fleet policy): the fork defaults LCM_PG_POOL_MAX=8 and a
   # compaction-heavy profile saturates its own 8-slot pool (PoolTimeout
   # 'couldn't get a connection after 10.00 sec' killed pip's compression on
