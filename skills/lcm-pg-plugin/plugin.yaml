@@ -1,5 +1,0 @@
-name: lcm-pg-plugin
-version: 1.0.0
-description: "Skill-carrier plugin for the lcm-pg fork. Ships no tools and hooks nothing — its only job is to make the lcm-pg new-agent-profile onboarding skill visible to EVERY Hermes profile that has the lcm-pg plugin enabled, on every fleet host."
-author: mike
-provides_tools: []
