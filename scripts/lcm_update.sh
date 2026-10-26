@@ -344,6 +344,17 @@ if [[ $DO_RESTART -eq 1 && -z "$DRY" ]]; then
   fi
 fi
 
+# ---- 3e. skill visibility (plugin-carried skills -> every profile) ---------
+# Hermes lists skills from the profile skills dir + skills.external_dirs ONLY
+# (agent/skill_utils.get_skill_search_roots; plain plugins' skills/ trees are
+# NOT scanned). Point every hermes home at this host's plugin skills tree so
+# skills like lcm-pg-new-profile-setup are visible to every profile, incl.
+# ones created after this deploy. Idempotent + per-file config backups.
+if [[ -z "$DRY" ]]; then
+  _sk="$(bash "$PLUGIN_DIR/scripts/add-skill-external-dirs.sh" 2>&1 | grep -c '^added:')" || _sk=0
+  [[ "${_sk:-0}" -gt 0 ]] && log "skill-visibility: added external_dirs in $_sk config(s)" || log "skill-visibility: all configs already carry external_dirs"
+fi
+
 # ---- 5. health check -> report -----------------------------------------------
 python3 "$PLUGIN_DIR/scripts/lcm_check_all.py" || true   # report is the artifact; exit code of update = 0
 REPORT="$HOME_DIR/lcm-pg-check-$(hostname).md"
