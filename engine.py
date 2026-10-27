@@ -355,31 +355,13 @@ _ROLLUP_MAINTENANCE_SCHEDULER = _RollupMaintenanceScheduler()
 _SESSION_END_BUSY_TIMEOUT_MS = 50
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
 
-# Window-aware autocompress thresholds (configurable default for every agent
-# profile). Compaction fires earlier (lower fraction) as the brain model's
-# context window grows so big windows stay out of the costlier tail:
-# 262k -> 60%, 512k -> 45%, 1M -> 35%. Exact-window buckets, so an unexpected
-# window does not match and the authoritative config (explicit LCM override or
-# the codex autoraise) stays in force. Tunable via
-# LCM_WINDOW_THRESHOLDS="tokens=fraction,tokens=fraction".
-_WINDOW_COMPRESS_THRESHOLDS: list[tuple[int, float]] = [
-    (262_144, 0.60),
-    (512_000, 0.45),
-    (1_000_000, 0.35),
-]
-
-
-def _window_compress_threshold(raw_context_length: int) -> float | None:
-    """Fraction to compress at for a brain-model context window, or None when
-    the window is not one of the tuned buckets."""
-    try:
-        ctx = int(raw_context_length)
-    except (TypeError, ValueError):
-        return None
-    for bucket, frac in _WINDOW_COMPRESS_THRESHOLDS:
-        if ctx == bucket:
-            return frac
-    return None
+# Fleet autocompress standard (Jan 2026-10-27): compress at a FLAT 50% of the
+# context window for every profile, regardless of the provider's window size.
+# The former window-aware buckets (262k->60%, 512k->45%, 1M->35%) are retired;
+# the flat fraction is the plugin default (config context_threshold=0.50) and
+# an explicit operator override (LCM_CONTEXT_THRESHOLD or
+# lcm.context_threshold) stays authoritative.
+_LCM_FLAT_COMPRESS_THRESHOLD = 0.50
 _TOTAL_COMPACTIONS_SCOPE = "current_conversation"
 
 # Auto-focus topic derivation: infer a compact focus hint from the most recent
@@ -916,21 +898,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         }
         route_model = self.model if model is None else model
         route_provider = self.provider if provider is None else provider
-        # Window-aware default: for the standard brain-model context windows,
-        # compress at a fixed fraction that scales inversely with the window
-        # (262k->60%, 512k->45%, 1M->35%). This is the configurable fleet-wide
-        # default, so it takes precedence over an inherited host/compression
-        # threshold. An explicit operator override (LCM_CONTEXT_THRESHOLD or
-        # lcm.context_threshold) stays authoritative, and windows outside the
-        # buckets fall through to the normal/codex logic below.
-        if not explicit_lcm_override:
-            window_frac = _window_compress_threshold(self.raw_context_length)
-            if window_frac is not None and window_frac != configured:
-                return (
-                    window_frac,
-                    "context_window_autotune",
-                    {"from": configured, "to": window_frac},
-                )
+        # Fleet standard: when the threshold was NOT explicitly set (no
+        # LCM_CONTEXT_THRESHOLD / lcm.context_threshold), compress at the flat
+        # 50% window fraction regardless of provider window size — this
+        # overrides an inherited host compression.threshold (fleet hosts carry
+        # 0.45) and the retired window-bucket autotune. Explicit operator
+        # overrides stay authoritative.
+        if source == "manual_or_default" and configured != _LCM_FLAT_COMPRESS_THRESHOLD:
+            return (
+                _LCM_FLAT_COMPRESS_THRESHOLD,
+                "flat_window_default",
+                {"from": configured, "to": _LCM_FLAT_COMPRESS_THRESHOLD},
+            )
         if (
             _is_codex_gpt55_route(route_model, route_provider)
             and self._config.codex_gpt55_autoraise_enabled

@@ -488,10 +488,15 @@ def s_params(schemas):
             md = (d.get("model") or {}).get("default")
             am = aux.get("model")
             thr = comp.get("threshold")
-            ok = am == md
+            # Jan 2026-10-27: compression must run on the profile's ACTIVE
+            # model. Hermes resolves an UNSET aux compression model to the
+            # main/current runtime (# compression-current-model), so correct
+            # == ABSENT (or blank). An explicit pin (even == model.default)
+            # freezes the route and must be converged away by params-sync.
+            ok = am is None or not str(am).strip()
             add("PARAMS", f"profile:{p}", "PASS" if ok else "WARN",
-                f"model.default={md} auxiliary.compression.model={am} threshold={thr}"
-                + ("" if ok else "  <-- summary model must equal profile default"))
+                f"model.default={md} auxiliary.compression.model={'<unset: follows active model>' if ok else am} threshold={thr}"
+                + ("" if ok else "  <-- aux pin must be REMOVED (hermes config unset auxiliary.compression.model) so compression follows the active model"))
         except Exception as e:
             add("PARAMS", f"profile:{p}", "INFO", f"parse: {type(e).__name__}")
     for u in ("hermes-gateway", "hermes-webui"):

@@ -77,6 +77,22 @@ def cfg_set(profile: str | None, key: str, value: str) -> bool:
     return True
 
 
+def _cfg_unset(profile: str | None, key: str) -> bool:
+    """Remove a config.yaml key via the CLI only (hermes [-p p] config unset).
+    Falls back to a WARN + manual hint when this Hermes build has no unset
+    subcommand; never touches the file directly."""
+    import subprocess
+    b = _hermes_bin()
+    cmd = [b] + (["-p", profile] if profile else []) + ["config", "unset", key]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if r.returncode == 0:
+        return True
+    msg = (r.stderr or r.stdout or "").strip().splitlines()
+    print(f"cfg unset FAILED ({profile or 'root'} {key}): {msg[-1] if msg else 'rc=' + str(r.returncode)}"
+          "  -> manual: hermes" + (f" -p {profile}" if profile else "") + f" config unset {key}")
+    return False
+
+
 def _env_keys(path: Path) -> dict[str, str]:
     # same parsing as backends/postgres.py:_load_dotenv_from_home (the runtime
     # reader this check must mirror): the LAST definition of a key wins (a
@@ -188,6 +204,27 @@ def main() -> int:
             continue
         ok = cfg_set(prof if prof != "default" else None, "context.engine", "lcm")
         print(f"cfg {prof}: context.engine {eng!r} -> lcm {'ok' if ok else 'FAILED'}")
+        if not ok:
+            errors += 1
+
+    # ---- auxiliary.compression.model: unset everywhere (follow main) ------
+    # Jan 2026-10-27: the compression summary must run on the profile's ACTIVE
+    # model, never a separate aux pin. Hermes resolves an UNSET aux compression
+    # model to the main/current runtime model (# compression-current-model),
+    # so the correct converged value is ABSENT, not "main".  An explicit pin
+    # (anything set, incl. "main") is removed via `hermes config set --unset`;
+    # if the CLI cannot unset, WARN with the manual command.
+    for prof in profiles:
+        pa = prof if prof != "default" else None
+        found, val = cfg_get(pa, "auxiliary.compression.model")
+        if not found or not str(val).strip():
+            continue  # unset/blank already means "follow the main model"
+        if a.dry_run:
+            print(f"dry: cfg unset auxiliary.compression.model -> profile {prof} (was {val!r})")
+            continue
+        ok = _cfg_unset(pa, "auxiliary.compression.model")
+        print(f"cfg {prof}: auxiliary.compression.model {val!r} -> unset (follow main) "
+              f"{'ok' if ok else 'FAILED'}")
         if not ok:
             errors += 1
 
