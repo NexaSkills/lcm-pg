@@ -269,6 +269,8 @@ if [[ -z "$DRY" && ! -e "$SWEEP_STAMP" ]]; then
     log "stale-backends: none"
   fi
   touch "$SWEEP_STAMP"
+else
+  log "stale-backends: skip (stamp $SWEEP_STAMP exists; delete to re-force)"
 fi
 
 env_files=("$HOME_DIR/.hermes/.env")
