@@ -1,0 +1,11 @@
+# configs/managed-scope.yaml — canonical /etc/hermes/config.yaml overlay
+# content (fleet standard). Deployed by hand via sudo on hosts that use a
+# system-level overlay; lcm_update.sh only ever READS /etc, never writes it.
+# Fleet policy (Jan 2026-10-27): prefer NO overlay at all (config lives under
+# ~/.hermes only). Where an overlay is mandated, it MUST list every load-bearing
+# plugin — a LIST leaf REPLACES plugins.enabled fleet-wide, so a short list
+# silently disables lcm-pg on every surface (template incident 2026-10-27).
+plugins:
+  enabled:
+    - lcm-pg
+    - hermes-lcm
