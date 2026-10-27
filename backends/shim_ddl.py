@@ -546,6 +546,32 @@ def _registry_rows() -> str:
 
 
 def install(cur, schema: str) -> None:
+    # Catalog-race guard (template/warren 2026-10-27): several surfaces
+    # booting onto one fresh schema race this CREATE OR REPLACE storm; the
+    # loser's next statement (the sqlite_master SELECT right after VIEW)
+    # dies with 'cache lookup failed for function' inside the just-
+    # redefined SQL functions — a transient, and every DDL here is
+    # idempotent, so replay the whole install.
+    import psycopg.errors as _pe
+    _MARK = ("tuple concurrently updated", "tuple concurrently deleted",
+             "cache lookup failed")
+    for _i in range(4):
+        try:
+            _install_once(cur, schema)
+            return
+        except (_pe.SerializationFailure, _pe.InternalError) as exc:
+            if not any(m in str(exc) for m in _MARK):
+                raise
+            try:
+                cur.connection.rollback()
+            except Exception:
+                pass
+            import time as _t
+            _t.sleep(0.05 * (2 ** _i))
+    _install_once(cur, schema)  # last attempt: let a real error surface
+
+
+def _install_once(cur, schema: str) -> None:
     if not _SCHEMA_RE.match(schema):
         raise ValueError(schema)
     cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
