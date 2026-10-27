@@ -409,6 +409,23 @@ if [[ -z "$DRY" && -d "$HOME_DIR/.hermes/profiles" ]]; then
     || log "config-sync: every profile config resolves context.engine=lcm"
 fi
 
+# ---- 3c3. managed-scope overlay check (NO /etc writes, ever) ----------------
+# If a stray /etc/hermes/config.yaml exists, hermes_cli/managed_scope.py
+# applies it OVER every profile and a LIST leaf REPLACES plugins.enabled
+# fleet-wide (template 2026-10-27: an overlay listing only
+# planning-with-files silently disabled lcm-pg on every surface). Fleet
+# policy (Jan 2026-10-27): ALL Hermes config lives under ~/.hermes — /etc is
+# root-owned, out of bounds, and must NOT exist on a fleet host. The deploy
+# therefore never reads-modifies-or-writes /etc; it only DETECTS a stray
+# overlay and FAILS the deploy so the situation can never be a silent
+# mystery. Remove such a file by hand:  sudo rm -rf /etc/hermes
+if [[ -e /etc/hermes/config.yaml ]]; then
+  log "FAIL: stray /etc/hermes/config.yaml — fleet policy: Hermes config lives under ~/.hermes ONLY."
+  log "      managed_scope applies it OVER every profile (plugins.enabled REPLACED fleet-wide)."
+  log "      fix:  sudo rm -rf /etc/hermes   (then rerun this deploy)"
+  exit 1
+fi
+
 # ---- 3d. plugin migration hermes-lcm -> lcm-pg (assumed on every host) ------
 # The deploy ASSUMES the host is migrating FROM the upstream hermes-lcm plugin
 # TO lcm-pg: code migration happened in step 1 (materialize) and overlays in

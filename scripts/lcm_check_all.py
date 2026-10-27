@@ -387,6 +387,14 @@ def s_params(schemas):
     # behave identically). check_all verifies the FULL surface independently.
     _root_lcm = {k: v for k, v in keys.items()
                  if k.startswith("LCM_") and v.strip().strip('"').strip("'")}
+    # Fleet hygiene (Jan 2026-10-27): Hermes config must live under ~/.hermes
+    # ONLY. A stray /etc/hermes/config.yaml makes managed_scope.py overlay
+    # plugins.enabled OVER every profile (LIST leaves REPLACE) — it silently
+    # defeated lcm-pg host-wide on template. Detect, don't write: /etc is
+    # out of bounds for this tooling (root-owned; fleet uses ~/.hermes only).
+    if Path("/etc/hermes").is_dir():
+        add("PARAMS", "managed-overlay-stray", "FAIL",
+            "/etc/hermes exists — managed overlay would REPLACE plugins.enabled over every profile; remove it: sudo rm -rf /etc/hermes")
     for _pf0 in (sorted((HERMES_HOME / "profiles").glob("*/.env"))
                  if (HERMES_HOME / "profiles").is_dir() else []):
         try:
