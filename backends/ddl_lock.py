@@ -13,6 +13,13 @@ several surfaces (gateway + webui + dashboard) start together after a
 restart, their provisioning races on the same schema — on template this
 dropped the whole plugin on boot ("Failed to load plugin 'hermes-lcm':
 tuple concurrently updated", 2026-10-27).
+#
+# warren 2026-10-27: same race class, different message — three surfaces
+# booting onto one fresh schema raced CREATE OR REPLACE FUNCTION
+# _lcm_tabledef; the loser's SQL-function inlining died with
+# "ERROR: cache lookup failed for function <oid>" (XX000) inside
+# _lcm_tabledef's own statement. Catalog-tuple races surface under more
+# than one wording; match both.
 
 Fix: run idempotent provisioning DDL under a transaction-level advisory
 lock keyed by (schema, DDL text). Same DDL serialises across processes;
@@ -39,6 +46,10 @@ except Exception:  # pragma: no cover
 _RETRY_MESSAGE_MARKERS = (
     "tuple concurrently updated",
     "tuple concurrently deleted",
+    # warren 2026-10-27: loser of a CREATE OR REPLACE FUNCTION race, raised
+    # when PG inlines the function mid-replacement. Idempotent DDL retry is
+    # the correct remedy (same class as the two above).
+    "cache lookup failed for function",
 )
 
 
