@@ -2,12 +2,16 @@
 # Install the reentrancy guard into the fork's connect() and verify end-to-end
 # with pool 1/1 (the exact config that deadlocked embed_auto_backfill).
 set -euo pipefail
-FORK="${HOME}/.hermes/forks/lcm-pg"
+# Code root: prefer the runtime plugin tree (fleet); dev host may export
+# LCM_PG_CODE to point at its authoring fork.
+FORK="${LCM_PG_CODE:-${HOME}/.hermes/plugins/lcm-pg}"
+[[ -d "$FORK/scripts" ]] || FORK="${HOME}/.hermes/forks/lcm-pg"
 B="$HOME/lcm-pg"
 
+export LCM_PG_CODE="$FORK"
 grep -q "_LCM_PG_REENTRANT_INSTALL_DONE" "$FORK/backends/postgres.py" || python3 - <<'PY'
 import re, os
-p = os.path.expanduser("~/.hermes/forks/lcm-pg/backends/postgres.py")
+p = os.environ["LCM_PG_CODE"] + "/backends/postgres.py"
 src = open(p).read()
 anchor = "def connect("
 i = src.index(anchor)
@@ -54,7 +58,7 @@ class ContextEngine(abc.ABC):
     def update_from_response(self,*a,**k): ...
 ce.ContextEngine=ContextEngine; agent.context_engine=ce
 sys.modules["agent"]=agent; sys.modules["agent.context_engine"]=ce
-FORK=str(Path.home()/".hermes/forks/lcm-pg")
+FORK=os.environ["LCM_PG_CODE"]
 sys.path.insert(0, FORK)
 st=importlib.import_module("store")  # fork root on sys.path: flat module names
 
