@@ -1,4 +1,14 @@
 name: hermes-lcm
+# Registry key is the DIRECTORY name (lcm-pg), not the manifest name. Without
+# this, a host with both the lcm-pg dir and the legacy hermes-lcm overlay dir
+# (symlink to it) scans TWO manifests with the same key `hermes-lcm`, and
+# because every Hermes profile is its own home scope, each profile's boot
+# re-imports the whole engine inside the 10s load deadline — last one wins
+# (resolve_manifest_winners dedupes per home) but a cold boot pays N× the
+# import cost and can surface 'Failed to load plugin: load timed out'.
+# `key:` pins both dirs to one id; the gate still honours the bare legacy
+# name `hermes-lcm` via manifest.name (plugins_discovery.gate_manifest).
+key: lcm-pg
 version: 1.0.0-rc.1
 description: "Lossless Context Management — standalone Hermes plugin with a DAG-based context engine that never loses a message"
 author: "Voltropy / Hermes Community"
