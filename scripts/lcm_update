@@ -114,21 +114,18 @@ fetch_ok=0
 # origin/HEAD (repo default branch), which silently ignores --ref and can
 # deploy the wrong code while reporting success. The ref-name fetch must
 # SUCCEED on its own — never fall back to the generic fetch.
-REFSPEC="$REF"
-[[ "$REFSPEC" == refs/* ]] || REFSPEC=refs/heads/${REF#origin/}
-# "HEAD" is a symbolic ref, never a branch: refs/heads/HEAD does not exist on
-# the remote (fetch fails, then the local-ref branch below writes FETCH_HEAD
-# via a redirect that explodes when .git is missing). Map it to the real
-# default-branch name first.
-if [[ "$REFSPEC" == */HEAD ]]; then
-  REF="$(git -C "$PLUGIN_DIR" symbolic-ref --short "$REF" 2>/dev/null \
-        || git -C "$PLUGIN_DIR" symbolic-ref --quiet "$REF" 2>/dev/null \
-        || echo origin/main)"
-  log "origin/HEAD resolved to default branch $REF"
-  REFSPEC="$REF"
-  [[ "$REFSPEC" == refs/* ]] || REFSPEC=refs/heads/${REF#origin/}
-fi
-git -C "$PLUGIN_DIR" fetch -q origin "$REFSPEC" 2>/dev/null && fetch_ok=1
+# REMOTE: --ref <remote>/<branch> fetches from THAT remote, not hardcoded
+# origin (template incident 2026-10-27: clone origin was a stale local
+# push-repo and GitHub was remote `nexa`; the old code mangled nexa/main
+# into refs/heads/nexa/main on origin and died on a misleading 'no .git dir').
+FETCH_REMOTE=origin
+[[ "$REF" == */* ]] && FETCH_REMOTE="${REF%%/*}"
+case "$REF" in
+  refs/*) FETCH_BRANCH="$REF" ;;          # fully-qualified ref: pass through
+  */HEAD) FETCH_BRANCH=HEAD ;;            # symbolic HEAD: fetch resolves it
+  *)      FETCH_BRANCH="${REF##*/}" ;;
+esac
+git -C "$PLUGIN_DIR" fetch -q "$FETCH_REMOTE" "$FETCH_BRANCH" 2>/dev/null && fetch_ok=1
 if [[ $fetch_ok -eq 0 ]] && git -C "$PLUGIN_DIR" rev-parse -q --verify "$REF^{commit}" >/dev/null 2>&1; then
   # ref already present locally (bare branch name / local object): FETCH_HEAD
   # format wants '<sha>\t<why>' — a bare sha line parses as a bad ref name.
@@ -136,8 +133,8 @@ if [[ $fetch_ok -eq 0 ]] && git -C "$PLUGIN_DIR" rev-parse -q --verify "$REF^{co
   printf '%s\t\tlocal ref\n' "$(git -C "$PLUGIN_DIR" rev-parse "$REF^{commit}")" \
     > "$gd/FETCH_HEAD" && fetch_ok=1
 fi
-if [[ $fetch_ok -eq 0 && "$REF" == "origin/HEAD" ]]; then
-  git -C "$PLUGIN_DIR" fetch -q origin 2>/dev/null && fetch_ok=1
+if [[ $fetch_ok -eq 0 && "$REF" == *"/HEAD" ]]; then
+  git -C "$PLUGIN_DIR" fetch -q "$FETCH_REMOTE" 2>/dev/null && fetch_ok=1
 fi
 # fallback: --local may point at a git repo dir or a .bundle file
 if [[ $fetch_ok -eq 0 && -n "$LOCAL_REPO" && -e "$LOCAL_REPO" ]]; then
