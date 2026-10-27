@@ -413,10 +413,39 @@ fi
 # planning-with-files silently disabled lcm-pg on every surface). Fleet
 # policy (Jan 2026-10-27): ALL Hermes config lives under ~/.hermes — /etc is
 # root-owned, out of bounds, and must NOT exist on a fleet host. The deploy
-# therefore never reads-modifies-or-writes /etc; it only DETECTS a stray
-# overlay and FAILS the deploy so the situation can never be a silent
-# mystery. Remove such a file by hand:  sudo rm -rf /etc/hermes
+# never reads-modifies-or-writes /etc itself; it DETECTS a stray overlay and
+# RESCUES the load-bearing keys into root config.yaml BEFORE FAILING, so the
+# operator's `sudo rm -rf /etc/hermes` can never strand the host.
+# (Hermes hard-blocks `config set` for any key the overlay pins, so writing
+# root plugins.enabled is impossible while the overlay exists — copy the
+# pinned values down, then fail with the same instruction.)
 if [[ -e /etc/hermes/config.yaml ]]; then
+  # ONE-TIME rescue: if root lacks a key the overlay pins AND that key is
+  # load-bearing for this plugin (plugins.enabled), copy the overlay's value
+  # into root. `hermes config set` CANNOT do this (config.py hard-rejects any
+  # key the overlay pins), so this is the single sanctioned exception to the
+  # config-set-only rule — a direct root config.yaml write, read-only on the
+  # overlay, and it loses its trigger the moment the overlay is gone.
+  # Net effect equals `hermes plugins enable` run after the overlay is removed.
+  if ! grep -qE '^\s+enabled:' "$HOME_DIR/.hermes/config.yaml" 2>/dev/null; then
+    _managed_en=$(python3 -c 'import yaml,sys;d=yaml.safe_load(open("/etc/hermes/config.yaml")) or {};e=(d.get("plugins") or {}).get("enabled");print(",".join(e) if isinstance(e,list) else "")' 2>/dev/null) || _managed_en=""
+    if [[ -n "$_managed_en" ]]; then
+      _need=""
+      for _k in lcm-pg hermes-lcm; do [[ "$_managed_en" == *"$_k"* ]] || _need="$_need $_k"; done
+      [[ -n "$_need" ]] && _managed_en="$_managed_en$_need"
+      python3 - "$HOME_DIR/.hermes/config.yaml" "$_managed_en" <<'PYEOF' 2>/dev/null && \
+        log "rescue: copied plugins.enabled [$_managed_en] into root config.yaml (was pinned only in /etc overlay)" || \
+        log "WARN: rescue of plugins.enabled failed — after rm /etc/hermes run: hermes plugins enable lcm-pg"
+import sys, yaml
+p, keys = sys.argv[1], [k for k in sys.argv[2].split(",") if k]
+d = yaml.safe_load(open(p)) or {}
+pl = d.setdefault("plugins", {})
+cur = set(pl.get("enabled") or [])
+pl["enabled"] = sorted(cur | set(keys))
+open(p, "w").write(yaml.safe_dump(d, sort_keys=False))
+PYEOF
+    fi
+  fi
   log "FAIL: stray /etc/hermes/config.yaml — fleet policy: Hermes config lives under ~/.hermes ONLY."
   log "      managed_scope applies it OVER every profile (plugins.enabled REPLACED fleet-wide)."
   log "      fix:  sudo rm -rf /etc/hermes   (then rerun this deploy)"
