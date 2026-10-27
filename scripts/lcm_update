@@ -291,10 +291,17 @@ fi
 # missing from its catalog) and falls back to a zero-byte per-profile lcm.db.
 # The legacy 'hermes-lcm' name is retired (Jan directive 2026-10-27): it is
 # deleted here, never created. Do it even when the profile has no .env yet.
+# Root-level legacy plugin dir/symlink (beez 2026-10-27: survived a deploy
+# because the 3c block below only runs when a profiles/ dir exists — root-
+# only hosts skipped the whole block). A root hermes-lcm dir makes a stale
+# root enabled: hermes-lcm loadable, so it goes first, always.
+_rlp="$HOME_DIR/.hermes/plugins/hermes-lcm"
+if [[ -L "$_rlp" ]]; then rm -f "$_rlp"; log "overlay: removed retired $_rlp"
+elif [[ -e "$_rlp" ]]; then mv "$_rlp" "$_rlp.retired.$(date +%Y%m%d%H%M%S)"; log "overlay: retired $_rlp (moved aside)"; fi
 if [[ -d "$HOME_DIR/.hermes/profiles" && ( -e "$HOME_DIR/.hermes/plugins/lcm-pg" || -L "$HOME_DIR/.hermes/plugins/lcm-pg" ) ]]; then
   # root-level legacy dir/symlink too (it makes a stale root enabled: hermes-lcm
   # loadable); removed so the retired name exists nowhere.
-  _rl="$HOME_DIR/.hermes/plugins/hermes-lcm"
+  _rl="$_rlp"
   if [[ -L "$_rl" ]]; then rm -f "$_rl"; log "overlay: removed retired $_rl"
   elif [[ -e "$_rl" ]]; then mv "$_rl" "$_rl.retired.$(date +%Y%m%d%H%M%S)"; log "overlay: retired $_rl (moved aside)"; fi
   for pd in "$HOME_DIR"/.hermes/profiles/*/; do
