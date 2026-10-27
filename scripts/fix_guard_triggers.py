@@ -35,7 +35,9 @@ Usage: fix_guard_triggers.py [DSN]   (default LCM_PG_DSN or the private cluster)
 import os
 import sys
 
-sys.path.insert(0, os.path.expanduser("~/.hermes/forks/lcm-pg"))
+# Code root: this script lives in <repo>/scripts, so the repo root is the
+# package dir — works from plugins/lcm-pg (fleet) and forks/lcm-pg (dev).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("LCM_BACKEND", "postgres")
 DSN = sys.argv[1] if len(sys.argv) > 1 else os.environ.get(
     "LCM_PG_DSN",

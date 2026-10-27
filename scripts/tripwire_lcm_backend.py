@@ -25,7 +25,7 @@ import sys
 import time
 from pathlib import Path
 
-FORK = Path.home() / ".hermes/forks/lcm-pg"
+FORK = Path(os.environ.get("LCM_PG_CODE") or (Path.home() / ".hermes/plugins/lcm-pg")).resolve()
 PROBE = (
     "import sys; sys.path.insert(0, %r)\n"
     "from backends import sqlite3_compat\n"

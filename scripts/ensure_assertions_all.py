@@ -19,7 +19,7 @@ private-cluster DSN)
 import os
 import sys
 
-sys.path.insert(0, os.path.expanduser("~/.hermes/forks/lcm-pg"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("LCM_BACKEND", "postgres")
 DSN = sys.argv[1] if len(sys.argv) > 1 else os.environ.get(
     "LCM_PG_DSN",
