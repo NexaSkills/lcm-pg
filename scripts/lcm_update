@@ -286,15 +286,22 @@ if [[ -z "$DRY" && -f "$PLUGIN_DIR/scripts/lcm_params_sync.py" ]]; then
 fi
 
 # ---- 3c. plugin overlay for EVERY profile (incl. profiles created after the
-# install). Discovery only finds hermes-lcm through a per-profile symlink;
-# a profile dir without one silently loads NO lcm plugin (tools missing from
-# its catalog) and falls back to a zero-byte per-profile lcm.db. Do it even
-# when the profile has no .env yet.
+# install). Discovery gates on the DIRECTORY name, so the overlay MUST be
+# named lcm-pg; a profile dir without one silently loads NO lcm plugin (tools
+# missing from its catalog) and falls back to a zero-byte per-profile lcm.db.
+# The legacy 'hermes-lcm' name is retired (Jan directive 2026-10-27): it is
+# deleted here, never created. Do it even when the profile has no .env yet.
 if [[ -d "$HOME_DIR/.hermes/profiles" && ( -e "$HOME_DIR/.hermes/plugins/lcm-pg" || -L "$HOME_DIR/.hermes/plugins/lcm-pg" ) ]]; then
   for pd in "$HOME_DIR"/.hermes/profiles/*/; do
     prof="$pd/plugins"
-    lp="$prof/hermes-lcm"
+    lp="$prof/lcm-pg"
+    legacy="$prof/hermes-lcm"
     mkdir -p "$prof"
+    if [[ -L "$legacy" ]]; then
+      rm -f "$legacy"; log "overlay: removed retired $legacy"
+    elif [[ -e "$legacy" ]]; then
+      mv "$legacy" "$legacy.retired.$(date +%Y%m%d%H%M%S)"; log "overlay: retired $legacy (moved aside)"
+    fi
     if [[ -L "$lp" ]]; then
       tgt=$(readlink "$lp")
       [[ "$tgt" == "$HOME_DIR/.hermes/plugins/lcm-pg" ]] || {
@@ -472,8 +479,9 @@ fi
 # The deploy ASSUMES the host is migrating FROM the upstream hermes-lcm plugin
 # TO lcm-pg: code migration happened in step 1 (materialize) and overlays in
 # 3c; this converges plugins.enabled in root + every profile config.yaml
-# (enabled += lcm-pg, - hermes-lcm once the lcm-pg plugin dir is live;
-# disabled -= lcm-pg). Idempotent; backs up each touched file.
+# (enabled += lcm-pg, - hermes-lcm — the retired name must not stay listed
+# once the lcm-pg plugin dir is live; disabled -= lcm-pg). Idempotent; backs
+# up each touched file.
 if [[ -z "$DRY" ]]; then
   _py="$HOME/lcm-pg/venv/bin/python"; [[ -x "$_py" ]] || _py=python3
   log "plugin-migration: $($_py "$PLUGIN_DIR/scripts/migrate_hermes_lcm_config.py" 2>&1 | tail -4)"

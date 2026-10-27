@@ -1,13 +1,14 @@
-name: hermes-lcm
-# Registry key is the DIRECTORY name (lcm-pg), not the manifest name. Without
-# this, a host with both the lcm-pg dir and the legacy hermes-lcm overlay dir
-# (symlink to it) scans TWO manifests with the same key `hermes-lcm`, and
-# because every Hermes profile is its own home scope, each profile's boot
-# re-imports the whole engine inside the 10s load deadline — last one wins
-# (resolve_manifest_winners dedupes per home) but a cold boot pays N× the
-# import cost and can surface 'Failed to load plugin: load timed out'.
-# `key:` pins both dirs to one id; the gate still honours the bare legacy
-# name `hermes-lcm` via manifest.name (plugins_discovery.gate_manifest).
+name: lcm-pg
+# Registry key = the `key:` (or directory name); the manifest `name` is also
+# accepted by the gate as a lookup alias. The legacy name 'hermes-lcm' is
+# retired fleet-wide (Jan 2026-10-27): lcm-pg REPLACES it. Keeping name:
+# hermes-lcm here meant gate_manifest matched a stale 'hermes-lcm' entry in
+# plugins.enabled from any home scope and loaded this plugin under the old
+# identity — exactly what made hermes-lcm keep 'existing' on the fleet.
+# With name: lcm-pg, ONLY 'lcm-pg' in plugins.enabled activates this plugin.
+# (The engine's internal name stays 'lcm' = context.engine value; the bundled
+# skill id 'hermes-lcm' in __init__.py refers to the skills/hermes-lcm DIR,
+# not the plugin identity, and is unchanged.)
 key: lcm-pg
 version: 1.0.0-rc.1
 description: "Lossless Context Management — standalone Hermes plugin with a DAG-based context engine that never loses a message"

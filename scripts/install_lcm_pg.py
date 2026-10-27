@@ -106,7 +106,14 @@ def main():
     os.symlink(FORK, ROOT_PLUGIN)
     print("symlink:", ROOT_PLUGIN, "->", FORK)
     for p in sorted(sh(f"ls -d {HOME}/.hermes/profiles/*/plugins 2>/dev/null", check=False).stdout.split()):
-        lp = os.path.join(p, "hermes-lcm")
+        # overlay dir is named lcm-pg: discovery gates on the DIRECTORY name
+        # (plugins_discovery), so the legacy 'hermes-lcm' name must not exist.
+        lp = os.path.join(p, "lcm-pg")
+        legacy = os.path.join(p, "hermes-lcm")
+        if os.path.islink(legacy):
+            os.remove(legacy)
+        elif os.path.isdir(legacy):
+            sh(f"mv {legacy} {backup}/profile-" + legacy.replace('/', '__'))
         if os.path.islink(lp):
             os.remove(lp)
         elif os.path.isdir(lp):

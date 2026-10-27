@@ -142,12 +142,12 @@ def _migrate_config(path: Path, plugin_live: bool, dry: bool) -> None:
                       yaml.safe_dump([*enabled, "lcm-pg"], default_flow_style=True).strip(),
                       dry) and ok
         acted = True
-    # 2026-10-27 (beez gateway 10s load timeout): the plugin.yaml now declares
-    # `key: lcm-pg`, so BOTH the lcm-pg dir and the legacy hermes-lcm overlay
-    # dir resolve to the ONE gate key `lcm-pg` (gate matches the manifest name
-    # hermes-lcm too). A redundant `hermes-lcm` entry is harmless but was
-    # suspected in the double-load race — drop it while we are editing the
-    # list; loading no longer depends on it.
+    # 2026-10-27 (Jan directive): hermes-lcm is RETIRED — lcm-pg completely
+    # replaces it, and 'hermes-lcm' must not appear in any plugins.enabled.
+    # plugin.yaml now says name: lcm-pg + key: lcm-pg, so nothing loads under
+    # the legacy identity; this strips stale entries wherever they exist
+    # (root, profiles, or a lingering /etc overlay would be refused by
+    # config.py — the operator removes that; deploy step 3c3 checks it).
     if isinstance(enabled, list) and "hermes-lcm" in enabled:
         ok = _cfg_set(prof, "plugins.enabled",
                       yaml.safe_dump([x for x in enabled if x != "hermes-lcm"],

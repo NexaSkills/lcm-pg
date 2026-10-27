@@ -149,8 +149,13 @@ def s_version():
     add("VERSION-LOAD", "plugin-load-errors-today", "INFO",
         f"{len(today)} such lines since midnight (historical, incl. pre-restart)")
     rc, out = sh(["hermes", "plugins", "list"])
-    add("VERSION-LOAD", "plugins-list", "PASS" if "hermes-lcm" in out and "error" not in out.lower()[-200:] else "INFO",
-        "hermes-lcm visible" if "hermes-lcm" in out else out[-160:])
+    # hermes-lcm is RETIRED (Jan 2026-10-27): the plugin must be visible as
+    # lcm-pg; a hermes-lcm row would mean a stale legacy identity loaded.
+    _pl_visible = "lcm-pg" in out
+    _legacy_row = "hermes-lcm" in out
+    add("VERSION-LOAD", "plugins-list", "PASS" if _pl_visible and not _legacy_row else ("FAIL" if _legacy_row else "INFO"),
+        "lcm-pg visible" if _pl_visible and not _legacy_row else
+        ("hermes-lcm STILL VISIBLE (retired name)" if _legacy_row else out[-160:]))
 
 def s_cluster():
     rows, err = _sql("select (select setting from pg_settings where name='server_version_num'),"
@@ -761,17 +766,21 @@ def s_residue():
         add("RESIDUE", "zombie-schemas", "PASS", "non-profile schemas all protected")
 
 def s_plugin_config():
-    """Migration hermes-lcm -> lcm-pg must have converged plugins.enabled.
-    Ground truth (hermes_cli/plugins_discovery.py parse_manifest_file): a dir
-    plugin's gate name is the DIRECTORY name — the fork under
-    plugins/lcm-pg is enabled ONLY when `lcm-pg` is in the list. `hermes-lcm`
-    alone matches the pip-installed upstream plugin, so a host can look
-    migrated while running the wrong engine. FAIL states:
+    """plugins.enabled convergence — lcm-pg ONLY (Jan 2026-10-27: hermes-lcm
+    is RETIRED; lcm-pg completely replaces it and the legacy name must not
+    exist anywhere: not in any enabled/disabled list, not as a dir/symlink).
+    Ground truth (hermes_cli/plugins_discovery.py): a dir plugin's gate key
+    is `key:` from plugin.yaml (else DIRECTORY name); the manifest `name` is
+    an accepted alias. plugin.yaml now says name: lcm-pg + key: lcm-pg, so
+    ONLY 'lcm-pg' activates it — 'hermes-lcm' in enabled is dead weight and
+    a FAIL below. Profiles WITHOUT a plugins.enabled list are checked
+    EFFECTIVELY: `hermes -p <p> config get plugins.enabled` merges root
+    (template incident 2026-10-27: root converged, profiles inherit).
+    FAIL states:
       * lcm-pg in plugins.disabled (defeats deploy)
-      * plugin dir live but lcm-pg in no enabled list (loads ONLY if a dir
-        named lcm-pg is reachable from root/profile plugins dirs)
-    WARN: lcm-pg live but listed nowhere (legacy hermes-lcm entry; upstream
-    pip plugin may be what actually loads)."""
+      * hermes-lcm in any plugins.enabled (retired name still listed)
+      * plugin dir live but lcm-pg in no EFFECTIVE enabled list
+    """
     try:
         import yaml
     except ImportError:
@@ -808,7 +817,16 @@ def s_plugin_config():
         disabled = [str(x) for x in (pl.get("disabled") or [])]
         en = [str(x) for x in (pl.get("enabled") or [])] if isinstance(pl.get("enabled"), list) else []
         if "lcm-pg" in disabled:
-            add("VERSION-LOAD", f"plugin-config:{tag}", "FAIL", "lcm-pg in plugins.disabled (defeates deploy; run lcm_update.sh)")
+            add("VERSION-LOAD", f"plugin-config:{tag}", "FAIL", "lcm-pg in plugins.disabled (defeats deploy; run lcm_update.sh)")
+            worst = "FAIL"
+            continue
+        if "hermes-lcm" in en:
+            # Retired name still listed (Jan directive 2026-10-27: lcm-pg
+            # completely replaces hermes-lcm). plugin.yaml name+key are both
+            # lcm-pg now, so nothing loads under the legacy identity — the
+            # entry is dead weight and a FAIL. migrate strips it (step 3d).
+            add("VERSION-LOAD", f"plugin-config:{tag}", "FAIL",
+                "hermes-lcm in plugins.enabled — retired name; run lcm_update.sh (3d strips it)")
             worst = "FAIL"
             continue
         if "lcm-pg" in en:
@@ -818,11 +836,26 @@ def s_plugin_config():
             # No plugins: block in this profile's config at all. load_config()
             # deep-merges DEFAULT_CONFIG + root inheritance, so the profile
             # runs with the ROOT plugins.enabled (cfg_get in
-            # plugins_discovery._get_enabled_plugins). Flagging here was a
-            # false alarm (skilltest '{}'-config incident, 2026-10-27).
-            listed_anywhere = listed_anywhere  # root's own row decides
-            add("VERSION-LOAD", f"plugin-config:{tag}", "INFO",
-                "no plugins block — inherits root plugins.enabled")
+            # plugins_discovery._get_enabled_plugins). Verify EFFECTIVELY via
+            # the CLI (skilltest '{}'-config incident: flagging was a false
+            # alarm; template 2026-10-27: inheritance is the supported model
+            # — root set, profiles inherit — so check what actually loads).
+            prof = None if cfg.parent == (HOME / ".hermes") else cfg.parent.name
+            cmd = [ "hermes" ] + (["-p", prof] if prof and prof != "root" else []) + \
+                  ["config", "get", "plugins.enabled"]
+            rc_e, out_e = sh(cmd)
+            eff = (out_e or "").strip()
+            if rc_e == 0 and "lcm-pg" in eff:
+                listed_anywhere = True
+                add("VERSION-LOAD", f"plugin-config:{tag}", "PASS",
+                    f"no own enabled list; effective (inherited) = {eff.replace(chr(10), ' ')}")
+            elif rc_e == 0:
+                add("VERSION-LOAD", f"plugin-config:{tag}", "FAIL",
+                    f"effective plugins.enabled lacks lcm-pg (inherited={eff.replace(chr(10), ' ')!r}); run lcm_update.sh")
+                worst = "FAIL"
+            else:
+                add("VERSION-LOAD", f"plugin-config:{tag}", "INFO",
+                    "no plugins block; CLI could not resolve effective list (manual check)")
         elif plugin_live:
             add("VERSION-LOAD", f"plugin-config:{tag}", "WARN",
                 f"enabled={'default(None)' if not isinstance(pl.get('enabled'), list) else en} — no lcm-pg (gate key = dir name; run lcm_update.sh)")
