@@ -378,16 +378,16 @@ if [[ -z "$DRY" && -d "$HOME_DIR/.hermes/profiles" ]]; then
     [[ -d "$pd" ]] || continue
     prof=$(basename "$pd")
     _eng=""
-    "$HERMES_BIN:-hermes" -p "$prof" config get context.engine >/dev/null 2>&1 && \
-      _eng=$("$HERMES_BIN:-hermes" -p "$prof" config get context.engine 2>/dev/null)
+    ${HERMES_BIN:-hermes} -p "$prof" config get context.engine >/dev/null 2>&1 && \
+      _eng=$(${HERMES_BIN:-hermes} -p "$prof" config get context.engine 2>/dev/null)
     if [[ "$_eng" == "lcm" ]]; then
       continue
     elif [[ -z "$_eng" ]]; then
       # unset (or unreadable config) may be legitimate inheritance from a
       # root that sets engine: lcm
       _rooteng=""
-      "$HERMES_BIN:-hermes" config get context.engine >/dev/null 2>&1 && \
-        _rooteng=$("$HERMES_BIN:-hermes" config get context.engine 2>/dev/null)
+      ${HERMES_BIN:-hermes} config get context.engine >/dev/null 2>&1 && \
+        _rooteng=$(${HERMES_BIN:-hermes} config get context.engine 2>/dev/null)
       [[ "$_rooteng" == "lcm" ]] && continue
     fi
     cfg_set "$prof" context.engine lcm && _ctxfix=$((_ctxfix+1))
@@ -436,12 +436,12 @@ if [[ -z "$DRY" ]]; then
     for pd in "$HOME_DIR"/.hermes/profiles/*/; do
       [[ -d "$pd" ]] || continue
       prof=$(basename "$pd")
-      _cur=$("$HERMES_BIN:-hermes" -p "$prof" config get skills.external_dirs 2>/dev/null) || _cur=""
+      _cur=$(${HERMES_BIN:-hermes} -p "$prof" config get skills.external_dirs 2>/dev/null) || _cur=""
       case "$_cur" in *"$_sktree"*) continue;; esac
       cfg_set "$prof" skills.external_dirs "['$_sktree']" && _sk=$((_sk+1))
     done
     # root config: only when root itself lacks the tree
-    _rootcur=$("$HERMES_BIN:-hermes" config get skills.external_dirs 2>/dev/null) || _rootcur=""
+    _rootcur=$(${HERMES_BIN:-hermes} config get skills.external_dirs 2>/dev/null) || _rootcur=""
     case "$_rootcur" in *"$_sktree"*) ;; *) cfg_set root skills.external_dirs "['$_sktree']" && _sk=$((_sk+1));; esac
     [[ "${_sk:-0}" -gt 0 ]] && log "skill-visibility: set external_dirs via hermes config set in $_sk config(s)" \
       || log "skill-visibility: all configs already carry external_dirs"
