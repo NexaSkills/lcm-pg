@@ -547,19 +547,24 @@ def _registry_rows() -> str:
 
 def install(cur, schema: str) -> None:
     # Catalog-race guard (template/warren 2026-10-27): several surfaces
-    # booting onto one fresh schema race this CREATE OR REPLACE storm; the
-    # loser's next statement (the sqlite_master SELECT right after VIEW)
-    # dies with 'cache lookup failed for function' inside the just-
-    # redefined SQL functions — a transient, and every DDL here is
-    # idempotent, so replay the whole install.
+    # booting onto one fresh schema race this CREATE OR REPLACE storm.
+    # Two loser symptoms, BOTH transient and both fixed by replay:
+    #  * 'cache lookup failed for function' — the loser's next statement
+    #    inlines a SQL function that was being replaced mid-plan.
+    #  * '_lcm_checkfold(oid) does not exist' — an ANOTHER process just
+    #    committed DROP+CREATE of the helper; in our snapshot the old row
+    #    is gone but the new one is invisible, so PG reports it missing.
+    # Every DDL here is idempotent, so rollback + replay the whole install.
     import psycopg.errors as _pe
     _MARK = ("tuple concurrently updated", "tuple concurrently deleted",
-             "cache lookup failed")
+             "cache lookup failed", "_lcm_checkfold", "_lcm_pred",
+             "_lcm_triggerdef", "does not exist")
     for _i in range(4):
         try:
             _install_once(cur, schema)
             return
-        except (_pe.SerializationFailure, _pe.InternalError) as exc:
+        except (_pe.SerializationFailure, _pe.InternalError,
+                _pe.UndefinedFunction) as exc:
             if not any(m in str(exc) for m in _MARK):
                 raise
             try:

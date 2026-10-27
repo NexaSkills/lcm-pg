@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+import time
 from typing import Any, Iterable, Optional, Sequence
 
 import psycopg
@@ -1294,6 +1295,26 @@ class _HybridRow(dict):
 _WRITE_STMT_RE = re.compile(
     r"(?i)\s*(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|GRANT|REVOKE|REINDEX|VACUUM|REFRESH|CALL|DO)\b")
 
+# Errors raised when a fresh catalog snapshot loses a race against a sibling
+# process's CREATE OR REPLACE of a shim helper (the helper is momentarily
+# missing/invalid inside the snapshot taken for this statement). A plain
+# replay takes a NEW snapshot and succeeds — self-healing, no DDL involved.
+_CATALOG_RACE_MARKERS = (
+    "cache lookup failed",
+    "_lcm_checkfold",
+    "_lcm_tabledef",
+    "_lcm_fts_rewrite",
+)
+
+
+def _is_catalog_race(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    if any(m in msg for m in _CATALOG_RACE_MARKERS):
+        return True
+    if isinstance(exc, psycopg.errors.InternalError):
+        return "sql function" in msg and "during inlining" in msg
+    return False
+
 
 class _Cursor:
     """sqlite3.Cursor-shaped wrapper over a psycopg cursor."""
@@ -1329,6 +1350,19 @@ class _Cursor:
             if self._retry_if_dead(e):
                 # replay on a FRESH physical cursor (the old raw cursor is
                 # bound to the corpse even after the conn rebounded)
+                self._raw = self._adapter._raw_cursor()
+                return self._guarded(sql, parameters)
+            if (getattr(self._adapter, "_shim_race_prone", False)
+                    and _is_catalog_race(e)
+                    and not getattr(self, "_catalog_race_replayed", False)):
+                # Catalog snapshot race against a sibling's shim redefinition
+                # (transient by contract): rollback, replay once, self-heal.
+                self._catalog_race_replayed = True
+                try:
+                    self._adapter._reset_if_aborted()
+                except Exception:
+                    pass
+                time.sleep(0.05)
                 self._raw = self._adapter._raw_cursor()
                 return self._guarded(sql, parameters)
             raise
@@ -1706,6 +1740,9 @@ class PgConnection:
         self._conn = None
         self._keep = False
         self._query_only = False
+        # True on connections from a process that just provisioned the shims
+        # for this schema: replay a catalog-race error once (snapshot race).
+        self._shim_race_prone = False
         self._tx = None
         self._tx_open = False
         self._synthetic_tx = False
@@ -2438,8 +2475,14 @@ def connect(dsn: str, schema: str, *,
     finally:
         pool.putconn(probe)
     # wrap: configure callback pins schema/lock_timeout on every checkout
-    _patch_pool_checkout(pool, schema, lock_timeout_ms)
+    with _SHIM_DONE_LOCK:
+        _fresh = schema not in _SHIM_DONE  # this connect() just provisioned it
+    _patch_pool_checkout(pool, schema, lock_timeout_ms, race_prone=_fresh)
     conn = PgConnection(pool, schema)
+    if _fresh:
+        # first-provisioner: the first shim query can lose a snapshot race
+        # (see _patch_pool_checkout); PgConnection.execute replays it once.
+        conn._shim_race_prone = True
     if query_only:
         conn._query_only = True
     return conn
@@ -2474,7 +2517,8 @@ def _provision_probe(probe, schema: str, lock_timeout_ms: int) -> None:
             raise
 
 
-def _patch_pool_checkout(pool: ConnectionPool, schema: str, lock_timeout_ms: int):
+def _patch_pool_checkout(pool: ConnectionPool, schema: str, lock_timeout_ms: int,
+                         race_prone: bool = False):
     if getattr(pool, "_lcm_patched", False):
         return
     orig_getconn = pool.getconn
@@ -2487,6 +2531,16 @@ def _patch_pool_checkout(pool: ConnectionPool, schema: str, lock_timeout_ms: int
         except Exception:
             pool.putconn(conn)
             raise
+        if race_prone:
+            # This PROCESS just provisioned the shims: the first catalog
+            # query (e.g. SELECT 1 FROM sqlite_master...) can still lose a
+            # snapshot race against a sibling process's helper redefinition
+            # ('cache lookup failed' / helper 'does not exist'). A replay
+            # takes the new snapshot and wins — see shim_ddl.install.
+            try:
+                setattr(conn, "_lcm_shim_race_prone", True)
+            except Exception:
+                pass
         return conn
 
     pool.getconn = getconn  # type: ignore[method-assign]
