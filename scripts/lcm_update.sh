@@ -430,7 +430,12 @@ fi
 # profile dir had none = the skill silently invisible = fleet drift), and
 # preserves an existing custom skills: section (read-only probe first).
 if [[ -z "$DRY" ]]; then
-  _sktree="$HERMES_HOME/plugins/lcm-pg/skills"
+  # Host ROOT plugins tree, NOT $HERMES_HOME: an agent-spawned deploy exports
+  # HERMES_HOME=<some profile home>, which would point every config at one
+  # profile's materialised symlink (beez incident 2026-10-27: all profiles
+  # got .../profiles/mike/plugins/lcm-pg/skills instead of the root clone).
+  _sktree="$HOME_DIR/.hermes/plugins/lcm-pg/skills"
+  [[ -d "$_sktree" ]] || _sktree="$HERMES_HOME/plugins/lcm-pg/skills"
   if [[ -d "$_sktree" ]]; then
     _sk=0
     for pd in "$HOME_DIR"/.hermes/profiles/*/; do

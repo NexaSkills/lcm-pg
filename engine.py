@@ -714,9 +714,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return clone
 
     def _resolve_db_path(self, hermes_home: str = "") -> Path:
-        """Resolve the SQLite path for the active Hermes profile/home."""
-        if self._config.database_path:
-            return Path(self._config.database_path)
+        """Resolve the SQLite path for the active Hermes profile/home.
+
+        On the postgres backend (the default, and the fleet contract) the
+        configured LCM_DATABASE_PATH is a LEGACY sqlite shim target — some
+        hosts still carry a systemd drop-in pointing it at a dead path
+        (template incident 2026-10-27: stray 0-byte lcm.db files made
+        operators believe the engine fell back to SQLite; it never did, the
+        path was never opened). Return the profile-home default as the
+        nominal identity instead: connect() routes to PG by backend_for()
+        regardless of this path, so nothing reads or writes the file.
+        """
+        from .backends import factory as _factory
+        if _factory.backend_for() != "postgres":
+            configured = str(self._config.database_path or "")
+            if configured:
+                return Path(configured)
         if hermes_home:
             return Path(hermes_home) / "lcm.db"
         return Path.home() / ".hermes" / "lcm.db"

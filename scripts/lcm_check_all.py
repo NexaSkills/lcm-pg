@@ -435,36 +435,46 @@ def s_params(schemas):
                 f"{len(_root_lcm)} LCM_* keys match root "
                 f"(slash={_pk.get('LCM_ENABLE_SLASH_COMMAND', '?')} "
                 f"embed={_pk.get('LCM_EMBEDDINGS_ENABLED', '?')})")
-    # context.engine per profile: 'lcm' (or inherited via absent block) is
-    # required; anything else (compressor/default) means that profile runs
-    # the BUILT-IN lossy compressor and lcm-pg capture/rollup never runs.
-    # Root value recorded once for context.
-    try:
-        import yaml
+    # context.engine per profile: 'lcm' is REQUIRED — anything else (or
+    # DEFAULT_CONFIG's 'compressor' fallback) means that profile runs the
+    # BUILT-IN LOSSY compressor and lcm-pg capture/rollup never runs.
+    # Resolution via `hermes -p <prof> config get context.engine` — Hermes'
+    # OWN merged view (profile file over root over DEFAULT_CONFIG). The old
+    # raw-YAML read could not see DEFAULT_CONFIG's engine: 'compressor', so a
+    # profile with no context block passed as "inherits root" while the
+    # runtime actually ran the built-in compressor (template 'demo', 2026-10-27).
+    import subprocess as _sp
+    _hbin = os.environ.get("HERMES_BIN") or os.path.expanduser("~/.local/bin/hermes")
+    if not Path(_hbin).is_file():
+        import shutil as _sh
+        _hbin = _sh.which("hermes") or _hbin
+    def _eff_engine(prof):
+        args = [_hbin] + ([] if prof is None else ["-p", prof]) + \
+            ["config", "get", "context.engine"]
         try:
-            rd = yaml.safe_load((HERMES_HOME / "config.yaml").read_text()) or {}
+            r = _sp.run(args, capture_output=True, text=True, timeout=60)
+            return (r.stdout or "").strip() if r.returncode == 0 else None
         except Exception:
-            rd = {}
-        rctx = (rd.get("context") or {}) if isinstance(rd.get("context"), dict) else {}
-        add("PARAMS", "context-engine:root", "PASS" if rctx.get("engine") == "lcm" else "WARN",
-            f"engine={rctx.get('engine', '<unset -> built-in compressor>')}")
-    except Exception:
-        rctx = {}
+            return None
+    rooteng = _eff_engine(None)
+    add("PARAMS", "context-engine:root", "PASS" if rooteng == "lcm" else "WARN",
+        f"effective engine={rooteng or '<unreadable>'}")
     for f in sorted((HERMES_HOME / "profiles").glob("*/config.yaml")) if (HERMES_HOME / "profiles").is_dir() else []:
         p = f.parent.name
+        eng = _eff_engine(p)
+        if eng == "lcm":
+            add("PARAMS", f"context-engine:{p}", "PASS", "effective engine=lcm")
+        elif eng is None:
+            add("PARAMS", f"context-engine:{p}", "WARN",
+                "hermes CLI could not resolve (CLI missing or profile error)")
+        else:
+            add("PARAMS", f"context-engine:{p}", "FAIL",
+                f"effective engine={eng!r} defeats lcm-pg for this profile (run lcm_update.sh / migrate_hermes_lcm_config.py)")
         try:
             import yaml
             d = yaml.safe_load(f.read_text()) or {}
-            ctx = d.get("context") if isinstance(d.get("context"), dict) else {}
-            eng = ctx.get("engine")
-            if eng == "lcm":
-                add("PARAMS", f"context-engine:{p}", "PASS", "engine=lcm")
-            elif eng is None:
-                add("PARAMS", f"context-engine:{p}", "PASS" if rctx.get("engine") == "lcm" else "WARN",
-                    f"unset (inherits root engine={rctx.get('engine', '<unset>')})")
-            else:
-                add("PARAMS", f"context-engine:{p}", "FAIL",
-                    f"engine={eng!r} defeats lcm-pg for this profile (run lcm_update.sh / migrate_hermes_lcm_config.py)")
+            if not isinstance(d, dict):
+                d = {}
             comp = (d.get("compression") or {})
             aux = (d.get("auxiliary") or {}).get("compression") or {}
             md = (d.get("model") or {}).get("default")
