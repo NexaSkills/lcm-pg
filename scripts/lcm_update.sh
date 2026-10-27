@@ -20,7 +20,20 @@
 set -uo pipefail
 
 HOME_DIR="${HOME}"
-HERMES_HOME="${HERMES_HOME:-$HOME_DIR/.hermes}"
+# HOST ROOT hermes home, always. An agent-launched deploy exports
+# HERMES_HOME=<a profile home> (that is how agent surfaces run); honouring it
+# here aimed the deploy at the launching profile instead of the host
+# (beez 2026-10-27: skill tree pinned to profiles/mike/...; template: deploy
+# ran from an agent shell and updated the wrong plugin clone). Surfaces
+# resolve their own homes; the DEPLOY's job is the host-wide trees.
+HERMES_ROOT="$HOME_DIR/.hermes"
+[[ "${HERMES_HOME:-}" == "$HERMES_ROOT" || -z "${HERMES_HOME:-}" ]] || \
+  log "HERMES_HOME=$HERMES_HOME (profile scope) -> deploy targets host root $HERMES_ROOT"
+HERMES_HOME="$HERMES_ROOT"
+# The CODE clone lives in the host root tree; per-profile plugins/lcm-pg are
+# symlinks onto it (overlay convergence in 3c). Never aim the code update at
+# a profile-scoped PLUGIN_DIR inherited from the environment.
+unset PLUGIN_DIR
 PLUGIN_DIR="${PLUGIN_DIR:-$HERMES_HOME/plugins/lcm-pg}"
 PARAM_FILES="${LCM_PARAM_FILES:-}"
 REF="origin/main"; LOCAL_REPO=""; DO_RESTART=1; DRY=""; MIGRATIONS_ONLY=""
