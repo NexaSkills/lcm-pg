@@ -8,6 +8,7 @@ Layout (all under $HOME, self-contained):
     venv/        own python env: psycopg3 + fastembed (+ model cache)
     run/         unix socket dir
     fork ->      symlink to $HOME/.hermes/forks/lcm-pg (source of truth)
+import os
 
 Plugin surface:
   ~/.hermes/plugins/lcm-pg   -> symlink to fork (one plugin for ALL profiles)
@@ -23,7 +24,12 @@ import argparse, json, os, shutil, subprocess, sys, time
 
 HOME = os.path.expanduser("~")
 BASE = f"{HOME}/lcm-pg"
-FORK = f"{HOME}/.hermes/forks/lcm-pg"
+# Code root = runtime plugin path (fleet hosts have NO fork dir; the dev
+# host is the only exception, and it runs via plugins/lcm-pg too).
+FORK = os.environ.get("LCM_PG_CODE") or (
+    f"{HOME}/.hermes/plugins/lcm-pg"
+    if os.path.isdir(f"{HOME}/.hermes/plugins/lcm-pg/scripts")
+    else f"{HOME}/.hermes/forks/lcm-pg")
 PG = f"{BASE}/pg"
 DATA = f"{BASE}/instance"
 RUN = f"{BASE}/run"

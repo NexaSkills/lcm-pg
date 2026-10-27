@@ -10,9 +10,12 @@
 # install time; without the timer, drift since install is never embedded.
 set -euo pipefail
 B="${LCM_PG_HOME:-$HOME/lcm-pg}"
-FORK="${HOME}/.hermes/forks/lcm-pg"
+# Code root = the RUNTIME plugin path (fleet hosts have no fork dir; only the
+# dev host does). Prefer plugins/lcm-pg, fall back to the fork on dev hosts.
+FORK="${LCM_PG_CODE:-${HOME}/.hermes/plugins/lcm-pg}"
+[ -d "$FORK/scripts" ] || FORK="${HOME}/.hermes/forks/lcm-pg"
 [ -x "$B/venv/bin/python" ] || { echo "missing $B/venv (run install_lcm_pg.py first)" >&2; exit 1; }
-[ -f "$FORK/scripts/embed_auto_backfill.py" ] || { echo "missing fork embed_auto_backfill.py" >&2; exit 1; }
+[ -f "$FORK/scripts/embed_auto_backfill.py" ] || { echo "missing $FORK/scripts/embed_auto_backfill.py" >&2; exit 1; }
 DSN="postgresql:///lcm?host=$B/run&port=54329&user=lcm01"
 mkdir -p ~/.config/systemd/user
 cat > ~/.config/systemd/user/hermes-lcm-embed-backfill.service <<UNIT
