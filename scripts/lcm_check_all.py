@@ -98,6 +98,21 @@ def s_version():
             ok = True
     add("VERSION-LOAD", "plugin-locations", "PASS" if ok else "FAIL",
         " | ".join(detail) if detail else "no lcm-pg plugin dir found in root/profile plugins dirs")
+    # Fleet standard (Jan directive 2026-10-27): the code flows beez -> GitHub
+    # -> host, so a FLEET host must carry ONLY runtime paths (~/.hermes/plugins/
+    # lcm-pg). ~/.hermes/forks/lcm-pg on a fleet host is a leftover dev clone —
+    # stale by definition and a drift trap. beez (the dev host) is exempt:
+    # detect it by the fork being the LIVE symlink target, else flag.
+    _fork = HOME / ".hermes" / "forks" / "lcm-pg"
+    if _fork.is_dir():
+        add("VERSION-LOAD", "fork-dir", "WARN",
+            f"{_fork} exists — fleet hosts must NOT have the fork (code source is GitHub; only the dev host keeps a fork). Remove after confirming nothing symlinks into it.")
+    _origin = subprocess.run(["git", "-C", str(HERMES_HOME / "plugins" / "lcm-pg"),
+                              "remote", "get-url", "origin"],
+                             capture_output=True, text=True).stdout.strip()
+    if _origin.startswith("/") or _origin.startswith("file://"):
+        add("VERSION-LOAD", "origin-local", "WARN",
+            f"origin is a local path ({_origin}) — retired staging pattern; set origin to https://github.com/NexaSkills/lcm-pg.git (deploy tolerates it and prefers GitHub)")
     git_head = None
     for r in roots:
         rc, out = sh(["git", "-C", str(r), "log", "-1", "--format=%h %ci %s"])

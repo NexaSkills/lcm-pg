@@ -108,6 +108,15 @@ if [[ -z "$SRC" ]]; then
   [[ -z "$SRC" ]] && SRC="https://github.com/NexaSkills/lcm-pg.git"
 fi
 # hosts without GitHub: their origin remote is pre-configured (staging repo/bundle) — this script honours whatever origin says. Host-agnostic.
+# FLEET STANDARD (Jan directive 2026-10-27): the canonical code source is
+# GitHub. A LOCAL-path origin (the retired ~/lcm-pg-push.git staging pattern)
+# is demoted to a fallback: try it, but fetch GitHub too and prefer whichever
+# actually carries the requested ref. Network errors stay tolerated.
+_GITHUB_URL="https://github.com/NexaSkills/lcm-pg.git"
+case "$SRC" in
+  /*|file://*) IS_LOCAL_ORIGIN=1 ;;
+  *) IS_LOCAL_ORIGIN=0 ;;
+esac
 
 fetch_ok=0
 # fetch the EXPLICIT ref: a plain `git fetch origin` leaves FETCH_HEAD at
@@ -126,6 +135,24 @@ case "$REF" in
   *)      FETCH_BRANCH="${REF##*/}" ;;
 esac
 git -C "$PLUGIN_DIR" fetch -q "$FETCH_REMOTE" "$FETCH_BRANCH" 2>/dev/null && fetch_ok=1
+# GitHub is the canonical source: a local-path origin (retired staging-repo
+# pattern) can serve a STALE commit, and the fetch itself succeeds — so
+# verify freshness. If the fetched commit does not match the canonical
+# GitHub tip for the same branch, also fetch GitHub and take FETCH_HEAD
+# from whichever is newer. Network failures here are non-fatal: the local
+# (stale) fetch already succeeded, and check_all reports the divergence.
+if [[ $fetch_ok -eq 1 && $IS_LOCAL_ORIGIN -eq 1 && "$FETCH_BRANCH" != refs/* ]]; then
+  _gh_ls=$(git -C "$PLUGIN_DIR" ls-remote "$_GITHUB_URL" "$FETCH_BRANCH" 2>/dev/null | awk 'NR==1{print $1}')
+  _fh=$(git -C "$PLUGIN_DIR" rev-parse FETCH_HEAD 2>/dev/null)
+  if [[ -n "$_gh_ls" && "$_gh_ls" != "$_fh" ]]; then
+    if git -C "$PLUGIN_DIR" fetch -q "$_GITHUB_URL" "$FETCH_BRANCH" 2>/dev/null; then
+      log "fetch: local origin was stale ($_fh) — using GitHub tip $(git -C "$PLUGIN_DIR" rev-parse --short FETCH_HEAD)"
+      fetch_ok=1
+    else
+      log "fetch: WARN local origin ($_fh) differs from GitHub ($_gh_ls) and GitHub fetch failed — deploying stale code"
+    fi
+  fi
+fi
 if [[ $fetch_ok -eq 0 ]] && git -C "$PLUGIN_DIR" rev-parse -q --verify "$REF^{commit}" >/dev/null 2>&1; then
   # ref already present locally (bare branch name / local object): FETCH_HEAD
   # format wants '<sha>\t<why>' — a bare sha line parses as a bad ref name.
