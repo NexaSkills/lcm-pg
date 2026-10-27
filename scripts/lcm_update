@@ -164,7 +164,7 @@ else
   # lcm_<profile> schemas (official naming rule), runs the canonical
   # ensure_* bootstrap, then the stamp loop. BEFORE migrations so the whole
   # run sees one converged inventory.
-  log "heal: $("$PY" "$PLUGIN_DIR/scripts/heal_profile_schemas.py" 2>&1 | tail -4)"
+  log "heal: $("$PY" "$PLUGIN_DIR/scripts/heal_profile_schemas.py" 2>&1)"
   log "migrations: $("$PY" "$PLUGIN_DIR/scripts/lcm_deploy_migrations.py" --ref "$HEAD_SHA" | tail -20)"
   "$PY" "$PLUGIN_DIR/scripts/lcm_deploy_migrations.py" --ref "$HEAD_SHA" >/dev/null \
     || die "DB migrations failed (see output above; fix on the dev host, rerun)"
@@ -284,7 +284,14 @@ env_files=("$HOME_DIR/.hermes/.env")
 # this is the authority (fleet drift incidents: keys someone forgot to add).
 if [[ -z "$DRY" && -f "$PLUGIN_DIR/scripts/lcm_params_sync.py" ]]; then
   _ps_py="$HOME/lcm-pg/venv/bin/python"; [[ -x "$_ps_py" ]] || _ps_py=python3
-  log "params-sync: $($_ps_py "$PLUGIN_DIR/scripts/lcm_params_sync.py" 2>&1 | tail -3)"
+  # FULL output into the log: an earlier `| tail -3` here silently dropped
+  # the drift-write lines on template (checker FAILed 15/25 keys with zero
+  # evidence in the deploy log — un-debuggable).
+  _ps_rc=0
+  log "params-sync begin"
+  "$_ps_py" "$PLUGIN_DIR/scripts/lcm_params_sync.py" 2>&1 | tee >(while IFS= read -r _l; do log "  $_l"; done) >/dev/null
+  _ps_rc=${PIPESTATUS[0]}
+  [[ $_ps_rc -eq 0 ]] || log "params-sync: exit $_ps_rc (check_all re-verifies)"
 fi
 
 # ---- 3c. plugin overlay for EVERY profile (incl. profiles created after the
@@ -508,7 +515,7 @@ fi
 # up each touched file.
 if [[ -z "$DRY" ]]; then
   _py="$HOME/lcm-pg/venv/bin/python"; [[ -x "$_py" ]] || _py=python3
-  log "plugin-migration: $($_py "$PLUGIN_DIR/scripts/migrate_hermes_lcm_config.py" 2>&1 | tail -4)"
+  log "plugin-migration: $($_py "$PLUGIN_DIR/scripts/migrate_hermes_lcm_config.py" 2>&1)"
 fi
 
 # ---- 4. restart hermes surfaces (discovered; profile units skipped) --------
