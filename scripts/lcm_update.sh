@@ -292,6 +292,11 @@ fi
 # The legacy 'hermes-lcm' name is retired (Jan directive 2026-10-27): it is
 # deleted here, never created. Do it even when the profile has no .env yet.
 if [[ -d "$HOME_DIR/.hermes/profiles" && ( -e "$HOME_DIR/.hermes/plugins/lcm-pg" || -L "$HOME_DIR/.hermes/plugins/lcm-pg" ) ]]; then
+  # root-level legacy dir/symlink too (it makes a stale root enabled: hermes-lcm
+  # loadable); removed so the retired name exists nowhere.
+  _rl="$HOME_DIR/.hermes/plugins/hermes-lcm"
+  if [[ -L "$_rl" ]]; then rm -f "$_rl"; log "overlay: removed retired $_rl"
+  elif [[ -e "$_rl" ]]; then mv "$_rl" "$_rl.retired.$(date +%Y%m%d%H%M%S)"; log "overlay: retired $_rl (moved aside)"; fi
   for pd in "$HOME_DIR"/.hermes/profiles/*/; do
     prof="$pd/plugins"
     lp="$prof/lcm-pg"
