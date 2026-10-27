@@ -427,7 +427,10 @@ if [[ -e /etc/hermes/config.yaml ]]; then
   # config-set-only rule — a direct root config.yaml write, read-only on the
   # overlay, and it loses its trigger the moment the overlay is gone.
   # Net effect equals `hermes plugins enable` run after the overlay is removed.
-  if ! grep -qE '^\s+enabled:' "$HOME_DIR/.hermes/config.yaml" 2>/dev/null; then
+  # root_has_enabled: does root config.yaml have a plugins: section WITH an
+  # enabled: key? (Bare `grep -q enabled:` is wrong — unrelated sections like
+  # checkpoints.enabled satisfy it; template incident 2026-10-27.)
+  if ! python3 -c 'import sys,yaml;d=yaml.safe_load(open(sys.argv[1])) or {};sys.exit(0 if "enabled" in (d.get("plugins") or {}) else 1)' "$HOME_DIR/.hermes/config.yaml" 2>/dev/null; then
     _managed_en=$(python3 -c 'import yaml,sys;d=yaml.safe_load(open("/etc/hermes/config.yaml")) or {};e=(d.get("plugins") or {}).get("enabled");print(",".join(e) if isinstance(e,list) else "")' 2>/dev/null) || _managed_en=""
     if [[ -n "$_managed_en" ]]; then
       _need=""
@@ -436,13 +439,15 @@ if [[ -e /etc/hermes/config.yaml ]]; then
       python3 - "$HOME_DIR/.hermes/config.yaml" "$_managed_en" <<'PYEOF' 2>/dev/null && \
         log "rescue: copied plugins.enabled [$_managed_en] into root config.yaml (was pinned only in /etc overlay)" || \
         log "WARN: rescue of plugins.enabled failed — after rm /etc/hermes run: hermes plugins enable lcm-pg"
-import sys, yaml
+import sys, yaml, os, tempfile
 p, keys = sys.argv[1], [k for k in sys.argv[2].split(",") if k]
 d = yaml.safe_load(open(p)) or {}
 pl = d.setdefault("plugins", {})
 cur = set(pl.get("enabled") or [])
 pl["enabled"] = sorted(cur | set(keys))
-open(p, "w").write(yaml.safe_dump(d, sort_keys=False))
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p))
+with os.fdopen(fd, "w") as f: yaml.safe_dump(d, f, sort_keys=False)
+os.replace(tmp, p)
 PYEOF
     fi
   fi
