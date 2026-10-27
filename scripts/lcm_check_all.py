@@ -150,12 +150,24 @@ def s_version():
         f"{len(today)} such lines since midnight (historical, incl. pre-restart)")
     rc, out = sh(["hermes", "plugins", "list"])
     # hermes-lcm is RETIRED (Jan 2026-10-27): the plugin must be visible as
-    # lcm-pg; a hermes-lcm row would mean a stale legacy identity loaded.
-    _pl_visible = "lcm-pg" in out
-    _legacy_row = "hermes-lcm" in out
-    add("VERSION-LOAD", "plugins-list", "PASS" if _pl_visible and not _legacy_row else ("FAIL" if _legacy_row else "INFO"),
-        "lcm-pg visible" if _pl_visible and not _legacy_row else
-        ("hermes-lcm STILL VISIBLE (retired name)" if _legacy_row else out[-160:]))
+    # lcm-pg. Row-level parse (trade incident 2026-10-27: retired plugin DIRs
+    # under plugins/ with the legacy manifest still produce a
+    # 'hermes-lcm | not enabled' row — harmless discovery noise, but the
+    # retirement bar is 'does not exist', so an ENABLED legacy row FAILs and
+    # a disabled row WARNs until the stale dirs are cleaned).
+    _rows = [ln for ln in out.splitlines() if "lcm" in ln and "|" in ln]
+    _legacy_rows = [ln for ln in _rows if "hermes-lcm" in ln]
+    _legacy_enabled = [ln for ln in _legacy_rows if "not enabled" not in ln]
+    _pg_visible = any("lcm-pg" in ln for ln in _rows)
+    if _legacy_enabled:
+        add("VERSION-LOAD", "plugins-list", "FAIL",
+            f"hermes-lcm ENABLED as a plugin ({len(_legacy_enabled)} row(s)) — retired name; run lcm_update.sh")
+    elif _legacy_rows:
+        add("VERSION-LOAD", "plugins-list", "WARN",
+            f"{len(_legacy_rows)} disabled hermes-lcm row(s) = stale plugin dirs with the legacy manifest (not loaded; remove the dirs)")
+    else:
+        add("VERSION-LOAD", "plugins-list", "PASS" if _pg_visible else "INFO",
+            "lcm-pg visible, no hermes-lcm rows" if _pg_visible else out[-160:])
 
 def s_cluster():
     rows, err = _sql("select (select setting from pg_settings where name='server_version_num'),"
