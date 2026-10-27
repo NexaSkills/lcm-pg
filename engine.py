@@ -1218,6 +1218,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self.last_cache_write_tokens = int(usage.get("cache_write_tokens", 0) or 0)
         self.last_reasoning_tokens = int(usage.get("reasoning_tokens", 0) or 0)
         self._record_turn_compaction_telemetry()
+        # Display contract for gateway /stats & /usage (fleet incident: raw
+        # turn usage rendered as context occupancy -> wrong 85% everywhere):
+        # the generic renderer reads last_prompt_tokens as CURRENT WINDOW
+        # occupancy. Swap the display pair AFTER the compaction telemetry
+        # above has consumed the raw turn usage (order matters: telemetry
+        # and cache ratios must see the raw provider figures, the UI pair
+        # last_prompt_tokens/last_real_prompt_tokens must hold occupancy).
+        # Every internal consumer (pressure ratios, telemetry) re-reads
+        # these AFTER this point on the next turn, i.e. they see occupancy —
+        # which is their actual intent (window pressure, not throughput).
+        try:
+            from .usage import sync_display_usage
+            sync_display_usage(self)
+        except Exception:
+            pass
 
     @property
     def cache_read_ratio(self) -> float:

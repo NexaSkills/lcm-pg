@@ -33,7 +33,16 @@ if _HOSTCFG.exists():
             os.environ["LCM_PG_DSN"] = _ln.split("=", 1)[1]
 
 HOME = Path(os.environ.get("HOME", str(Path.home())))
-HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(HOME / ".hermes")))
+HERMES_HOME = Path(os.environ.get("HOME", str(HOME))) / ".hermes"
+# HOST root tree, always: an agent shell exports HERMES_HOME=.../profiles/<p>
+# (one profile's home) — using it here checked one profile instead of every
+# profile (the exact blind spot Jan's 2026-10-27 directive closes). A real
+# deploy with HERMES_HOME=$HOME/.hermes still honours a custom root install.
+_hh = Path(os.environ.get("HERMES_HOME", "")).expanduser() if os.environ.get("HERMES_HOME") else None
+if _hh and _hh.parent == HERMES_HOME and _hh.name != "profiles":
+    HERMES_HOME = _hh                    # custom root install dir
+elif _hh and _hh.parent.parent == HERMES_HOME:
+    pass                                 # profile home => keep the host root
 PLUGIN_DIR = Path(os.environ.get("PLUGIN_DIR", str(HERMES_HOME / "plugins" / "lcm-pg")))
 FORK_DIR = Path(os.environ.get("LCM_FORK_DIR", str(HERMES_HOME / "forks" / "lcm-pg")))
 DSN = os.environ.get("LCM_PG_DSN", f"postgresql://lcm01@lcm-pg/lcm?host={HOME}/lcm-pg/run&port=54329")
@@ -52,11 +61,14 @@ def sh(cmd, **kw):
     except Exception as e:
         return 99, f"{type(e).__name__}: {e}"
 
+def _heal_python():
+    # the host's lcm-pg venv python has psycopg; fall back to this interpreter
+    v = HOME / "lcm-pg/venv/bin/python"
+    return v if v.exists() else Path(sys.executable)
+
 def _sql(query, dsn=None):
     dsn = dsn or DSN
-    py = HOME / "lcm-pg/venv/bin/python"
-    if not py.exists():
-        py = Path(sys.executable)
+    py = _heal_python()
     code = (
         "import psycopg,sys,json\n"
         "c=psycopg.connect(sys.argv[1],autocommit=True)\n"
@@ -363,34 +375,66 @@ def s_params(schemas):
         else:
             add("PARAMS", f"pool-pin:{_pname}", "PASS",
                 f"LCM_PG_POOL_MAX={_pk['LCM_PG_POOL_MAX']}")
-    # Operator-surface params the fork reads from os.environ ONLY (slash gate
-    # + embeddings). Root .env carries them for systemd surfaces; profile-run
-    # sessions resolve the PROFILE .env, so each profile .env must carry the
-    # same value the root has (lcm_update.sh step 3c syncs them). A profile
-    # missing LCM_ENABLE_SLASH_COMMAND silently has no /lcm; missing
-    # LCM_EMBEDDINGS_ENABLED reports "embeddings are disabled" on warmup
-    # (fleet incident 2026-10-25).
-    _surf_keys = ("LCM_ENABLE_SLASH_COMMAND", "LCM_EMBEDDINGS_ENABLED",
-                  "LCM_EMBEDDING_PROVIDER", "LCM_EMBEDDING_MODEL")
+    # FULL per-profile .env parity: EVERY LCM_* key the root .env carries
+    # must equal the same value in every profile .env. The old check covered
+    # a curated 4-key subset — exactly the drift class it was supposed to
+    # catch (a key outside the subset drifted invisibly; fleet incidents
+    # 2026-10-25). lcm_params_sync.py (deploy step 3c0) converges this;
+    # check_all verifies the FULL surface independently.
+    # Host-wide LCM_* surface = root .env UNION every profile .env (see
+    # lcm_params_sync.py: a key present anywhere on the host is the host's
+    # value; every profile must carry the same value for every surface to
+    # behave identically). check_all verifies the FULL surface independently.
+    _root_lcm = {k: v for k, v in keys.items()
+                 if k.startswith("LCM_") and v.strip().strip('"').strip("'")}
+    for _pf0 in (sorted((HERMES_HOME / "profiles").glob("*/.env"))
+                 if (HERMES_HOME / "profiles").is_dir() else []):
+        try:
+            for l in _pf0.read_text(errors="ignore").splitlines():
+                l = l.strip()
+                if l.startswith("export "):
+                    l = l[len("export "):]
+                if l.startswith("LCM_") and "=" in l and not l.startswith("#"):
+                    _k, _, _v = l.partition("=")
+                    _v = _v.strip().strip('"').strip("'")
+                    if _v:
+                        _root_lcm.setdefault(_k.strip(), _v)
+        except Exception:
+            continue
     _pdir = HERMES_HOME / "profiles"
     for _pf in sorted(_pdir.glob("*/.env")) if _pdir.is_dir() else []:
         _pname = _pf.parent.name
         try:
-            _pk = dict(l.split("=", 1) for l in _pf.read_text().splitlines()
-                       if l.startswith("LCM_") and "=" in l)
+            _pk = {}
+            for l in _pf.read_text(errors="ignore").splitlines():
+                l = l.strip()
+                if l.startswith("export "):
+                    l = l[len("export "):]
+                if l.startswith("LCM_") and "=" in l and not l.startswith("#"):
+                    _k, _, _v = l.partition("=")
+                    _pk[_k.strip()] = _v.strip().strip('"').strip("'")
+            # effective values = runtime semantics: last definition wins,
+            # empty counts as unset (matches backends/postgres.py dotenv load)
+            _pk = {k: v for k, v in _pk.items() if v}
         except Exception:
             continue
-        _miss = [k for k in _surf_keys if not _pk.get(k)]
-        _diff = [k for k in _surf_keys if _pk.get(k) and keys.get(k) and _pk[k] != keys[k]]
+        _miss = sorted(k for k in _root_lcm if k not in _pk)
+        _diff = sorted(k for k in _root_lcm if k in _pk and _pk[k] != _root_lcm[k])
         if _miss:
             add("PARAMS", f"profile-env:{_pname}", "FAIL",
-                f"missing {' '.join(_miss)} (lcm_update.sh 3c syncs from root .env)")
+                f"missing {len(_miss)}/{len(_root_lcm)} LCM_* keys vs root: "
+                f"{' '.join(_miss[:6])}{' ...' if len(_miss) > 6 else ''} "
+                "(lcm_params_sync.py / lcm_update.sh 3c0 converges)")
         elif _diff:
-            add("PARAMS", f"profile-env:{_pname}", "WARN",
-                f"differ from root: {' '.join(_diff)}")
+            add("PARAMS", f"profile-env:{_pname}", "FAIL",
+                f"{len(_diff)} value(s) differ from root: "
+                f"{', '.join(f'{k}={_pk[k]}' for k in _diff[:4])}"
+                f"{' ...' if len(_diff) > 4 else ''}")
         else:
             add("PARAMS", f"profile-env:{_pname}", "PASS",
-                f"slash={_pk['LCM_ENABLE_SLASH_COMMAND']} embed={_pk['LCM_EMBEDDINGS_ENABLED']}")
+                f"{len(_root_lcm)} LCM_* keys match root "
+                f"(slash={_pk.get('LCM_ENABLE_SLASH_COMMAND', '?')} "
+                f"embed={_pk.get('LCM_EMBEDDINGS_ENABLED', '?')})")
     # context.engine per profile: 'lcm' (or inherited via absent block) is
     # required; anything else (compressor/default) means that profile runs
     # the BUILT-IN lossy compressor and lcm-pg capture/rollup never runs.
@@ -569,8 +613,37 @@ def s_residue():
     if serr or not stamped:
         add("RESIDUE", "zombie-schemas", "WARN",
             "drop_zombie_schemas migration not stamped in lcm_default (run lcm_update/lcm_deploy_migrations)")
-        return
+        _zombie_stamped = False
+    else:
+        _zombie_stamped = True
     profs = sorted(p.name for p in (HERMES_HOME / "profiles").glob("*/")) if (HERMES_HOME / "profiles").is_dir() else []
+    # INVENTORY CONVERGENCE (fleet incident 2026-10-27, skilltest): a profile
+    # dir can exist whose schema NO deploy ever migrated (created straight
+    # from store.py's first-open DDL). drop_zombie_schemas keeps
+    # profile-mapped schemas and the migration loop only enumerates schemas
+    # that already exist in pg_namespace BEFORE bootstrapping, so such a
+    # profile runs forever with un-stamped, parity-incomplete DDL (missing
+    # vector rowid cols = permanent verifier FAIL while deploy reports OK).
+    # Flag every profile whose schema lacks the parity stamp. Profile dirs
+    # under the main ~/.hermes count too (HERMES_HOME may be a scratch home).
+    _inv = {p.name for p in (HERMES_HOME / "profiles").glob("*/") if p.name != ".deleted"} \
+        if (HERMES_HOME / "profiles").is_dir() else set()
+    _std_inv = HOME / ".hermes"
+    if _std_inv != HERMES_HOME and (_std_inv / "profiles").is_dir():
+        _inv |= {p.name for p in (_std_inv / "profiles").glob("*/") if p.name != ".deleted"}
+    _inv |= {"default"}
+    unstamped = []
+    for _p in sorted(_inv):
+        srow, serr = _sql(f"select 1 from \"lcm_{_p}\".lcm_deploy_migrations where migration='parity'")
+        if serr or not srow:
+            unstamped.append(f"lcm_{_p}")
+    if unstamped:
+        add("RESIDUE", "inventory-migrations", "FAIL",
+            f"profile schemas without parity stamp: {' '.join(unstamped)} "
+            "(ensure_profile_bootstrap.py + lcm_deploy_migrations.py heal these; lcm_update.sh runs both)")
+    else:
+        add("RESIDUE", "inventory-migrations", "PASS",
+            f"all {len(_inv)} profile schemas carry the parity stamp")
     # HERMES_HOME may be a profile scratch home (telegram/cron); the real
     # profile dirs live under the main ~/.hermes — union both, same as the
     # drop_zombie_schemas.sh keep rule.
@@ -638,6 +711,8 @@ def s_residue():
     for z in empties:
         if z not in zombies or z in prof_live or z == "lcm_default":
             continue   # belt-and-braces: own inventory + profile keep rule
+        if not _zombie_stamped:
+            continue   # DROP authority requires the stamped migration census
         rc, out = sh([str(_py), "-c", _dsn_code, z], timeout=60)
         if rc == 0:
             dropped_here.append(z)
@@ -645,8 +720,8 @@ def s_residue():
             if _empty_canonical_shell(z):
                 healed.append(z)
     for z in zombies:
-        if z in dropped_here:
-            continue
+        if z in dropped_here or not _zombie_stamped:
+            continue   # never mutate schema shapes when the census is unauthoritative
         if _empty_canonical_shell(z):
             healed.append(z)
     if dropped_here:
@@ -716,6 +791,15 @@ def s_plugin_config():
         if "lcm-pg" in en:
             listed_anywhere = True
             add("VERSION-LOAD", f"plugin-config:{tag}", "PASS", "lcm-pg in enabled")
+        elif tag != "root" and "enabled" not in pl:
+            # No plugins: block in this profile's config at all. load_config()
+            # deep-merges DEFAULT_CONFIG + root inheritance, so the profile
+            # runs with the ROOT plugins.enabled (cfg_get in
+            # plugins_discovery._get_enabled_plugins). Flagging here was a
+            # false alarm (skilltest '{}'-config incident, 2026-10-27).
+            listed_anywhere = listed_anywhere  # root's own row decides
+            add("VERSION-LOAD", f"plugin-config:{tag}", "INFO",
+                "no plugins block — inherits root plugins.enabled")
         elif plugin_live:
             add("VERSION-LOAD", f"plugin-config:{tag}", "WARN",
                 f"enabled={'default(None)' if not isinstance(pl.get('enabled'), list) else en} — no lcm-pg (gate key = dir name; run lcm_update.sh)")
@@ -730,6 +814,17 @@ def s_plugin_config():
 
 
 def main():
+    # CRITICAL: force line-buffered stdout. The summary below prints at the
+    # very END of the run and the __main__ wrapper exits via os._exit(),
+    # which skips interpreter flush. When stdout is a pipe/file (fully
+    # buffered by default — e.g. deploy runs `checker | tail`, or output
+    # redirected to a log), the whole verdict silently vanished and the
+    # script looked like it died with no output while the report file was
+    # actually fine. Fleet deploy debugging 2026-10-27 hinged on this.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+    except Exception:
+        pass
     # the checker's own converge/drop decisions read profile dirs + .env;
     # make sure the root env the deploy pins is visible (exported env wins,
     # and LCM_PG_DSN keeps its host.conf/default resolution above).
@@ -741,6 +836,19 @@ def main():
                 if ln.startswith("LCM_") and "=" in ln:
                     k, _, v = ln.partition("=")
                     os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    # Deploy-time heal BEFORE verifying: any profile schema must carry the
+    # full stamped DDL contract. A profile whose schema was ever created from
+    # store.py's first-open DDL alone (never bootstrapped by a deploy — fleet
+    # incident skilltest, 2026-10-27) is otherwise forever rowid-FAIL. This
+    # runs the same scripts lcm_update.sh step 2 uses; idempotent, stamped,
+    # never touches a schema with data rows beyond parity ALTERs. Best-effort
+    # (a failed heal still leaves the verifiers to report the truth).
+    heal = Path(__file__).resolve().parent / "heal_profile_schemas.py"
+    if heal.is_file():
+        rc_h, out_h = sh([str(_heal_python()), str(heal)], timeout=600)
+        if out_h.strip():
+            add("RESIDUE", "schema-heal", "PASS" if rc_h == 0 else "WARN",
+                out_h.strip().replace("\n", " | ")[:480])
     s_version()
     s_plugin_config()
     s_cluster()

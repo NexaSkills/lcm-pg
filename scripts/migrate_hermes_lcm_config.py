@@ -24,6 +24,7 @@ Exit 0 always unless a write/parse fails (then 1, with the file named).
 import argparse
 import os
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -35,9 +36,47 @@ except ImportError:  # PyYAML ships with hermes envs; bundle venv may lack it
     sys.exit(0)
 
 HOME = Path(os.environ.get("HOME", "$HOME"))
-HERMES = Path(os.environ.get("HERMES_HOME", str(HOME / ".hermes")))
+# Host root tree — an agent shell's HERMES_HOME points ONE profile home; only
+# a deploy running with HERMES_HOME=$HOME/.hermes (or a custom root) is honoured.
+HERMES = HOME / ".hermes"
+_hh = Path(os.environ.get("HERMES_HOME", "")).expanduser() if os.environ.get("HERMES_HOME") else None
+if _hh and _hh.parent == HERMES and _hh.name != "profiles":
+    HERMES = _hh
 PLUGIN_DIR = Path(os.environ.get("PLUGIN_DIR", str(HERMES / "plugins" / "lcm-pg")))
 TS = time.strftime("%Y%m%d%H%M%S")
+
+
+def _hermes_bin() -> str:
+    for cand in (os.environ.get("HERMES_BIN"),
+                 shutil.which("hermes"),
+                 str(HOME / ".local/bin/hermes")):
+        if cand and Path(cand).exists() and Path(cand).stat().st_mode & 0o111:
+            return str(cand)
+    return "hermes"
+
+
+# profile name as `hermes -p` expects it ("default" = root home, no -p)
+def _profile_arg(path: Path) -> str | None:
+    if path.parent.parent == HERMES / "profiles":
+        name = path.parent.name
+        return None if name == "default" else name
+    return None  # root config.yaml
+
+
+# config.yaml writes go through `hermes config set` ONLY (Jan directive
+# 2026-10-27). Reads may parse the file (harmless); writes may not touch it.
+def _cfg_set(profile: str | None, key: str, value: str, dry: bool) -> bool:
+    if dry:
+        print(f"dry: hermes{' -p ' + profile if profile else ''} config set {key} {value}")
+        return True
+    cmd = [_hermes_bin()] + (["-p", profile] if profile else []) + \
+          ["config", "set", "--force", key, value]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if p.returncode != 0:
+        _fail(f"hermes config set {key} ({profile or 'root'}): "
+              f"{(p.stdout + p.stderr).strip().splitlines()[-1:]}")
+        return False
+    return True
 
 
 class _St:
@@ -50,6 +89,8 @@ def _fail(msg: str) -> None:
 
 
 def _backup_write(path: Path, text: str) -> bool:
+    # .env writes only (the one file deploy may file-edit; config.yaml goes
+    # via `hermes config set` exclusively — Jan directive 2026-10-27).
     try:
         shutil.copy2(path, f"{path}.pre-lcm-pg-migration.{TS}")
         path.write_text(text)
@@ -69,6 +110,8 @@ def _configs():
 
 
 def _migrate_config(path: Path, plugin_live: bool, dry: bool) -> None:
+    # READ the file (parsing is harmless); all WRITES go via _cfg_set
+    # (`hermes config set` only — never a file edit of config.yaml).
     try:
         data = yaml.safe_load(path.read_text()) or {}
     except Exception as e:
@@ -77,48 +120,48 @@ def _migrate_config(path: Path, plugin_live: bool, dry: bool) -> None:
     if not isinstance(data, dict):
         _fail(f"{path}: top level not a mapping")
         return
+    prof = _profile_arg(path)
     plugins = data.get("plugins")
-    if not isinstance(plugins, dict):
-        if not plugin_live:
-            return
-        plugins = {}
-        data["plugins"] = plugins
+    if plugins is not None and not isinstance(plugins, dict):
+        _fail(f"{path}: plugins is not a mapping")
+        return
+    plugins = plugins or {}
     enabled = plugins.get("enabled")
     if enabled is not None and not isinstance(enabled, list):
         _fail(f"{path}: plugins.enabled is not a list")
         return
-    actions = []
-    if plugin_live:
-        if "lcm-pg" not in (enabled or []):
-            plugins["enabled"] = [*(enabled or []), "lcm-pg"]
-            actions.append("enabled += lcm-pg")
+    ok = True
+    acted = False
+    # enabled: set the LIST ONLY when it already exists (a list literal via
+    # config set). When the key is absent the profile INHERITS root's
+    # plugins.enabled — which this script converges root-side first — so an
+    # explicit per-profile list here is unnecessary (and would freeze the
+    # inherited set). YAGNI: don't materialise inheritance.
+    if plugin_live and isinstance(enabled, list) and "lcm-pg" not in enabled:
+        ok = _cfg_set(prof, "plugins.enabled",
+                      yaml.safe_dump([*enabled, "lcm-pg"], default_flow_style=True).strip(),
+                      dry) and ok
+        acted = True
     disabled = plugins.get("disabled")
     if isinstance(disabled, list) and "lcm-pg" in disabled:
-        plugins["disabled"] = [x for x in disabled if x != "lcm-pg"]
-        actions.append("disabled -= lcm-pg (would defeat deploy)")
-    # context.engine: the profile MUST opt into the lcm engine. Consumption
-    # (agent/agent_init.py _select_context_engine): missing context (or
-    # missing engine) falls back to "compressor" = built-in lossy
-    # summarization — the lcm-pg engine never runs and the profile's context
-    # is NOT lossless. fleet default policy: a profile with NO context block
-    # inherits the fleet default (root config sets engine: lcm everywhere),
-    # so leave it unset; an EXPLICIT different engine (e.g. engine: default)
-    # defeats lcm-pg for that profile and is flipped to lcm.
+        ok = _cfg_set(prof, "plugins.disabled",
+                      yaml.safe_dump([x for x in disabled if x != "lcm-pg"],
+                                     default_flow_style=True).strip(),
+                      dry) and ok
+        acted = True
+    # context.engine: an EXPLICIT non-lcm engine defeats lcm-pg for this
+    # profile (agent_init falls back to the built-in lossy compressor). An
+    # absent block legitimately inherits root — leave it unset.
     ctx = data.get("context")
     if isinstance(ctx, dict):
         eng = ctx.get("engine")
         if eng is not None and eng != "lcm":
-            ctx["engine"] = "lcm"
-            actions.append(f"context.engine {eng!r} -> lcm (else built-in compressor runs; not lossless)")
+            ok = _cfg_set(prof, "context.engine", "lcm", dry) and ok
+            acted = True
     elif ctx is not None and not isinstance(ctx, dict):
         _fail(f"{path}: context is not a mapping")
-    if not actions:
-        return
-    if dry:
-        print(f"dry: {'; '.join(actions)} -> {path}")
-        return
-    if _backup_write(path, yaml.safe_dump(data, sort_keys=False)):
-        print(f"{'; '.join(actions)} -> {path.name} ({path.parent})")
+    if acted:
+        print(f"config converged via hermes config set -> {path}")
 
 
 def _env_schema_stripping(dry: bool) -> None:

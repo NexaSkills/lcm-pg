@@ -30,7 +30,9 @@ LCM_PG_POOL_MAX_IDLE=60
 ```
 (DSN socket dir/port follow the HOST — read root `~/.hermes/.env`; all fleet hosts use socket dir `~/lcm-pg/run`, port 54329, role lcm01. Never pin `LCM_PG_SCHEMA` — the deploy strips it; per-profile derivation sets it.)
 
-`~/.hermes/profiles/<p>/config.yaml` — the critical keys:
+`~/.hermes/profiles/<p>/config.yaml` — the critical keys (SET THEM VIA
+`hermes -p <p> config set <key> <value>` ONLY — the file is never edited by
+hand; deploy converges them the same way):
 ```yaml
 context:
   engine: lcm        # without this the profile uses built-in LOSSY compression
@@ -54,22 +56,33 @@ Created by deploy step 3d (migrate_hermes_lcm_config.py); create by hand only if
 0. Skill visibility (fleet-wide fix, verified 2026-10-26): Hermes lists skills
 only from the profile skills dir + `skills.external_dirs` in config.yaml —
 plain plugins' skills/ trees are NOT scanned (portable plugin.json packages
-are the exception). Fix lives in the plugin repo: `scripts/add-skill-external-
-dirs.sh` (run automatically by lcm_update.sh step 3e) appends to root + every
-profile config.yaml:
+are the exception). lcm_update.sh step 3e now converges this via
+`hermes config set` ONLY (config.yaml is NEVER file-edited by deploy or by
+hand — Jan's rule; only a profile's .env may be edited on file level). End
+state in root + every profile config.yaml:
 ```yaml
 skills:
   external_dirs:
-    - "/home/mybuddy/.hermes/plugins/lcm-pg/skills"   # absolute; relative anchors per-profile
+    - "<home>/.hermes/plugins/lcm-pg/skills"   # absolute; relative anchors per-profile
 ```
-Verify: `hermes -p <p> chat -q "list skills containing lcm"` must show
-lcm-pg-new-profile-setup + lcm-pg-self-contained. One-liner for a
-single missed profile: run the script, or add the block by hand + backup.
+Verify: `hermes -p <p> config get skills.external_dirs` must print the tree;
+`hermes -p <p> chat -q "list skills containing lcm"` must show
+lcm-pg-new-profile-setup + lcm-pg-self-contained. One-liner for a single
+missed profile: `hermes -p <p> config set --force skills.external_dirs
+"['<home>/.hermes/plugins/lcm-pg/skills']"`.
 First run only (older deploys): probe answers vary between cold-start races —
 re-probe once before chasing shadows.
 
 1. Create the profile normally.
-2. Edit `~/.hermes/profiles/<p>/config.yaml`: `context.engine: lcm`; enabled plugins include `hermes-lcm`, `lcm-pg`, `mnemosyne`; `auxiliary.compression.model` = the profile's own default/aux model (Jan's rule: never assume main/aux — use the profile's configured model).
+2. Set config keys via the CLI only — `hermes -p <p> config set <key> <value>`
+   (never open config.yaml in an editor): `context.engine lcm`;
+   `plugins.enabled` must let the gate key `lcm-pg` through — a profile with
+   NO plugins: block inherits root (fine, root lists lcm-pg); if the profile
+   has its own enabled list, add lcm-pg to it. Do NOT add a `hermes-lcm`
+   entry: the deploy's migration 3d treats it as harmless fallback only; the
+   DIRECTORY-named overlay (step 3d) + `lcm-pg` are what load the fork.
+   `auxiliary.compression.model` = the profile's own default/aux model
+   (Jan's rule: never assume main/aux — use the profile's configured model).
 3. Run `bash ~/lcm_update.sh` on that host — DETACHED if it's the host serving your own session (`setsid bash -c 'bash ~/lcm_update.sh > ~/lcm_deploy_$(date +%s).log 2>&1'`): it syncs the .env params, bootstraps the `lcm_<p>` schema, ensures 6/6 assertion guards, restarts surfaces.
 4. `lcm_check_all.py` must show 0 FAIL with PARAMS pool-pin + context-engine rows PASS.
 

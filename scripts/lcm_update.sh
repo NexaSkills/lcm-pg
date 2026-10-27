@@ -41,6 +41,31 @@ done
 log() { printf '[update] %s\n' "$*"; }
 die() { printf '[update] FAIL: %s\n' "$*" >&2; exit 1; }
 
+# Canonical way to write ANY config.yaml value (Jan directive 2026-10-27):
+# never edit config.yaml with sed/awk/editors — only each profile's .env may
+# be file-edited. Set a dotted key in the root config or a named profile's
+# config via hermes' own writer (creates files/keys as needed). --force so
+# plugin-namespace keys the running Hermes doesn't enumerate (skills.*,
+# lcm.*) still land. Failures WARN loudly: a missed convergence shows in
+# step 5's report rather than vanishing.
+cfg_set() {  # cfg_set <profile|root> <dotted.key> <value>
+  local scope="$1" key="$2" val="$3" out rc
+  local bin="${HERMES_BIN:-}"
+  [[ -z "$bin" ]] && bin=$(command -v hermes || true)
+  [[ -z "$bin" && -x "$HOME/.local/bin/hermes" ]] && bin="$HOME/.local/bin/hermes"
+  [[ -z "$bin" ]] && { log "WARN: hermes binary not found; cannot set $key ($scope) via CLI"; return 1; }
+  if [[ "$scope" == root ]]; then
+    out=$("$bin" config set --force "$key" "$val" 2>&1); rc=$?
+  else
+    out=$("$bin" -p "$scope" config set --force "$key" "$val" 2>&1); rc=$?
+  fi
+  if [[ $rc -ne 0 ]]; then
+    log "WARN: hermes config set $key ($scope) failed: $(echo "$out" | tail -1)"
+    return 1
+  fi
+  return 0
+}
+
 command -v git >/dev/null || die "git not found"
 command -v psql >/dev/null || command -v "$HOME/lcm-pg/pg/bin/psql" >/dev/null || die "psql not found"
 export LCM_PG_DSN="${LCM_PG_DSN:-postgresql://lcm01@lcm-pg/lcm?host=$HOME/lcm-pg/run&port=54329}"
@@ -121,6 +146,15 @@ if [[ -n "$DRY" ]]; then
   log "DRY: migrations skipped"
 else
   PY="$HOME/lcm-pg/venv/bin/python"; [[ -x "$PY" ]] || PY=python3
+  # 2a. INVENTORY HEAL (fleet incident skilltest 2026-10-27): profile dirs
+  # created AFTER the last deploy have no schema, and the migration loop
+  # below enumerates pg_namespace BEFORE bootstrapping — so such a profile
+  # would run forever on un-stamped, parity-incomplete DDL while every
+  # deploy says RESULT: OK. heal_profile_schemas.py creates the missing
+  # lcm_<profile> schemas (official naming rule), runs the canonical
+  # ensure_* bootstrap, then the stamp loop. BEFORE migrations so the whole
+  # run sees one converged inventory.
+  log "heal: $("$PY" "$PLUGIN_DIR/scripts/heal_profile_schemas.py" 2>&1 | tail -4)"
   log "migrations: $("$PY" "$PLUGIN_DIR/scripts/lcm_deploy_migrations.py" --ref "$HEAD_SHA" | tail -20)"
   "$PY" "$PLUGIN_DIR/scripts/lcm_deploy_migrations.py" --ref "$HEAD_SHA" >/dev/null \
     || die "DB migrations failed (see output above; fix on the dev host, rerun)"
@@ -230,6 +264,17 @@ fi
 env_files=("$HOME_DIR/.hermes/.env")
 [[ -d "$HOME_DIR/.hermes/profiles" ]] && env_files+=("$HOME_DIR"/.hermes/profiles/*/.env)
 
+# ---- 3c0. full per-profile param convergence (repo-owned script) -----------
+# ONE deterministic pass that converges EVERY profile against the root .env's
+# COMPLETE LCM_* surface (every key, not a curated subset) and every profile
+# config.yaml's context.engine via `hermes config get/set` ONLY. The
+# hand-curated key lists elsewhere in this script are minimum guarantees;
+# this is the authority (fleet drift incidents: keys someone forgot to add).
+if [[ -z "$DRY" && -f "$PLUGIN_DIR/scripts/lcm_params_sync.py" ]]; then
+  _ps_py="$HOME/lcm-pg/venv/bin/python"; [[ -x "$_ps_py" ]] || _ps_py=python3
+  log "params-sync: $($_ps_py "$PLUGIN_DIR/scripts/lcm_params_sync.py" 2>&1 | tail -3)"
+fi
+
 # ---- 3c. plugin overlay for EVERY profile (incl. profiles created after the
 # install). Discovery only finds hermes-lcm through a per-profile symlink;
 # a profile dir without one silently loads NO lcm plugin (tools missing from
@@ -253,16 +298,14 @@ if [[ -d "$HOME_DIR/.hermes/profiles" && ( -e "$HOME_DIR/.hermes/plugins/lcm-pg"
       ln -s "$HOME_DIR/.hermes/plugins/lcm-pg" "$lp"
       log "overlay: created $lp -> root plugin"
     fi
-    # a routed profile's .env must carry the backend+DSN the daemons get from
-    # the root .env, else a profile-local session can write a per-profile
-    # lcm.db instead of the shared cluster (pluginless fallback). The other
-    # keys are operator-surface params the fork reads from os.environ ONLY:
-    # LCM_ENABLE_SLASH_COMMAND gates the /lcm command registration (default
-    # OFF), LCM_EMBEDDINGS_ENABLED + LCM_EMBEDDING_* gate embedding warmup /
-    # semantic recall (default OFF). systemd surfaces inherit the root .env
-    # (20-active-profile-env.conf), but CLI/launcher-run profile sessions
-    # resolve the PROFILE .env — a profile missing these silently loses /lcm
-    # and reports 'embeddings are disabled' (fleet incident 2026-10-25).
+    # lcm.db instead of the shared cluster (pluginless fallback). The FULL
+    # LCM_* surface is converged once per deploy by scripts/lcm_params_sync.py
+    # (step 3c0 below): EVERY LCM_* key in the root .env must equal the same
+    # value in every profile .env. The hand-picked key list kept here is the
+    # minimum guarantee for older plugin clones without the sync script (a
+    # key missing from a list = silent profile drift; fleet incidents
+    # 2026-10-25). config.yaml keys are converged via hermes config get/set
+    # ONLY — never a file edit (Jan directive 2026-10-27).
     src_env="$HOME_DIR/.hermes/.env"
     penv="$pd.env"
     if [[ -f "$src_env" ]]; then
@@ -321,6 +364,38 @@ for ef in "${env_files[@]}"; do
   fi
 done
 
+# ---- 3c2. profile config convergence via `hermes config set` ONLY ---------
+# Jan directive 2026-10-27: config.yaml is NEVER written by sed/echo/file
+# edits anywhere in the pipeline; only each profile's .env may be file-edited
+# (steps 3b/3c keep that). This step guarantees every profile dir has a
+# config.yaml whose context.engine is lcm (else the profile silently runs
+# the built-in LOSSY compressor — the #1 'LCM not working' cause). Read via
+# the CLI (no writes unless needed); write via the CLI with --force (the
+# dotted path may live under a section this Hermes build doesn't enumerate).
+if [[ -z "$DRY" && -d "$HOME_DIR/.hermes/profiles" ]]; then
+  _ctxfix=0
+  for pd in "$HOME_DIR"/.hermes/profiles/*/; do
+    [[ -d "$pd" ]] || continue
+    prof=$(basename "$pd")
+    _eng=""
+    "$HERMES_BIN:-hermes" -p "$prof" config get context.engine >/dev/null 2>&1 && \
+      _eng=$("$HERMES_BIN:-hermes" -p "$prof" config get context.engine 2>/dev/null)
+    if [[ "$_eng" == "lcm" ]]; then
+      continue
+    elif [[ -z "$_eng" ]]; then
+      # unset (or unreadable config) may be legitimate inheritance from a
+      # root that sets engine: lcm
+      _rooteng=""
+      "$HERMES_BIN:-hermes" config get context.engine >/dev/null 2>&1 && \
+        _rooteng=$("$HERMES_BIN:-hermes" config get context.engine 2>/dev/null)
+      [[ "$_rooteng" == "lcm" ]] && continue
+    fi
+    cfg_set "$prof" context.engine lcm && _ctxfix=$((_ctxfix+1))
+  done
+  [[ "${_ctxfix:-0}" -gt 0 ]] && log "config-sync: set context.engine=lcm via hermes config set in $_ctxfix profile(s)" \
+    || log "config-sync: every profile config resolves context.engine=lcm"
+fi
+
 # ---- 3d. plugin migration hermes-lcm -> lcm-pg (assumed on every host) ------
 # The deploy ASSUMES the host is migrating FROM the upstream hermes-lcm plugin
 # TO lcm-pg: code migration happened in step 1 (materialize) and overlays in
@@ -349,14 +424,38 @@ fi
 # (agent/skill_utils.get_skill_search_roots; plain plugins' skills/ trees are
 # NOT scanned). Point every hermes home at this host's plugin skills tree so
 # skills like lcm-pg-new-profile-setup are visible to every profile, incl.
-# ones created after this deploy. Idempotent + per-file config backups.
+# ones created after this deploy. WRITTEN VIA `hermes config set` ONLY (Jan
+# directive 2026-10-27: config.yaml is never file-edited; only .env may be).
+# The writer keeps YAML validity, creates missing config.yaml files (a new
+# profile dir had none = the skill silently invisible = fleet drift), and
+# preserves an existing custom skills: section (read-only probe first).
 if [[ -z "$DRY" ]]; then
-  _sk="$(bash "$PLUGIN_DIR/scripts/add-skill-external-dirs.sh" 2>&1 | grep -c '^added:')" || _sk=0
-  [[ "${_sk:-0}" -gt 0 ]] && log "skill-visibility: added external_dirs in $_sk config(s)" || log "skill-visibility: all configs already carry external_dirs"
+  _sktree="$HERMES_HOME/plugins/lcm-pg/skills"
+  if [[ -d "$_sktree" ]]; then
+    _sk=0
+    for pd in "$HOME_DIR"/.hermes/profiles/*/; do
+      [[ -d "$pd" ]] || continue
+      prof=$(basename "$pd")
+      _cur=$("$HERMES_BIN:-hermes" -p "$prof" config get skills.external_dirs 2>/dev/null) || _cur=""
+      case "$_cur" in *"$_sktree"*) continue;; esac
+      cfg_set "$prof" skills.external_dirs "['$_sktree']" && _sk=$((_sk+1))
+    done
+    # root config: only when root itself lacks the tree
+    _rootcur=$("$HERMES_BIN:-hermes" config get skills.external_dirs 2>/dev/null) || _rootcur=""
+    case "$_rootcur" in *"$_sktree"*) ;; *) cfg_set root skills.external_dirs "['$_sktree']" && _sk=$((_sk+1));; esac
+    [[ "${_sk:-0}" -gt 0 ]] && log "skill-visibility: set external_dirs via hermes config set in $_sk config(s)" \
+      || log "skill-visibility: all configs already carry external_dirs"
+  else
+    log "skill-visibility: no skills tree at $_sktree; skipped"
+  fi
 fi
 
 # ---- 5. health check -> report -----------------------------------------------
-python3 "$PLUGIN_DIR/scripts/lcm_check_all.py" || true   # report is the artifact; exit code of update = 0
+# `stdbuf -oL` so the checker's summary reaches this log even when the deploy
+# output is redirected to a file/pipe (os._exit in the checker skips the
+# interpreter flush; the summary printed last and silently vanished — the
+# single most confusing deploy symptom, fixed 2026-10-27).
+stdbuf -oL -eL python3 "$PLUGIN_DIR/scripts/lcm_check_all.py" || true   # report is the artifact; exit code of update = 0
 REPORT="$HOME_DIR/lcm-pg-check-$(hostname).md"
 log "health report: $REPORT"
 grep -qE '\*\*OVERALL: FAIL' "$REPORT" 2>/dev/null && { log "RESULT: FAIL (see report)"; exit 1; }
