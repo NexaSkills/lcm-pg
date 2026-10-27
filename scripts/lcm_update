@@ -298,6 +298,16 @@ fi
 _rlp="$HOME_DIR/.hermes/plugins/hermes-lcm"
 if [[ -L "$_rlp" ]]; then rm -f "$_rlp"; log "overlay: removed retired $_rlp"
 elif [[ -e "$_rlp" ]]; then mv "$_rlp" "$_rlp.retired.$(date +%Y%m%d%H%M%S)"; log "overlay: retired $_rlp (moved aside)"; fi
+# Retired manifests hidden (trade 2026-10-27: pre-retirement dirs already
+# named lcm-pg.* carry name: hermes-lcm, and discovery lists them as a
+# 'hermes-lcm | not enabled' row). Renaming the plugin.yaml makes a stale
+# copy undiscoverable; the files stay for forensics.
+for d in "$HOME_DIR"/.hermes/plugins/lcm-pg.*; do
+  [[ -f "$d/plugin.yaml" ]] || continue
+  grep -qs "^name: hermes-lcm" "$d/plugin.yaml" || continue
+  mv "$d/plugin.yaml" "$d/plugin.yaml.retired.$(date +%Y%m%d%H%M%S)"
+  log "overlay: hid retired manifest $d/plugin.yaml"
+done
 if [[ -d "$HOME_DIR/.hermes/profiles" && ( -e "$HOME_DIR/.hermes/plugins/lcm-pg" || -L "$HOME_DIR/.hermes/plugins/lcm-pg" ) ]]; then
   # root-level legacy dir/symlink too (it makes a stale root enabled: hermes-lcm
   # loadable); removed so the retired name exists nowhere.
