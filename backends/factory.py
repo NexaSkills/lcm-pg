@@ -103,55 +103,74 @@ def connect(db_path: Any, *, mode: str = "rw", **sqlite_kwargs: Any):
     accepted and ignored on the Postgres path.
     """
     if backend_for() == "postgres":
-        from .postgres import connect as pg_connect, schema_for_profile
-        from .fts_conn import FtsConnection, set_spec
-        from . import fts_pg
-
-        s0 = str(db_path)
-        # SQLite URI semantics: a '?mode=ro' path means the caller wants a
-        # strictly read-only handle (upstream's read paths pass these).
-        if "mode=ro" in s0:
-            mode = "ro"
-        hermes_home = ""
-        p = Path(s0.split("?")[0])
-        # lcm.db normally lives directly under HERMES_HOME
-        if p.name.startswith("lcm"):
-            hermes_home = str(p.parent)
-        schema = os.environ.get("LCM_PG_SCHEMA") or schema_for_profile(hermes_home or None)
-        query_only = (mode == "ro")
-        if query_only:
-            # DDL/idempotent-helper provisioning (lcm_normalize_fts, FTS
-            # install) must not run over a read-only handle — a retired or
-            # never-provisioned schema must fail closed, not self-provision.
-            # Provision on a short-lived admin handle instead.
-            admin = pg_connect(_pg_dsn(), schema)
-            try:
-                fts_pg.ensure_helper(admin)
-            finally:
-                try:
-                    admin.close()
-                except Exception:
-                    pass
-            base = pg_connect(_pg_dsn(), schema, query_only=True)
-        else:
-            base = pg_connect(_pg_dsn(), schema)
-            fts_pg.ensure_helper(base)
-        conn = FtsConnection(base)
-        # Durability is configured where the handle is created so every store
-        # gets it without each one having to opt in; the upstream
-        # configure_connection() call sites only carry SQLite pragmas.
-        try:
-            from .. import db_bootstrap
-            db_bootstrap.configure_postgres_connection(conn)
-        except Exception:
-            pass
-        if mode == "ro":
-            set_spec(conn, _existing_fts_tables(base))
-        else:
-            set_spec(conn, _ensure_fts_tables(base))
-        return conn
+        return _connect_postgres(db_path, mode=mode, **sqlite_kwargs)
     # --- SQLite path: upstream behaviour ------------------------------------
     s = str(db_path)
     if s.startswith("file:") or s == ":memory:":
         sqlite_kwargs.setdefault("uri", True)
     return sqlite3.connect(s, **sqlite_kwargs)
+
+
+from .ddl_lock import retry_serialization as _retry_serialization
+
+
+@_retry_serialization("factory.connect")
+def _connect_postgres(db_path, *, mode="rw", **_ignored):
+    """PG open: pool + shim provisioning + FTS spec.
+
+    The WHOLE body reruns on 40001 (`tuple concurrently updated`): catalog
+    DDL from a sibling surface that started at the same moment. Every step
+    (CREATE SCHEMA/shims/ensure_fts) is idempotent, so a rerun after a
+    jittered pause is the entire fix — a half-provisioned schema must never
+    escape as a "successful" connection.
+    """
+    from .postgres import connect as pg_connect, schema_for_profile
+    from .fts_conn import FtsConnection, set_spec
+    from . import fts_pg
+
+    s0 = str(db_path)
+    # SQLite URI semantics: a '?mode=ro' path means the caller wants a
+    # strictly read-only handle (upstream's read paths pass these).
+    if "mode=ro" in s0:
+        mode = "ro"
+    hermes_home = ""
+    p = Path(s0.split("?")[0])
+    # lcm.db normally lives directly under HERMES_HOME
+    if p.name.startswith("lcm"):
+        hermes_home = str(p.parent)
+    schema = os.environ.get("LCM_PG_SCHEMA") or schema_for_profile(hermes_home or None)
+    query_only = (mode == "ro")
+    if query_only:
+        # DDL/idempotent-helper provisioning (lcm_normalize_fts, FTS
+        # install) must not run over a read-only handle — a retired or
+        # never-provisioned schema must fail closed, not self-provision.
+        # Provision on a short-lived admin handle instead.
+        admin = pg_connect(_pg_dsn(), schema)
+        try:
+            fts_pg.ensure_helper(admin)
+        finally:
+            try:
+                admin.close()
+            except Exception:
+                pass
+        base = pg_connect(_pg_dsn(), schema, query_only=True)
+    else:
+        base = pg_connect(_pg_dsn(), schema)
+        fts_pg.ensure_helper(base)
+    conn = FtsConnection(base)
+    # Durability is configured where the handle is created so every store
+    # gets it without each one having to opt in; the upstream
+    # configure_connection() call sites only carry SQLite pragmas.
+    try:
+        from .. import db_bootstrap
+        db_bootstrap.configure_postgres_connection(conn)
+    except Exception:
+        pass
+    if mode == "ro":
+        set_spec(conn, _existing_fts_tables(base))
+    else:
+        set_spec(conn, _ensure_fts_tables(base))
+    return conn
+
+
+# (connect tail moved into _connect_postgres above)

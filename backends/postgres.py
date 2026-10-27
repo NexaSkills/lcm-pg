@@ -2392,10 +2392,49 @@ def connect(dsn: str, schema: str, *,
         return conn
     probe = pool.getconn()
     try:
-        with probe.cursor() as cur:
-            cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
-            cur.execute(_set_stmts(schema, lock_timeout_ms))
-            _ensure_catalog_shims(cur, schema)
+        # Once-per-process per schema: shim install is pure idempotent
+        # provisioning DDL; running it on EVERY connection open made each
+        # register() (store + dag + lifecycle + assertions open 3-6
+        # handles) and every sibling surface (gateway/webui/dashboard)
+        # race the same pg_proc/pg_type rows -> `tuple concurrently
+        # updated` dropped the plugin on boot (template 2026-10-27).
+        # First opener still serialises across PROCESSES via an advisory
+        # lock; everyone else in-process skips the DDL entirely.
+        global _SHIM_DONE
+        with _SHIM_DONE_LOCK:
+            already = schema in _SHIM_DONE
+        if already:
+            with probe.cursor() as cur:
+                cur.execute(_set_stmts(schema, lock_timeout_ms))
+        else:
+            from . import ddl_lock as _dl
+            _lock_id = _dl._lock_id(_dl.ddl_key(schema, "catalog-shims"))
+            _lk = None
+            _locked = False
+            try:
+                _lk = pool.getconn()
+                with _lk.cursor() as _lc:
+                    _lc.execute(f"SELECT pg_advisory_lock({_lock_id})")
+                _locked = True
+            except Exception:
+                _locked = False  # best-effort: DDL itself is idempotent + retryable
+            try:
+                _provision_probe(probe, schema, lock_timeout_ms)
+                with _SHIM_DONE_LOCK:
+                    _SHIM_DONE.add(schema)
+            finally:
+                if _locked and _lk is not None:
+                    try:
+                        with _lk.cursor() as _lc:
+                            _lc.execute(f"SELECT pg_advisory_unlock({_lock_id})")
+                        _lk.commit()
+                    except Exception:
+                        pass
+                if _lk is not None:
+                    try:
+                        pool.putconn(_lk)
+                    except Exception:
+                        pass
     finally:
         pool.putconn(probe)
     # wrap: configure callback pins schema/lock_timeout on every checkout
@@ -2404,6 +2443,35 @@ def connect(dsn: str, schema: str, *,
     if query_only:
         conn._query_only = True
     return conn
+
+
+def _provision_probe(probe, schema: str, lock_timeout_ms: int) -> None:
+    """CREATE SCHEMA + search_path/lock_timeout + catalog shims on the probe
+    connection, with ONE whole-batch rerun on 40001 (`tuple concurrently
+    updated`): racing catalog DDL from another surface. Idempotent by
+    construction, so a rerun after a pause is the entire fix."""
+    import time
+    for _try in range(2):
+        try:
+            with probe.cursor() as cur:
+                cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+                cur.execute(_set_stmts(schema, lock_timeout_ms))
+                _ensure_catalog_shims(cur, schema)
+            try:
+                probe.commit()
+            except Exception:
+                pass
+            return
+        except Exception as _exc:
+            from .ddl_lock import is_concurrency_conflict
+            if _try == 0 and is_concurrency_conflict(_exc):
+                try:
+                    probe.rollback()
+                except Exception:
+                    pass
+                time.sleep(0.2)
+                continue
+            raise
 
 
 def _patch_pool_checkout(pool: ConnectionPool, schema: str, lock_timeout_ms: int):
@@ -2427,6 +2495,10 @@ def _patch_pool_checkout(pool: ConnectionPool, schema: str, lock_timeout_ms: int
 
 _POOLS: dict[tuple, ConnectionPool] = {}
 _POOLS_LOCK = threading.Lock()
+
+# schemas whose catalog shims this PROCESS has provisioned (see connect()).
+_SHIM_DONE: set[str] = set()
+_SHIM_DONE_LOCK = threading.Lock()
 _ATEXIT_ARMED = False
 
 

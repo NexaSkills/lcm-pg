@@ -19,6 +19,19 @@ import re
 
 import psycopg
 
+# Idempotent provisioning DDL (CREATE OR REPLACE FUNCTION / CREATE TRIGGER /
+# ADD COLUMN IF NOT EXISTS ...) is retried on serialization-class errors.
+# Postgres does not lock single-row catalog writes for concurrent DDL, so
+# when several surfaces (gateway + webui + dashboard) open the same schema
+# together after a restart, their ensure_* provisioning races and all but
+# one die with `tuple concurrently updated` (template 2026-10-27: dropped
+# the whole plugin on boot). The decorator makes each ensure_* retry its
+# whole idempotent body once after a short jittered pause; the standard
+# advisory-lock remedy lives in backends/ddl_lock.py for call sites that
+# want hard serialisation.
+from .ddl_lock import retry_serialization as _retry_serialization
+
+
 # tsvector column added per FTS table spec (kept out of upstream column lists)
 _TS_SUFFIX = "_tsv"
 
@@ -62,6 +75,7 @@ def normalize_expr_sql(inner: str) -> str:
     return f"lcm_normalize_fts({inner})"
 
 
+@_retry_serialization('ensure_helper')
 def ensure_helper(conn) -> None:
     """Create the normalize function + tsvector triggers idempotently."""
     # PG 18 resolves an unresolved prepared param to smallint; make that
@@ -116,6 +130,7 @@ def ts_colname(indexed_column: str) -> str:
 
 
 
+@_retry_serialization('ensure_query_fn')
 def ensure_query_fn(conn) -> None:
     """Create lcm_tsq(q text) -> text (idempotent). The FTS rewriter bakes
     ts_rank/ts_headline/ORDER BY copies of the WHERE tsquery expression as
@@ -144,6 +159,7 @@ def _pk_column(conn, table: str) -> str:
     return row[0] if not isinstance(row, dict) else next(iter(row.values()))
 
 
+@_retry_serialization('ensure_fts')
 def ensure_fts(conn, table: str, indexed_column: str) -> None:
     """Idempotent tsvector column + triggers for one (table, column) pair."""
     ensure_helper(conn)
