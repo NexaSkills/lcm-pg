@@ -430,7 +430,18 @@ if [[ -e /etc/hermes/config.yaml ]]; then
   # root_has_enabled: does root config.yaml have a plugins: section WITH an
   # enabled: key? (Bare `grep -q enabled:` is wrong — unrelated sections like
   # checkpoints.enabled satisfy it; template incident 2026-10-27.)
-  if ! python3 -c 'import sys,yaml;d=yaml.safe_load(open(sys.argv[1])) or {};sys.exit(0 if "enabled" in (d.get("plugins") or {}) else 1)' "$HOME_DIR/.hermes/config.yaml" 2>/dev/null; then
+  # Trigger is UNION-based: every overlay-pinned plugin must be in root's
+  # enabled list, not merely 'does root have an enabled key' — a partial
+  # root list (template: ['lcm-pg'] while overlay pinned 3) must still merge.
+  if ! python3 - "$HOME_DIR/.hermes/config.yaml" <<'PYEOF' 2>/dev/null
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1])) or {}
+m = yaml.safe_load(open("/etc/hermes/config.yaml")) or {}
+root = set((d.get("plugins") or {}).get("enabled") or [])
+pin = set((m.get("plugins") or {}).get("enabled") or [])
+sys.exit(0 if pin and pin <= root else 1)
+PYEOF
+  then
     _managed_en=$(python3 -c 'import yaml,sys;d=yaml.safe_load(open("/etc/hermes/config.yaml")) or {};e=(d.get("plugins") or {}).get("enabled");print(",".join(e) if isinstance(e,list) else "")' 2>/dev/null) || _managed_en=""
     if [[ -n "$_managed_en" ]]; then
       _need=""
