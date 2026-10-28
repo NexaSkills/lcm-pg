@@ -60,6 +60,12 @@ onboarded + verified; non-zero prints exactly what needs attention. The
 manual steps below remain valid for auditing or when the script is
 unavailable. Flags: --dry-run (print intended changes), --no-deploy (batch
 workflows: converge configs, run the deploy once afterwards for all profiles).
+Host deploy coverage: lcm_update.sh step 3f (commit 4a18da7) now runs
+`hermes -p <p> plugins enable lcm-pg` for EVERY profile each deploy (no-op
+when already enabled), so hosts stay gate-clean even without the script;
+verify hosts run 3f via the deploy log line `plugins-enable:`. Older host
+scripts (~750B ~/lcm_update.sh on some fleet hosts) lack BOTH 3c0 and 3f —
+the script self-heals both (runs lcm_params_sync.py + enable itself).
 
 0. Skill visibility (fleet-wide fix, verified 2026-10-26): Hermes lists skills
 only from the profile skills dir + `skills.external_dirs` in config.yaml —
