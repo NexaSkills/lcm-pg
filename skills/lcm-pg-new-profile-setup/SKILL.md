@@ -61,16 +61,6 @@ manual steps below remain valid for auditing or when the script is
 unavailable. Flags: --dry-run (print intended changes), --no-deploy (batch
 workflows: converge configs, run the deploy once afterwards for all profiles).
 
-ZERO-TOUCH PATH (preferred since 2026-10-28): after `hermes profile create <p>`,
-run `bash ~/lcm_new_profile_setup.sh <p>` (repo script
-scripts/lcm_new_profile_setup.py; runs the steps below in order: config keys
-via hermes config set ONLY, both overlay symlinks, then the standard
-detached lcm_update.sh, then a per-profile checker verdict). Exit 0 =
-onboarded + verified; non-zero prints exactly what needs attention. The
-manual steps below remain valid for auditing or when the script is
-unavailable. Flags: --dry-run (print intended changes), --no-deploy (batch
-workflows: converge configs, run the deploy once afterwards for all profiles).
-
 0. Skill visibility (fleet-wide fix, verified 2026-10-26): Hermes lists skills
 only from the profile skills dir + `skills.external_dirs` in config.yaml —
 plain plugins' skills/ trees are NOT scanned (portable plugin.json packages
@@ -89,7 +79,23 @@ First run only (older deploys): probe answers vary between cold-start races —
 re-probe once before chasing shadows.
 
 1. Create the profile normally.
-2. Edit `~/.hermes/profiles/<p>/config.yaml`: `context.engine: lcm`; enabled plugins include `hermes-lcm`, `lcm-pg`, `mnemosyne`; `auxiliary.compression.model` = the profile's own default/aux model (Jan's rule: never assume main/aux — use the profile's configured model).
+2. Per-profile plugin gate (CRITICAL — the #1 miss; verified beez+template
+   2026-10-28): `hermes -p <p> plugins enable lcm-pg`. Gate semantics: a
+   profile WITHOUT its own plugins.enabled list is NOT "inheriting root's
+   allow-list" — effective set = all-discovered EXCEPT disabled, and root's
+   disabled list (uninstall leftovers, kev-router-style entries) silently
+   blocks lcm-pg for every such profile (skilltest on beez, demo/alpha on
+   template all sat at `not enabled` with healthy deploy + engine=lcm).
+   Only profiles WITH their own enabled: list are allow-listed. Runtime
+   truth = `hermes -p <p> plugins list` shows `enabled`; `hermes plugins
+   list` (root scope) proves NOTHING for a profile. The deploy's 3c2 never
+   touches plugins.enabled — do it per profile here. NEVER write
+   plugins.enabled via `config set` with a list value: the list-writer
+   appends a literal '-' entry (broken; template incident 2026-10-28).
+   Do NOT add a `hermes-lcm` entry (double-registration); the DIRECTORY-
+   named overlay + `lcm-pg` are what load the fork. `auxiliary.compression
+   .model` stays UNSET (params-sync converges pins away; compression
+   follows the profile's active model).
 3. Run `bash ~/lcm_update.sh` on that host — DETACHED if it's the host serving your own session (`setsid bash -c 'bash ~/lcm_update.sh > ~/lcm_deploy_$(date +%s).log 2>&1'`): it converges ALL params (root-union LCM_* .env surface for every profile + context.engine, via hermes config get/set ONLY — scripts/lcm_params_sync.py, step 3c0), heals profile schemas before migrations, bootstraps the `lcm_<p>` schema, ensures 6/6 assertion guards, restarts surfaces.
 4. `lcm_check_all.py` must show 0 FAIL with PARAMS pool-pin + context-engine + profile-env (full LCM_* parity per profile) rows PASS.
 
@@ -126,7 +132,6 @@ are verified per-deploy by lcm_check_all.py.
 - `PoolTimeout ... 10.00 sec` on a new profile: check the profile .env pins (deploy ENFORCES MAX>=16 since f837776; create-only before that) — the constraint is the per-process pool, not the server.
 - The surface's process env is what counts (`/proc/PID/environ`), not the file — restart the surface after editing .env.
 - Never run the deploy foreground from a session hosted on that surface — it restarts webui and severs the session.
-- Test profile names starting with `test` make the checker SILENT for that profile (its SQL excludes `lcm_test_%` schemas by design) — a checker run right after can look clean while the deploy's own embedded report still shows a stale mid-run FAIL row (e.g. tsv-triggers counted before the FTS migration completed). Always re-run lcm_check_all.py after the deploy finishes before concluding.
-- A fresh profile's `context.engine` defaults to `compressor` — the script/deploy flip it to `lcm`; a profile that predates both silently runs lossy built-in compression.
+- Post-onboard functional proof (the ONLY acceptable e2e check): restart surfaces, run 3 sessions in the profile (`hermes -p <p> chat -q ...`), then `journalctl --user --since -5m | grep -c "Context engine 'lcm' not found"` MUST be 0 and `lcm_<p>.metadata` gains rows. Engine-registration log lines and root-scope `plugins list` are NOT proof. Per-turn warnings after 3+ turns = real failure (discovery nondeterminism gotcha above).
 - Test profile names starting with `test` make the checker SILENT for that profile (its SQL excludes `lcm_test_%` schemas by design) — a checker run right after can look clean while the deploy's own embedded report still shows a stale mid-run FAIL row (e.g. tsv-triggers counted before the FTS migration completed). Always re-run lcm_check_all.py after the deploy finishes before concluding.
 - A fresh profile's `context.engine` defaults to `compressor` — the script/deploy flip it to `lcm`; a profile that predates both silently runs lossy built-in compression.

@@ -62,6 +62,24 @@ def cfg_get(profile: str, key: str) -> str:
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
+
+def _venv_python() -> str:
+    """First interpreter that has psycopg+psycopg_pool (same ladder as the
+    repo scripts): LCM_VENV_PY, ~/lcm-pg/venv, install envs, then sys.exe."""
+    import glob
+    home = Path.home()
+    cands = [os.environ.get("LCM_VENV_PY"),
+             str(home / "lcm-pg/venv/bin/python"),
+             *sorted(glob.glob(str(home / ".hermes/installs/*/environments/*/venv/bin/python")),
+                     reverse=True),
+             sys.executable]
+    for c in cands:
+        if c and Path(c).is_file() and sh([c, "-c",
+                "import psycopg, psycopg_pool"]).returncode == 0:
+            return c
+    return ""
+
+
 class Runner:
     def __init__(self, profile: str, dry: bool):
         self.p = profile
@@ -125,33 +143,60 @@ def main() -> int:
                  lambda: hermes_cfg(p, "set", "--force", "skills.external_dirs", lst))
 
     # plugins.enabled: touch ONLY if the profile carries its own list
-    enabled_raw = cfg_get(p, "plugins.enabled")
-    if enabled_raw:  # own list present (inherits-root profiles print empty)
-        names = re.findall(r"[a-zA-Z0-9_-]+", enabled_raw)
-        if "lcm-pg" not in names or "hermes-lcm" in names:
-            new = [n for n in names if n != "hermes-lcm"]
-            if "lcm-pg" not in new:
-                new.append("lcm-pg")
-            lst = "[" + ", ".join(f"'{n}'" for n in new) + "]"
-            r.action(f"plugins.enabled {names} -> {new}",
-                     lambda: hermes_cfg(p, "set", "--force", "plugins.enabled", lst))
+    # 2a. per-profile plugin enable — the CRITICAL step.
+    # Gate semantics (verified on beez + template 2026-10-28): a profile
+    # WITHOUT an explicit plugins.enabled key is NOT "inheriting root" —
+    # the effective set is ALL-EXCEPT-DISABLED, and an uninstall/legacy
+    # disable entry in ROOT's disabled list (e.g. kev-router incidents)
+    # silently blocks lcm-pg for every such profile. Only profiles with
+    # their own enabled: list are allow-listed. The runtime truth is
+    # `hermes -p <p> plugins list`; the deploy's 3c2 never touches this,
+    # so a fresh `profile create` copy needs it HERE.
+    def _gate_state() -> "bool | None":
+        pr = sh([HERMES, "-p", p, "plugins", "list"])
+        row = [ln for ln in (pr.stdout or "").splitlines()
+               if "lcm-pg" in ln and "│" in ln]
+        if not row:
+            return None
+        return "not enabled" not in row[0]
 
-    # 2. overlay symlinks (same contract as deploy 3d)
-    for gate in ("lcm-pg", "hermes-lcm"):
-        link = pdir / "plugins" / gate
-        if link.is_symlink() and link.resolve() == PLUGIN_DIR.resolve():
-            continue
-        if link.exists() and not link.is_symlink():
-            r.problem(f"{link} exists as a real dir — deploy 3d will merge it; "
-                      f"leave it, do not delete by hand")
-            continue
+    if _gate_state() is not True:
+        def _enable():
+            # supported CLI, profile-scoped (writes the profile's own lists;
+            # NEVER hand-edit config.yaml). The bare list-writer is broken
+            # (appends literal '-' entries), so no config set here.
+            er = sh([HERMES, "-p", p, "plugins", "enable", "lcm-pg"])
+            if er.returncode != 0:
+                r.problem(f"plugins enable failed: "
+                          f"{(er.stdout + er.stderr).strip()[-200:]}")
+        r.action("hermes -p <p> plugins enable lcm-pg", _enable)
+    if not a.dry and _gate_state() is not True:
+        r.problem("lcm-pg still NOT enabled for the profile per "
+                  "`hermes -p <p> plugins list` — inspect that table and "
+                  "root/profile disabled lists manually")
 
-        def mk(link=link, gate=gate):
-            link.parent.mkdir(parents=True, exist_ok=True)
-            if link.is_symlink():
-                link.unlink()
-            link.symlink_to(PLUGIN_DIR)
-        r.action(f"overlay {gate} -> {PLUGIN_DIR}", mk)
+    # 2b. full LCM_* param convergence for this profile (self-heal: some
+    # hosts' ~/lcm_update.sh predates the 3c0 params-sync block — the
+    # profile then only gets the hand-curated 11-key overlay subset and
+    # check_all FAILs the profile-env parity row. The repo's
+    # lcm_params_sync.py is idempotent and root-is-truth; run it now.)
+    psync = PLUGIN_DIR / "scripts/lcm_params_sync.py"
+    if psync.exists():
+        _py = _venv_python()
+        if _py:
+            pr = sh([_py, str(psync)])
+            if pr.returncode != 0:
+                r.problem(f"lcm_params_sync.py rc={pr.returncode}: "
+                          f"{(pr.stdout + pr.stderr).strip()[-200:]}")
+            else:
+                r.actions.append("DID  lcm_params_sync.py (full LCM_* root-union "
+                                 "converged into profile .env)")
+        else:
+            r.problem("no interpreter with psycopg found for lcm_params_sync.py "
+                      "— profile .env parity may lag root (deploy 3c fixes it)")
+    else:
+        r.problem(f"{psync} missing — profile .env keys converge only via the "
+                  f"host deploy's 3c/3c0 step")
 
     # 3. standard deploy (detached; it restarts surfaces incl. this profile)
     updater = Path.home() / "lcm_update.sh"
@@ -186,16 +231,7 @@ def main() -> int:
     # 4. verdict via the fleet checker
     checker = PLUGIN_DIR / "scripts/lcm_check_all.py"
     if checker.exists() and not a.dry:
-        # find an interpreter with psycopg (same ladder as the scripts)
-        py = sys.executable
-        cands = [os.environ.get("LCM_VENV_PY"),
-                 str(HOME / "lcm-pg/venv/bin/python"),
-                 *sorted(glob.glob(str(HOME / ".hermes/installs/*/environments/*/venv/bin/python")),
-                         reverse=True)]
-        for c in cands:
-            if c and Path(c).is_file() and sh([c, "-c", "import psycopg, psycopg_pool"]).returncode == 0:
-                py = c
-                break
+        py = _venv_python() or sys.executable
         chk = sh([py, str(checker)])
         # the gate is THIS profile's rows only (host rows from transient probe/
         # zombie schemas are noise for a per-profile onboarding verdict)
