@@ -545,6 +545,28 @@ if [[ -z "$DRY" ]]; then
   log "plugin-migration: $($_py "$PLUGIN_DIR/scripts/migrate_hermes_lcm_config.py" 2>&1)"
 fi
 
+# ---- 3f. per-profile plugin enable gate (all profiles; idempotent) ---------
+# A profile without its own plugins.enabled list is allow-listed by
+# all-except-disabled, so root's disabled list (uninstall leftovers) can
+# silently block lcm-pg for it (verified beez+template 2026-10-28: the
+# running multiplex surfaces load anyway via root's own list, but
+# profile-scoped processes fall back per-turn). `plugins enable` is a
+# no-op when already enabled, so this is safe every deploy.
+if [[ -z "$DRY" && -d "$HOME_DIR/.hermes/profiles" ]]; then
+  _pe=0
+  for pd in "$HOME_DIR"/.hermes/profiles/*/; do
+    [[ -d "$pd" ]] || continue
+    prof=$(basename "$pd")
+    [[ "$prof" == .* ]] && continue
+    if ! ${HERMES_BIN:-hermes} -p "$prof" plugins list 2>/dev/null | grep -q "lcm-pg.*enabled"; then
+      ${HERMES_BIN:-hermes} -p "$prof" plugins enable lcm-pg >/dev/null 2>&1 \
+        && { log "plugins-enable: $prof enabled lcm-pg"; _pe=$((_pe+1)); } \
+        || log "WARN: plugins-enable: $prof failed (check manually)"
+    fi
+  done
+  [[ $_pe -eq 0 ]] && log "plugins-enable: all profiles already enabled"
+fi
+
 # ---- 4. restart hermes surfaces (discovered; profile units skipped) --------
 if [[ $DO_RESTART -eq 1 && -z "$DRY" ]]; then
   units=$(systemctl --user list-units --type=service --state=loaded --no-legend 2>/dev/null \
