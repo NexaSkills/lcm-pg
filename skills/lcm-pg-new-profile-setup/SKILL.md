@@ -84,8 +84,12 @@ re-probe once before chasing shadows.
    profile WITHOUT its own plugins.enabled list is NOT "inheriting root's
    allow-list" — effective set = all-discovered EXCEPT disabled, and root's
    disabled list (uninstall leftovers, kev-router-style entries) silently
-   blocks lcm-pg for every such profile (skilltest on beez, demo/alpha on
-   template all sat at `not enabled` with healthy deploy + engine=lcm).
+   blocks lcm-pg for every such profile. (Precision: the ROOT launch scope
+   still honours root's own enabled list, so a host-wide multiplexed
+   gateway can load lcm for such a profile anyway — skilltest/demo showed
+   0 fallback warnings in live sessions while `plugins list -p` said
+   not-enabled; profile-scoped/CLI processes DO fall back. Treat
+   `not enabled` as must-fix regardless.)
    Only profiles WITH their own enabled: list are allow-listed. Runtime
    truth = `hermes -p <p> plugins list` shows `enabled`; `hermes plugins
    list` (root scope) proves NOTHING for a profile. The deploy's 3c2 never
