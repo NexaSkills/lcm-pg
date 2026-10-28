@@ -60,12 +60,20 @@ onboarded + verified; non-zero prints exactly what needs attention. The
 manual steps below remain valid for auditing or when the script is
 unavailable. Flags: --dry-run (print intended changes), --no-deploy (batch
 workflows: converge configs, run the deploy once afterwards for all profiles).
-Host deploy coverage: lcm_update.sh step 3f (commit 4a18da7) now runs
+Delegation phrasing: tell an agent "onboard <p> to lcm-pg using the
+lcm-pg-new-profile-setup skill" — the skill name alone routes it to the
+script; step 3e makes the skill visible on any converged host (plugin
+skills/ tree is in skills.external_dirs, surfaced under the lcm-pg: namespace
+and by plain name).
+Host deploy coverage: lcm_update.sh step 3f (commit 4a18da7) runs
 `hermes -p <p> plugins enable lcm-pg` for EVERY profile each deploy (no-op
 when already enabled), so hosts stay gate-clean even without the script;
-verify hosts run 3f via the deploy log line `plugins-enable:`. Older host
-scripts (~750B ~/lcm_update.sh on some fleet hosts) lack BOTH 3c0 and 3f —
-the script self-heals both (runs lcm_params_sync.py + enable itself).
+verify hosts run 3f via the deploy log line `plugins-enable:`. GOTCHA
+(fleet rollout 2026-10-28): hosts execute `~/lcm_update.sh` which was a
+stale FILE COPY on all 5 fleet hosts (19.4KB Oct-26 vs repo 24.7KB) — old
+copies lack 3f AND the HERMES_ROOT pin, silently running instead of the
+freshly deployed repo copy (buddy/demo stayed gate-blocked despite RESULT:
+OK). Fixed fleet-wide: `ln -sf ~/.hermes/plugins/lcm-pg/scripts/lcm_update.sh ~/lcm_update.sh` (old copies kept as ~/lcm_update.sh.bak-pre3f). Diagnose: no `plugins-enable:` line in the deploy log, or `grep -c '3f\.' ~/lcm_update.sh` = 0. The setup script still self-heals params+gate even on stale-script hosts.
 
 0. Skill visibility (fleet-wide fix, verified 2026-10-26): Hermes lists skills
 only from the profile skills dir + `skills.external_dirs` in config.yaml —
@@ -144,4 +152,13 @@ are verified per-deploy by lcm_check_all.py.
 - Never run the deploy foreground from a session hosted on that surface — it restarts webui and severs the session.
 - Post-onboard functional proof (the ONLY acceptable e2e check): restart surfaces, run 3 sessions in the profile (`hermes -p <p> chat -q ...`), then `journalctl --user --since -5m | grep -c "Context engine 'lcm' not found"` MUST be 0 and `lcm_<p>.metadata` gains rows. Engine-registration log lines and root-scope `plugins list` are NOT proof. Per-turn warnings after 3+ turns = real failure (discovery nondeterminism gotcha above).
 - Test profile names starting with `test` make the checker SILENT for that profile (its SQL excludes `lcm_test_%` schemas by design) — a checker run right after can look clean while the deploy's own embedded report still shows a stale mid-run FAIL row (e.g. tsv-triggers counted before the FTS migration completed). Always re-run lcm_check_all.py after the deploy finishes before concluding.
+- Test profile names starting with `test` (or `probe`) are EXCLUDED from
+lcm_check_all coverage by design — a PASS there is not proof; verify those
+via journalctl fallback-count + metadata rows instead.
+- Fleet-wide rollout without disrupting running surfaces: per host, `git
+fetch + reset --hard origin/main` on the plugin/fork repo, then run
+`~/lcm_update.sh` (step 3f does the per-profile `plugins enable`); copy
+scripts/lcm_new_profile_setup.{py,sh} to ~ so the shim works on every host
+immediately. Verify per host from the deploy log's plugins-enable lines +
+final RESULT row rather than SSHing extra probes.
 - A fresh profile's `context.engine` defaults to `compressor` — the script/deploy flip it to `lcm`; a profile that predates both silently runs lossy built-in compression.
