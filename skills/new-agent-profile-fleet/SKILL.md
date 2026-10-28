@@ -136,6 +136,11 @@ starts EMPTY by design; recreate schedules explicitly with correct `deliver`.
    PASS there proves nothing.
 5. Browser smoke test (camofox) + one MCP call + one tool-call round-trip.
 
+## Non-fleet hosts
+
+On a machine without the lcm-pg stack, skip step 4 and verification 3-4 (no
+lcm_<p> schema or lcm_check_all.py exists there); the rest applies unchanged.
+
 ## Never
 
 Two agent processes on one profile home. Hand-edited config.yaml. Hardcoded
