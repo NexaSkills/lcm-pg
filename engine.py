@@ -901,10 +901,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # Fleet standard: when the threshold was NOT explicitly set (no
         # LCM_CONTEXT_THRESHOLD / lcm.context_threshold), compress at the flat
         # 50% window fraction regardless of provider window size — this
-        # overrides an inherited host compression.threshold (fleet hosts carry
-        # 0.45) and the retired window-bucket autotune. Explicit operator
-        # overrides stay authoritative.
-        if source == "manual_or_default" and configured != _LCM_FLAT_COMPRESS_THRESHOLD:
+        # overrides an inherited host compression.threshold (fleet hosts carried
+        # 0.45) and the retired window-bucket autotune. A host
+        # compression.threshold resolves with source
+        # "config_yaml:compression.threshold" (NOT an LCM override), so it must
+        # fall to the flat default here; before 2026-10-29 the gate accepted
+        # only "manual_or_default" and every host carrying an explicit
+        # compression.threshold silently compressed at 45%. Explicit operator
+        # overrides (env / lcm.context_threshold) stay authoritative.
+        if (
+            source not in {"env:LCM_CONTEXT_THRESHOLD",
+                           "config_yaml:lcm.context_threshold"}
+            and configured != _LCM_FLAT_COMPRESS_THRESHOLD
+        ):
             return (
                 _LCM_FLAT_COMPRESS_THRESHOLD,
                 "flat_window_default",
