@@ -98,3 +98,12 @@ A host that only ever ran `lcm_update.sh` (never rollout_host.sh / 7c) has
 NO timer = corpora stay unembedded (FTS-only recall). Run
 `bash ~/.hermes/plugins/lcm-pg/scripts/embed_timer_install.sh` once there
 (idempotent).
+
+## 4c. Fleet runbooks (workspace docs) are dated snapshots, superseded on threshold
+
+The handover/params runbooks under `~/workspace/` (lcm-pg-handover-2026-10-22*.md,
+lcm-pg-fleet-params-addendum-2026-10-22.md) predate the flat-50 standard and state
+`compression.threshold = 0.45` / `LCM_COMPRESS_THRESHOLD 0.45`. That policy was
+retired 2026-10-27/29: the authoritative compression policy is §4 above (flat 0.50,
+engine-enforced; host `compression.threshold` is inert under engine=lcm). Do not
+re-derive thresholds from the 2026-10-22 runbooks.
