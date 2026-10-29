@@ -13,7 +13,7 @@ Sections: VERSION-LOAD / CLUSTER / SCHEMAS / STRUCTURE / VERIFIER / INGEST /
 RECALL / TIMERS / PARAMS / RESIDUE.
 """
 from __future__ import annotations
-import datetime, json, os, re, subprocess, sys
+import datetime, json, os, re, subprocess, sys, time
 from pathlib import Path
 
 # deps: prefer the host's venv312 site-packages (psycopg/psycopg_pool); works
@@ -563,20 +563,36 @@ def s_params(schemas):
                         _fh.seek(-2_000_000, 2)
                     except OSError:
                         _fh.seek(0)
-                    _hits = [l for l in _fh.read().decode("utf-8", "replace").splitlines()
-                             if "threshold" in l and "reflight" in l][-8:]
+                    # only lines from AFTER this host's last surface restart count:
+            # pre-restart lines legitimately show the retired 0.45 products
+            # (log rotation kept them) and would falsely FAIL a healthy host.
+            try:
+                _boot = float(subprocess.run(
+                    ["systemctl", "show", u, "-p", "ActiveEnterTimestampMonotonic", "--value"],
+                    capture_output=True, text=True).stdout.strip() or 0) / 1e6
+            except Exception:
+                _boot = 0.0
+            _hits = [l for l in _fh.read().decode("utf-8", "replace").splitlines()
+                     if "threshold" in l and "reflight" in l]
+            if _boot:
+                _now = time.time()
+                _fresh = [l for l in _hits
+                          if _now - time.mktime(time.strptime(
+                              l[:19], "%Y-%m-%d %H:%M:%S")) < (_now - _boot)]
+            else:
+                _fresh = _hits[-8:]
             _toks = []
-            for _l in _hits:
+            for _l in _fresh:
                 _m = __import__("re").search(r"(\d[\d,]*)\s+threshold", _l)
                 if _m:
                     _toks.append(int(_m.group(1).replace(",", "")))
             _stale = {int(w * 0.45) for w in (262144, 512000, 1000000)}
             if not _toks:
-                add("PARAMS", f"compress-live:{u}", "INFO", "no preflight-threshold log lines yet (no session crossed a preflight check)")
+                add("PARAMS", f"compress-live:{u}", "INFO", "no post-restart preflight-threshold log lines yet (no session crossed a preflight check since boot)")
             else:
                 _bad = [t for t in _toks if t in _stale]
                 add("PARAMS", f"compress-live:{u}", "FAIL" if _bad else "PASS",
-                    f"preflight thresholds seen: {sorted(set(_toks))}"
+                    f"post-restart preflight thresholds seen: {sorted(set(_toks))}"
                     + ("  <-- surface runs a STALE pre-flat-50 process (restart it)" if _bad else ""))
             add("PARAMS", f"daemon-env:{u}", "PASS" if env.get("LCM_BACKEND") == "postgres" else "FAIL",
                 f"LCM_BACKEND={env.get('LCM_BACKEND','-')}")
