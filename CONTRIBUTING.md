@@ -126,7 +126,8 @@ Packaging or install-flow changes should also verify the standalone user-plugin 
 ```bash
 export HERMES_HOME=/tmp/hermes-lcm-smoke
 mkdir -p "$HERMES_HOME/plugins"
-git clone https://github.com/stephenschoettler/hermes-lcm "$HERMES_HOME/plugins/hermes-lcm"
+# NOTE: install our fork, NEVER the retired upstream repo:
+git clone https://github.com/NexaSkills/lcm-pg "$HERMES_HOME/plugins/hermes-lcm"
 # then enable `hermes-lcm` in plugins.enabled and set context.engine: lcm
 hermes plugins
 ```
