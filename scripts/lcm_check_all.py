@@ -529,6 +529,17 @@ def s_params(schemas):
             add("PARAMS", f"profile:{p}", "PASS" if ok else "WARN",
                 f"model.default={md} auxiliary.compression.model={'<unset: follows active model>' if ok else am} threshold={thr}"
                 + ("" if ok else "  <-- aux pin must be REMOVED (hermes config unset auxiliary.compression.model) so compression follows the active model"))
+            # Fleet standard (Jan 2026-10-27/29): LCM compresses at a FLAT 50%
+            # of the window. engine=lcm + no LCM override => the plugin's
+            # flat_window_default is authoritative and a host compression.
+            # threshold is inert by design. FAIL only when THIS profile would
+            # actually run built-in compression at a non-50% trigger: engine
+            # not lcm AND effective (CLI-merged) threshold != 0.50.
+            eng2 = _eff_engine(p if p != "default" else None)
+            thr_ok = (eng2 == "lcm") or (thr is not None and abs(float(thr) - 0.50) < 1e-9)
+            add("PARAMS", f"compress-threshold:{p}", "PASS" if thr_ok else "FAIL",
+                f"engine={eng2} host compression.threshold={thr} -> lcm flat 0.50"
+                + ("" if thr_ok else "  <-- built-in compressor would trigger at non-50%: set compression.threshold 0.5 or context.engine lcm"))
         except Exception as e:
             add("PARAMS", f"profile:{p}", "INFO", f"parse: {type(e).__name__}")
     for u in ("hermes-gateway", "hermes-webui"):
@@ -538,6 +549,35 @@ def s_params(schemas):
             continue
         try:
             env = dict(l.split("=", 1) for l in Path(f"/proc/{pid}/environ").read_text().split("\0") if "=" in l)
+            # Engine-driven preflight: lcm publishes threshold_tokens and the
+            # host logs "Engine-driven preflight maintenance ... (below <N>
+            # threshold)" / "Preflight compression: ... >= <N> threshold".
+            # Flat-50 fleet standard: N = window * 0.50. A surface still
+            # showing the OLD host-0.45 products (117964/230400/450000) runs a
+            # stale pre-flat process.
+            _log = HERMES_HOME / "logs" / "agent.log"
+            _hits: list = []
+            if _log.is_file():
+                with _log.open("rb") as _fh:
+                    try:
+                        _fh.seek(-2_000_000, 2)
+                    except OSError:
+                        _fh.seek(0)
+                    _hits = [l for l in _fh.read().decode("utf-8", "replace").splitlines()
+                             if "threshold" in l and "reflight" in l][-8:]
+            _toks = []
+            for _l in _hits:
+                _m = __import__("re").search(r"(\d[\d,]*)\s+threshold", _l)
+                if _m:
+                    _toks.append(int(_m.group(1).replace(",", "")))
+            _stale = {int(w * 0.45) for w in (262144, 512000, 1000000)}
+            if not _toks:
+                add("PARAMS", f"compress-live:{u}", "INFO", "no preflight-threshold log lines yet (no session crossed a preflight check)")
+            else:
+                _bad = [t for t in _toks if t in _stale]
+                add("PARAMS", f"compress-live:{u}", "FAIL" if _bad else "PASS",
+                    f"preflight thresholds seen: {sorted(set(_toks))}"
+                    + ("  <-- surface runs a STALE pre-flat-50 process (restart it)" if _bad else ""))
             add("PARAMS", f"daemon-env:{u}", "PASS" if env.get("LCM_BACKEND") == "postgres" else "FAIL",
                 f"LCM_BACKEND={env.get('LCM_BACKEND','-')}")
             add("PARAMS", f"daemon-boundary:{u}", "PASS" if env.get("LCM_DATABASE_PATH") == pinned else "FAIL",
