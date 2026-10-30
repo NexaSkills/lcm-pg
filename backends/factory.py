@@ -83,13 +83,41 @@ def backend_for() -> str:
 def _pg_dsn() -> str:
     dsn = os.environ.get("LCM_PG_DSN")
     if not dsn:
-        home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
-        p = Path(home) / ".env"
-        if p.is_file():
-            for line in p.read_text().splitlines():
-                if line.startswith("LCM_PG_DSN="):
-                    dsn = line.split("=", 1)[1].strip()
-                    break
+        # Walk up from HERMES_HOME reading LCM_PG_DSN= lines, then always
+        # check the ~/.hermes ROOT itself. A process whose env carries only a
+        # profile-dir HERMES_HOME with no inherited DSN (nohup/setsid/CLI
+        # launches — the DSN lives in the ROOT .env, not profile .env files)
+        # used to resolve None here and raise: the lcm-pg plugin then failed
+        # to load ("LCM_BACKEND=postgres but LCM_PG_DSN is not set"), Hermes
+        # silently fell back to the built-in compressor, and the fleet flat-50
+        # LCM compression standard was bypassed (mike session bootstrap,
+        # 2026-10-30 11:44:33). Fail-loud semantics are unchanged — only the
+        # resolution is widened. (mnemo-pg carries the same fix.)
+        roots: list[Path] = []
+        home_env = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+        p = Path(home_env)
+        roots.extend([p, *p.parents])
+        roots.append(Path.home() / ".hermes")
+        seen: set[Path] = set()
+        for cand in roots:
+            if cand in seen:
+                continue
+            seen.add(cand)
+            env = cand / ".env"
+            if env.is_file():
+                for line in env.read_text().splitlines():
+                    if line.startswith("LCM_PG_DSN="):
+                        dsn = line.split("=", 1)[1].strip()
+                        break
+            if cand.name == ".hermes":
+                break
+    if not dsn:
+        # fleet default: the private lcm-pg cluster socket dir convention
+        for run in (Path.home() / "lcm-pg" / "run",
+                    Path.home() / ".hermes" / "lcm-pg" / "run"):
+            if run.is_dir():
+                dsn = f"host={run} port=54329 dbname=lcm user=lcm01"
+                break
     if not dsn:
         raise RuntimeError("LCM_BACKEND=postgres but LCM_PG_DSN is not set")
     return dsn
